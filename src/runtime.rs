@@ -1,7 +1,8 @@
 use crate::{
     agent::{AgentEvent, AgentTaskRunner},
     app::{App, AppAction, AuthProvider},
-    auth::{AuthEvent, AuthTaskRunner},
+    auth::{AuthEvent, AuthStore, AuthTaskRunner},
+    llm::{LlmClient, LlmConfig},
     theme::Theme,
     ui,
 };
@@ -75,15 +76,26 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         LaunchMode::AuthOnly => App::for_auth(),
     };
     let theme = Theme::default();
-    let mut runner = AgentTaskRunner::spawn();
+    let mut runner = match launch_mode {
+        LaunchMode::Interactive => {
+            let config = LlmConfig::from_env().context("failed to load LLM configuration")?;
+            let auth_store =
+                AuthStore::standard().context("failed to locate ChatGPT credentials")?;
+            let llm = LlmClient::new(config, auth_store).context("failed to configure the LLM")?;
+            Some(AgentTaskRunner::spawn(llm))
+        }
+        LaunchMode::AuthOnly => None,
+    };
     let mut auth_runner = AuthTaskRunner::spawn();
     let mut next_tick = Instant::now() + TICK_RATE;
     let mut should_quit = false;
     let mut regions = ui::UiRegions::default();
 
     while !should_quit {
-        while let Some(agent_event) = runner.try_event() {
-            app.handle_agent_event(agent_event);
+        if let Some(runner) = runner.as_ref() {
+            while let Some(agent_event) = runner.try_event() {
+                app.handle_agent_event(agent_event);
+            }
         }
         while let Some(auth_event) = auth_runner.try_event() {
             app.handle_auth_event(auth_event);
@@ -98,7 +110,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
             match event::read().context("failed to read terminal input")? {
                 Event::Key(key) if matches!(key.kind, KeyEventKind::Press) => {
                     if let Some(action) = app.handle_key(key, Instant::now()) {
-                        should_quit = dispatch(action, &mut app, &runner, &auth_runner);
+                        should_quit = dispatch(action, &mut app, runner.as_ref(), &auth_runner);
                     }
                 }
                 Event::Paste(text) => app.handle_paste(&text),
@@ -109,7 +121,8 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                             Some(ui::UiTarget::Tools) => app.toggle_tools(),
                             Some(ui::UiTarget::AuthProvider) => {
                                 if let Some(action) = app.select_auth_provider() {
-                                    should_quit = dispatch(action, &mut app, &runner, &auth_runner);
+                                    should_quit =
+                                        dispatch(action, &mut app, runner.as_ref(), &auth_runner);
                                 }
                             }
                             None => {}
@@ -129,7 +142,9 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         }
     }
 
-    runner.shutdown();
+    if let Some(runner) = runner.as_mut() {
+        runner.shutdown();
+    }
     auth_runner.shutdown();
     Ok(())
 }
@@ -137,25 +152,41 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
 fn dispatch(
     action: AppAction,
     app: &mut App,
-    runner: &AgentTaskRunner,
+    runner: Option<&AgentTaskRunner>,
     auth_runner: &AuthTaskRunner,
 ) -> bool {
     match action {
         AppAction::Submit { request_id, prompt } => {
-            if let Err(error) = runner.submit(request_id, prompt) {
-                app.handle_agent_event(AgentEvent::Failed {
+            match runner {
+                Some(runner) => {
+                    if let Err(error) = runner.submit(request_id, prompt) {
+                        app.handle_agent_event(AgentEvent::Failed {
+                            request_id,
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                None => app.handle_agent_event(AgentEvent::Failed {
                     request_id,
-                    message: error.to_string(),
-                });
+                    message: "the LLM is unavailable in authentication-only mode".into(),
+                }),
             }
             false
         }
         AppAction::Cancel { request_id } => {
-            if let Err(error) = runner.cancel(request_id) {
-                app.handle_agent_event(AgentEvent::Failed {
+            match runner {
+                Some(runner) => {
+                    if let Err(error) = runner.cancel(request_id) {
+                        app.handle_agent_event(AgentEvent::Failed {
+                            request_id,
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                None => app.handle_agent_event(AgentEvent::Failed {
                     request_id,
-                    message: error.to_string(),
-                });
+                    message: "the LLM is unavailable in authentication-only mode".into(),
+                }),
             }
             false
         }

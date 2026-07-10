@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod app;
 pub mod auth;
+pub(crate) mod llm;
 pub mod theme;
 pub mod ui;
 

@@ -20,6 +20,7 @@ const ISSUER: &str = "https://auth.openai.com";
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const CALLBACK_ADDRESS: &str = "127.0.0.1:1455";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthEvent {
@@ -190,6 +191,7 @@ struct AuthFile {
 #[derive(Debug, Clone)]
 pub struct AuthStore {
     path: PathBuf,
+    token_url: String,
 }
 
 impl AuthStore {
@@ -205,7 +207,15 @@ impl AuthStore {
     }
 
     pub fn at(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            token_url: format!("{ISSUER}/oauth/token"),
+        }
+    }
+
+    #[cfg(test)]
+    fn at_with_token_url(path: PathBuf, token_url: String) -> Self {
+        Self { path, token_url }
     }
 
     pub fn save(&self, credentials: &OAuthCredentials) -> AnyResult<()> {
@@ -267,6 +277,57 @@ impl AuthStore {
         let auth: AuthFile = serde_json::from_slice(&bytes).context("failed to parse auth data")?;
         Ok(Some(auth.openai))
     }
+
+    pub(crate) async fn valid_credentials(&self) -> AnyResult<OAuthCredentials> {
+        let credentials = self
+            .load()?
+            .context("ChatGPT sign-in required; run /auth")?;
+        let now = unix_time_millis()?;
+        if credentials.expires_at > now.saturating_add(TOKEN_REFRESH_SKEW.as_millis() as u64) {
+            return Ok(credentials);
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(format!("funcode/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("failed to create the ChatGPT refresh client")?;
+        let response = client
+            .post(&self.token_url)
+            .form(&[
+                ("client_id", CLIENT_ID),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", credentials.refresh_token.as_str()),
+                ("scope", "openid profile email"),
+            ])
+            .send()
+            .await
+            .context("could not reach the ChatGPT token endpoint")?;
+        let status = response.status();
+        if !status.is_success() {
+            if matches!(status.as_u16(), 400 | 401 | 403) {
+                bail!("ChatGPT sign-in required; run /auth");
+            }
+            bail!("ChatGPT token refresh failed with status {status}");
+        }
+        let tokens: RefreshTokenResponse = response
+            .json()
+            .await
+            .context("ChatGPT returned an invalid refresh response")?;
+        let refreshed = OAuthCredentials {
+            account_id: tokens
+                .id_token
+                .as_deref()
+                .and_then(parse_account_id)
+                .or_else(|| parse_account_id(&tokens.access_token))
+                .or(credentials.account_id),
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token.unwrap_or(credentials.refresh_token),
+            expires_at: now.saturating_add(tokens.expires_in.saturating_mul(1000)),
+        };
+        self.save(&refreshed)?;
+        Ok(refreshed)
+    }
 }
 
 fn create_private_directory(path: &std::path::Path) -> AnyResult<()> {
@@ -297,8 +358,24 @@ struct TokenResponse {
     expires_in: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct RefreshTokenResponse {
+    id_token: Option<String>,
+    access_token: String,
+    refresh_token: Option<String>,
+    #[serde(default = "default_expires_in")]
+    expires_in: u64,
+}
+
 fn default_expires_in() -> u64 {
     3600
+}
+
+fn unix_time_millis() -> AnyResult<u64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    Ok(now.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,16 +607,11 @@ fn credentials_from_tokens(tokens: TokenResponse) -> AnyResult<OAuthCredentials>
         .as_deref()
         .and_then(parse_account_id)
         .or_else(|| parse_account_id(&tokens.access_token));
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?;
+    let now = unix_time_millis()?;
     Ok(OAuthCredentials {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
-        expires_at: now
-            .as_millis()
-            .saturating_add(u128::from(tokens.expires_in) * 1000)
-            .min(u128::from(u64::MAX)) as u64,
+        expires_at: now.saturating_add(tokens.expires_in.saturating_mul(1000)),
         account_id,
     })
 }
@@ -614,7 +686,7 @@ fn error_page(message: &str) -> String {
 mod tests {
     use super::{AuthStore, ChatGptOAuth, OAuthCredentials, REDIRECT_URI};
     use base64::Engine as _;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read as _, Write as _};
     use url::Url;
 
     #[test]
@@ -724,6 +796,144 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn valid_credentials_returns_an_unexpired_saved_session() {
+        let root = std::env::temp_dir().join(format!(
+            "funcode-auth-valid-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store = AuthStore::at(root.join("auth.json"));
+        let credentials = OAuthCredentials {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: u64::MAX,
+            account_id: Some("account".into()),
+        };
+        store.save(&credentials).unwrap();
+
+        assert_eq!(store.valid_credentials().await.unwrap(), credentials);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_credentials_are_refreshed_and_atomically_saved() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            let body = serde_json::json!({
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let root = std::env::temp_dir().join(format!(
+            "funcode-auth-refresh-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store = AuthStore::at_with_token_url(
+            root.join("auth.json"),
+            format!("http://{address}/oauth/token"),
+        );
+        store
+            .save(&OAuthCredentials {
+                access_token: "expired-access".into(),
+                refresh_token: "old-refresh".into(),
+                expires_at: 0,
+                account_id: Some("account".into()),
+            })
+            .unwrap();
+
+        let refreshed = store.valid_credentials().await.unwrap();
+
+        assert_eq!(refreshed.access_token, "new-access");
+        assert_eq!(refreshed.refresh_token, "new-refresh");
+        assert_eq!(refreshed.account_id.as_deref(), Some("account"));
+        assert_eq!(store.load().unwrap(), Some(refreshed));
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_requires_sign_in_again() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            let body = r#"{"error":"invalid_grant"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let root = std::env::temp_dir().join(format!(
+            "funcode-auth-rejected-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store = AuthStore::at_with_token_url(
+            root.join("auth.json"),
+            format!("http://{address}/oauth/token"),
+        );
+        store
+            .save(&OAuthCredentials {
+                access_token: "expired-access".into(),
+                refresh_token: "rejected-refresh".into(),
+                expires_at: 0,
+                account_id: Some("account".into()),
+            })
+            .unwrap();
+
+        let error = store.valid_credentials().await.unwrap_err();
+
+        assert_eq!(error.to_string(), "ChatGPT sign-in required; run /auth");
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                return;
+            }
+        }
     }
 
     #[test]

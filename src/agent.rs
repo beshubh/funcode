@@ -1,15 +1,14 @@
+use crate::llm::{ConversationCommit, LlmClient, LlmEvent};
+use futures::StreamExt as _;
 use std::{
     collections::VecDeque,
     fmt,
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
 };
+use tokio::{sync::mpsc as async_mpsc, task::JoinHandle as AsyncJoinHandle};
 
 pub type RequestId = u64;
-
-const FAKE_RESPONSE: &str =
-    "This is a streamed placeholder response from funcode. Model integration will come next.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
@@ -52,21 +51,6 @@ enum AgentCommand {
     Shutdown,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RunnerTiming {
-    thinking: Duration,
-    chunk: Duration,
-}
-
-impl Default for RunnerTiming {
-    fn default() -> Self {
-        Self {
-            thinking: Duration::from_millis(850),
-            chunk: Duration::from_millis(110),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnerUnavailable;
 
@@ -79,20 +63,22 @@ impl fmt::Display for RunnerUnavailable {
 impl std::error::Error for RunnerUnavailable {}
 
 pub struct AgentTaskRunner {
-    commands: Sender<AgentCommand>,
+    commands: async_mpsc::UnboundedSender<AgentCommand>,
     events: Receiver<AgentEvent>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl AgentTaskRunner {
-    pub fn spawn() -> Self {
-        Self::spawn_with_timing(RunnerTiming::default())
-    }
-
-    fn spawn_with_timing(timing: RunnerTiming) -> Self {
-        let (command_tx, command_rx) = mpsc::channel();
+    pub(crate) fn spawn(llm: LlmClient) -> Self {
+        let (command_tx, command_rx) = async_mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
-        let thread = thread::spawn(move || run_coordinator(command_rx, event_tx, timing));
+        let thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create the LLM runtime");
+            runtime.block_on(run_coordinator(command_rx, event_tx, llm));
+        });
 
         Self {
             commands: command_tx,
@@ -118,7 +104,10 @@ impl AgentTaskRunner {
     }
 
     #[cfg(test)]
-    fn recv_timeout(&self, timeout: Duration) -> Result<AgentEvent, mpsc::RecvTimeoutError> {
+    fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<AgentEvent, mpsc::RecvTimeoutError> {
         self.events.recv_timeout(timeout)
     }
 
@@ -139,27 +128,36 @@ impl Drop for AgentTaskRunner {
 #[derive(Debug)]
 struct PendingRequest {
     request_id: RequestId,
-    _prompt: String,
+    prompt: String,
 }
 
-#[derive(Debug)]
-enum Phase {
-    Thinking,
-    Streaming { chunks: Vec<String>, next: usize },
-}
-
-#[derive(Debug)]
 struct ActiveRequest {
     request_id: RequestId,
-    phase: Phase,
-    deadline: Instant,
+    task: AsyncJoinHandle<()>,
 }
 
-fn run_coordinator(
-    commands: Receiver<AgentCommand>,
+#[derive(Debug)]
+enum RequestUpdate {
+    TextDelta {
+        request_id: RequestId,
+        text: String,
+    },
+    Completed {
+        request_id: RequestId,
+        commit: ConversationCommit,
+    },
+    Failed {
+        request_id: RequestId,
+        message: String,
+    },
+}
+
+async fn run_coordinator(
+    mut commands: async_mpsc::UnboundedReceiver<AgentCommand>,
     events: Sender<AgentEvent>,
-    timing: RunnerTiming,
+    llm: LlmClient,
 ) {
+    let (update_tx, mut update_rx) = async_mpsc::unbounded_channel();
     let mut pending: VecDeque<PendingRequest> = VecDeque::new();
     let mut active: Option<ActiveRequest> = None;
 
@@ -175,140 +173,200 @@ fn run_coordinator(
             {
                 return;
             }
-            active = Some(ActiveRequest {
-                request_id: request.request_id,
-                phase: Phase::Thinking,
-                deadline: Instant::now() + timing.thinking,
-            });
+            let request_id = request.request_id;
+            let task = tokio::spawn(run_request(request, llm.clone(), update_tx.clone()));
+            active = Some(ActiveRequest { request_id, task });
         }
 
-        let command = match active.as_ref() {
-            Some(request) => {
-                let timeout = request.deadline.saturating_duration_since(Instant::now());
-                match commands.recv_timeout(timeout) {
-                    Ok(command) => Some(command),
-                    Err(RecvTimeoutError::Timeout) => {
-                        advance_active(&mut active, &events, timing);
-                        None
-                    }
-                    Err(RecvTimeoutError::Disconnected) => return,
+        tokio::select! {
+            command = commands.recv() => match command {
+                Some(AgentCommand::Submit { request_id, prompt }) => {
+                    pending.push_back(PendingRequest { request_id, prompt });
                 }
-            }
-            None => match commands.recv() {
-                Ok(command) => Some(command),
-                Err(_) => return,
-            },
-        };
-
-        match command {
-            Some(AgentCommand::Submit { request_id, prompt }) => {
-                pending.push_back(PendingRequest {
-                    request_id,
-                    _prompt: prompt,
-                });
-            }
-            Some(AgentCommand::Cancel { request_id }) => {
-                if active.as_ref().map(|request| request.request_id) == Some(request_id) {
-                    active = None;
-                    if events.send(AgentEvent::Interrupted { request_id }).is_err() {
-                        return;
+                Some(AgentCommand::Cancel { request_id }) => {
+                    if active.as_ref().map(|request| request.request_id) == Some(request_id) {
+                        if let Some(request) = active.take() {
+                            request.task.abort();
+                        }
+                        if events.send(AgentEvent::Interrupted { request_id }).is_err() {
+                            return;
+                        }
                     }
                 }
-            }
-            Some(AgentCommand::Shutdown) => return,
-            None => {}
-        }
-    }
-}
-
-fn advance_active(
-    active: &mut Option<ActiveRequest>,
-    events: &Sender<AgentEvent>,
-    timing: RunnerTiming,
-) {
-    let Some(request) = active.as_mut() else {
-        return;
-    };
-
-    match &mut request.phase {
-        Phase::Thinking => {
-            request.phase = Phase::Streaming {
-                chunks: response_chunks(),
-                next: 0,
-            };
-            request.deadline = Instant::now();
-        }
-        Phase::Streaming { chunks, next } => {
-            if let Some(text) = chunks.get(*next) {
-                if events
-                    .send(AgentEvent::TextDelta {
-                        request_id: request.request_id,
-                        text: text.clone(),
-                    })
-                    .is_err()
-                {
-                    *active = None;
+                Some(AgentCommand::Shutdown) | None => {
+                    if let Some(request) = active.take() {
+                        request.task.abort();
+                    }
                     return;
                 }
-                *next += 1;
-                request.deadline = Instant::now() + timing.chunk;
-            } else {
-                let request_id = request.request_id;
-                let _ = events.send(AgentEvent::Completed { request_id });
-                *active = None;
+            },
+            update = update_rx.recv() => {
+                let Some(update) = update else {
+                    return;
+                };
+                let request_id = match &update {
+                    RequestUpdate::TextDelta { request_id, .. }
+                    | RequestUpdate::Completed { request_id, .. }
+                    | RequestUpdate::Failed { request_id, .. } => *request_id,
+                };
+                if active.as_ref().map(|request| request.request_id) != Some(request_id) {
+                    continue;
+                }
+                let event = match update {
+                    RequestUpdate::TextDelta { request_id, text } => {
+                        AgentEvent::TextDelta { request_id, text }
+                    }
+                    RequestUpdate::Completed { request_id, commit } => {
+                        active = None;
+                        match llm.commit(commit) {
+                            Ok(()) => AgentEvent::Completed { request_id },
+                            Err(error) => AgentEvent::Failed {
+                                request_id,
+                                message: error.to_string(),
+                            },
+                        }
+                    }
+                    RequestUpdate::Failed { request_id, message } => {
+                        active = None;
+                        AgentEvent::Failed { request_id, message }
+                    }
+                };
+                if events.send(event).is_err() {
+                    return;
+                }
             }
         }
     }
 }
 
-fn response_chunks() -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut words = FAKE_RESPONSE.split_whitespace().peekable();
-    while let Some(word) = words.next() {
-        let suffix = if words.peek().is_some() { " " } else { "" };
-        chunks.push(format!("{word}{suffix}"));
+async fn run_request(
+    request: PendingRequest,
+    llm: LlmClient,
+    updates: async_mpsc::UnboundedSender<RequestUpdate>,
+) {
+    let request_id = request.request_id;
+    let mut stream = match llm.stream(request.prompt).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            let _ = updates.send(RequestUpdate::Failed {
+                request_id,
+                message: error.to_string(),
+            });
+            return;
+        }
+    };
+
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(LlmEvent::TextDelta(text)) => {
+                if updates
+                    .send(RequestUpdate::TextDelta { request_id, text })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(LlmEvent::Completed(commit)) => {
+                let _ = updates.send(RequestUpdate::Completed { request_id, commit });
+                return;
+            }
+            Err(error) => {
+                let _ = updates.send(RequestUpdate::Failed {
+                    request_id,
+                    message: error.to_string(),
+                });
+                return;
+            }
+        }
     }
-    chunks
+
+    let _ = updates.send(RequestUpdate::Failed {
+        request_id,
+        message: "the model stream ended before completion".into(),
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentEvent, AgentTaskRunner, RunnerTiming};
-    use std::time::Duration;
+    use super::{AgentEvent, AgentTaskRunner};
+    use crate::llm::{
+        LlmClient, LlmError, Provider, ProviderEvent, ProviderRequest, ProviderStream,
+    };
+    use futures::{future::BoxFuture, stream};
+    use std::{sync::Arc, time::Duration};
 
-    #[test]
-    fn interrupting_the_active_request_continues_with_the_next_queued_request() {
-        let mut runner = AgentTaskRunner::spawn_with_timing(RunnerTiming {
-            thinking: Duration::from_secs(1),
-            chunk: Duration::ZERO,
-        });
+    struct EchoProvider;
 
-        runner.submit(1, "first".into()).unwrap();
-        runner.submit(2, "second".into()).unwrap();
+    impl Provider for EchoProvider {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+        ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+            Box::pin(async move {
+                let response = format!("response to {}", request.prompt);
+                let mut history = request.history;
+                history.push(rig_core::completion::Message::user(request.prompt));
+                history.push(rig_core::completion::Message::assistant(response.clone()));
+                Ok(Box::pin(stream::iter([
+                    Ok(ProviderEvent::TextDelta(response)),
+                    Ok(ProviderEvent::Completed(history)),
+                ])) as ProviderStream)
+            })
+        }
+    }
 
-        assert_eq!(
-            runner.recv_timeout(Duration::from_millis(100)).unwrap(),
-            AgentEvent::Started { request_id: 1 }
-        );
-        runner.cancel(1).unwrap();
-        assert_eq!(
-            runner.recv_timeout(Duration::from_millis(100)).unwrap(),
-            AgentEvent::Interrupted { request_id: 1 }
-        );
-        assert_eq!(
-            runner.recv_timeout(Duration::from_millis(100)).unwrap(),
-            AgentEvent::Started { request_id: 2 }
-        );
+    struct BlockingFirstProvider;
 
-        runner.shutdown();
+    impl Provider for BlockingFirstProvider {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+        ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+            Box::pin(async move {
+                if request.prompt == "first" {
+                    Ok(Box::pin(stream::pending()) as ProviderStream)
+                } else {
+                    let mut history = request.history;
+                    history.push(rig_core::completion::Message::user(request.prompt));
+                    history.push(rig_core::completion::Message::assistant("second response"));
+                    Ok(Box::pin(stream::iter([
+                        Ok(ProviderEvent::TextDelta("second response".into())),
+                        Ok(ProviderEvent::Completed(history)),
+                    ])) as ProviderStream)
+                }
+            })
+        }
+    }
+
+    struct FailingFirstProvider;
+
+    impl Provider for FailingFirstProvider {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+        ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+            Box::pin(async move {
+                if request.prompt == "first" {
+                    Ok(Box::pin(stream::iter([Err(LlmError::Provider(
+                        "provider unavailable".into(),
+                    ))])) as ProviderStream)
+                } else {
+                    let mut history = request.history;
+                    history.push(rig_core::completion::Message::user(request.prompt));
+                    history.push(rig_core::completion::Message::assistant("recovered"));
+                    Ok(Box::pin(stream::iter([
+                        Ok(ProviderEvent::TextDelta("recovered".into())),
+                        Ok(ProviderEvent::Completed(history)),
+                    ])) as ProviderStream)
+                }
+            })
+        }
     }
 
     #[test]
     fn queued_requests_stream_to_completion_in_fifo_order() {
-        let mut runner = AgentTaskRunner::spawn_with_timing(RunnerTiming {
-            thinking: Duration::ZERO,
-            chunk: Duration::ZERO,
-        });
+        let client = LlmClient::with_provider(Arc::new(EchoProvider));
+        let mut runner = AgentTaskRunner::spawn(client);
         runner.submit(1, "first".into()).unwrap();
         runner.submit(2, "second".into()).unwrap();
 
@@ -331,7 +389,65 @@ mod tests {
             AgentEvent::TextDelta {
                 request_id: 1,
                 text
-            } if text.contains("funcode")
+            } if text == "response to first"
+        )));
+
+        runner.shutdown();
+    }
+
+    #[test]
+    fn interrupting_the_active_request_continues_with_the_next_queued_request() {
+        let client = LlmClient::with_provider(Arc::new(BlockingFirstProvider));
+        let mut runner = AgentTaskRunner::spawn(client);
+        runner.submit(1, "first".into()).unwrap();
+        runner.submit(2, "second".into()).unwrap();
+
+        assert_eq!(
+            runner.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AgentEvent::Started { request_id: 1 }
+        );
+        runner.cancel(1).unwrap();
+        assert_eq!(
+            runner.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AgentEvent::Interrupted { request_id: 1 }
+        );
+        assert_eq!(
+            runner.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AgentEvent::Started { request_id: 2 }
+        );
+
+        let mut events = Vec::new();
+        while !events.contains(&AgentEvent::Completed { request_id: 2 }) {
+            events.push(runner.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta { request_id: 2, text } if text == "second response"
+        )));
+
+        runner.shutdown();
+    }
+
+    #[test]
+    fn provider_failure_only_fails_the_active_request() {
+        let client = LlmClient::with_provider(Arc::new(FailingFirstProvider));
+        let mut runner = AgentTaskRunner::spawn(client);
+        runner.submit(1, "first".into()).unwrap();
+        runner.submit(2, "second".into()).unwrap();
+
+        let mut events = Vec::new();
+        while !events.contains(&AgentEvent::Completed { request_id: 2 }) {
+            events.push(runner.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Failed { request_id: 1, message } if message == "provider unavailable"
+        )));
+        assert!(events.contains(&AgentEvent::Started { request_id: 2 }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta { request_id: 2, text } if text == "recovered"
         )));
 
         runner.shutdown();

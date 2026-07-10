@@ -1,9 +1,9 @@
 # funcode
 
-`funcode` is an early terminal coding-agent prototype built with Rust and Ratatui. Phase 1 uses a
-background demo runner and streams a hardcoded response; it does not connect to a model or execute
-tools yet. Browser authentication with a ChatGPT subscription is available for the upcoming model
-integration phase.
+`funcode` is an early terminal coding-agent prototype built with Rust and Ratatui. It connects to
+ChatGPT through the saved subscription login, streams model responses in the background, and keeps
+successfully completed turns as conversation context for the current session. Tool execution is not
+implemented yet.
 
 ## Run
 
@@ -24,6 +24,15 @@ opens the OpenAI sign-in page in your browser and waits for the localhost callba
 cannot be opened automatically, copy the displayed URL. Credentials are stored in
 `~/.funcode/auth.json`; on Unix, the directory and file are restricted to the current user.
 
+The default model is `gpt-5.4`. Override it when starting Funcode:
+
+```sh
+FUNCODE_MODEL=gpt-5.3-instant cargo run
+```
+
+If credentials are missing or the saved refresh token is rejected, the failed turn tells you to run
+`/auth`. Expired access tokens are refreshed automatically and replaced atomically on disk.
+
 ## Controls
 
 - Enter: submit the composer
@@ -36,7 +45,8 @@ cannot be opened automatically, copy the displayed URL. Credentials are stored i
 - `/auth`: open the authentication picker
 - `/exit` or Ctrl+C: quit
 
-Prompts submitted while the runner is busy are shown immediately and processed in FIFO order.
-Thinking is only shown while the runner is thinking. Tools is only shown during an active tool call;
-the phase-one fake runner does not call tools. The commands displayed on the home screen are
-placeholders.
+Prompts submitted while the runner is busy are shown immediately and processed in FIFO order. Only
+completed turns are included in later model context; failed or interrupted turns remain visible but
+are not sent again. Thinking is shown until the first response text arrives. Tools is only shown
+during an active tool call; the current agent does not call tools. The commands displayed on the home
+screen are placeholders.
