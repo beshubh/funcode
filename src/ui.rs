@@ -130,21 +130,22 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
 }
 
 fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let content_area = area.inner(Margin::new(2, 0));
     let mut text = conversation_text(app, theme);
     if !app.follow_output {
         text.lines
             .insert(0, Line::styled("↑ End to follow", theme.muted));
     }
-    let line_count = wrapped_line_count(&text, area.width.max(1));
+    let line_count = wrapped_line_count(&text, content_area.width.max(1));
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
-    let viewport_height = area.height as usize;
+    let viewport_height = content_area.height as usize;
     let maximum_top = line_count.saturating_sub(viewport_height);
     let from_bottom = app.scroll_from_bottom.min(maximum_top);
     let top = maximum_top
         .saturating_sub(from_bottom)
         .min(u16::MAX as usize) as u16;
 
-    frame.render_widget(paragraph.scroll((top, 0)), area);
+    frame.render_widget(paragraph.scroll((top, 0)), content_area);
 }
 
 fn conversation_text(app: &App, theme: &Theme) -> Text<'static> {
@@ -461,6 +462,28 @@ mod tests {
         assert!(regions.tools.is_none());
         assert_eq!(top_left, " ");
         assert!(cursor_visible);
+    }
+
+    #[test]
+    fn transcript_content_has_balanced_horizontal_padding() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.turns.push(Turn::queued(1, "x".repeat(54)));
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &app, &Theme::default());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer.cell(Position::new(1, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell(Position::new(2, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell(Position::new(3, 1)).unwrap().symbol(), "y");
+        assert_eq!(buffer.cell(Position::new(56, 2)).unwrap().symbol(), "x");
+        assert_eq!(buffer.cell(Position::new(57, 2)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell(Position::new(58, 2)).unwrap().symbol(), " ");
     }
 
     #[test]
