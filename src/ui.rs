@@ -130,17 +130,14 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
 }
 
 fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let title = if app.follow_output {
-        "Agent messages".to_owned()
-    } else {
-        "Agent messages · End to follow".to_owned()
-    };
-    let block = panel_block(title, theme);
-    let inner = block.inner(area);
-    let text = conversation_text(app, theme);
-    let line_count = wrapped_line_count(&text, inner.width.max(1));
-    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
-    let viewport_height = inner.height as usize;
+    let mut text = conversation_text(app, theme);
+    if !app.follow_output {
+        text.lines
+            .insert(0, Line::styled("↑ End to follow", theme.muted));
+    }
+    let line_count = wrapped_line_count(&text, area.width.max(1));
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    let viewport_height = area.height as usize;
     let maximum_top = line_count.saturating_sub(viewport_height);
     let from_bottom = app.scroll_from_bottom.min(maximum_top);
     let top = maximum_top
@@ -317,10 +314,7 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let block = panel_block(
-        "Enter send · Shift+Enter new line",
-        theme,
-    );
+    let block = panel_block("Enter send · Shift+Enter new line", theme);
     let inner = block.inner(area);
     let (cursor_column, cursor_row) = composer_cursor(
         app.composer.text(),
@@ -458,7 +452,8 @@ mod tests {
 
         let (screen, cursor_visible, regions, top_left) = render_to_string(&app, 100, 30);
 
-        assert!(screen.contains("Agent messages"));
+        assert!(!screen.contains("Agent messages"));
+        assert!(screen.contains("No messages yet"));
         assert!(!screen.contains("Thinking"));
         assert!(!screen.contains("Tools"));
         assert!(screen.contains("Type something"));
