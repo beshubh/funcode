@@ -153,11 +153,21 @@ enum RequestUpdate {
 }
 
 async fn run_coordinator(
-    mut commands: async_mpsc::UnboundedReceiver<AgentCommand>,
+    commands: async_mpsc::UnboundedReceiver<AgentCommand>,
     events: Sender<AgentEvent>,
     llm: LlmClient,
 ) {
-    let (update_tx, mut update_rx) = async_mpsc::unbounded_channel();
+    let (update_tx, update_rx) = async_mpsc::unbounded_channel();
+    run_coordinator_with_updates(commands, events, llm, update_tx, update_rx).await;
+}
+
+async fn run_coordinator_with_updates(
+    mut commands: async_mpsc::UnboundedReceiver<AgentCommand>,
+    events: Sender<AgentEvent>,
+    llm: LlmClient,
+    update_tx: async_mpsc::UnboundedSender<RequestUpdate>,
+    mut update_rx: async_mpsc::UnboundedReceiver<RequestUpdate>,
+) {
     let mut pending: VecDeque<PendingRequest> = VecDeque::new();
     let mut active: Option<ActiveRequest> = None;
 
@@ -288,12 +298,19 @@ async fn run_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentEvent, AgentTaskRunner};
+    use super::{
+        AgentCommand, AgentEvent, AgentTaskRunner, RequestUpdate, run_coordinator_with_updates,
+    };
     use crate::llm::{
-        LlmClient, LlmError, Provider, ProviderEvent, ProviderRequest, ProviderStream,
+        ConversationMessage, LlmClient, LlmError, Provider, ProviderEvent, ProviderRequest,
+        ProviderStream,
     };
     use futures::{future::BoxFuture, stream};
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{Arc, mpsc},
+        thread,
+        time::Duration,
+    };
 
     struct EchoProvider;
 
@@ -305,8 +322,8 @@ mod tests {
             Box::pin(async move {
                 let response = format!("response to {}", request.prompt);
                 let mut history = request.history;
-                history.push(rig_core::completion::Message::user(request.prompt));
-                history.push(rig_core::completion::Message::assistant(response.clone()));
+                history.push(ConversationMessage::User(request.prompt));
+                history.push(ConversationMessage::Assistant(response.clone()));
                 Ok(Box::pin(stream::iter([
                     Ok(ProviderEvent::TextDelta(response)),
                     Ok(ProviderEvent::Completed(history)),
@@ -327,8 +344,8 @@ mod tests {
                     Ok(Box::pin(stream::pending()) as ProviderStream)
                 } else {
                     let mut history = request.history;
-                    history.push(rig_core::completion::Message::user(request.prompt));
-                    history.push(rig_core::completion::Message::assistant("second response"));
+                    history.push(ConversationMessage::User(request.prompt));
+                    history.push(ConversationMessage::Assistant("second response".into()));
                     Ok(Box::pin(stream::iter([
                         Ok(ProviderEvent::TextDelta("second response".into())),
                         Ok(ProviderEvent::Completed(history)),
@@ -352,8 +369,8 @@ mod tests {
                     ))])) as ProviderStream)
                 } else {
                     let mut history = request.history;
-                    history.push(rig_core::completion::Message::user(request.prompt));
-                    history.push(rig_core::completion::Message::assistant("recovered"));
+                    history.push(ConversationMessage::User(request.prompt));
+                    history.push(ConversationMessage::Assistant("recovered".into()));
                     Ok(Box::pin(stream::iter([
                         Ok(ProviderEvent::TextDelta("recovered".into())),
                         Ok(ProviderEvent::Completed(history)),
@@ -451,5 +468,70 @@ mod tests {
         )));
 
         runner.shutdown();
+    }
+
+    #[test]
+    fn late_updates_after_cancellation_are_discarded() {
+        let client = LlmClient::with_provider(Arc::new(BlockingFirstProvider));
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
+        let coordinator_update_tx = update_tx.clone();
+        let coordinator = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run_coordinator_with_updates(
+                    command_rx,
+                    event_tx,
+                    client,
+                    coordinator_update_tx,
+                    update_rx,
+                ));
+        });
+
+        command_tx
+            .send(AgentCommand::Submit {
+                request_id: 1,
+                prompt: "first".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AgentEvent::Started { request_id: 1 }
+        );
+        command_tx
+            .send(AgentCommand::Cancel { request_id: 1 })
+            .unwrap();
+        assert_eq!(
+            event_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AgentEvent::Interrupted { request_id: 1 }
+        );
+
+        update_tx
+            .send(RequestUpdate::TextDelta {
+                request_id: 1,
+                text: "stale".into(),
+            })
+            .unwrap();
+        command_tx
+            .send(AgentCommand::Submit {
+                request_id: 2,
+                prompt: "second".into(),
+            })
+            .unwrap();
+
+        let mut events = Vec::new();
+        while !events.contains(&AgentEvent::Completed { request_id: 2 }) {
+            events.push(event_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta { request_id: 1, text } if text == "stale"
+        )));
+
+        command_tx.send(AgentCommand::Shutdown).unwrap();
+        coordinator.join().unwrap();
     }
 }

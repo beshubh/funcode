@@ -1,9 +1,12 @@
-use super::super::{LlmError, Provider, ProviderRequest, ProviderStream};
+use super::super::{
+    ConversationMessage, LlmError, Provider, ProviderEvent, ProviderRequest, ProviderStream,
+};
 use crate::auth::AuthStore;
-use futures::{StreamExt, future::BoxFuture};
+use futures::{Stream, StreamExt, future, future::BoxFuture};
 use rig_core::{
     agent::MultiTurnStreamItem,
     client::CompletionClient,
+    completion::Message,
     providers::chatgpt::{self, ChatGPTAuth},
     streaming::{StreamedAssistantContent, StreamingPrompt},
 };
@@ -49,31 +52,263 @@ impl Provider for ChatGptProvider {
                 .map_err(|error| {
                     LlmError::Configuration(format!("could not configure ChatGPT: {error}"))
                 })?;
-            let agent = client.agent(model).build();
-            let stream = agent
-                .stream_prompt(request.prompt)
-                .with_history(request.history)
+            let ProviderRequest { prompt, history } = request;
+            let stream = client
+                .agent(model)
+                .build()
+                .stream_prompt(prompt.clone())
+                .with_history(rig_history(&history))
                 .await;
-            let events = stream.filter_map(|item| async move {
-                match item {
-                    Ok(MultiTurnStreamItem::StreamAssistantItem(
-                        StreamedAssistantContent::Text(text),
-                    )) => Some(Ok(super::super::ProviderEvent::TextDelta(text.text))),
-                    Ok(MultiTurnStreamItem::FinalResponse(response)) => {
-                        Some(match response.history().map(<[_]>::to_vec) {
-                            Some(history) => Ok(super::super::ProviderEvent::Completed(history)),
-                            None => Err(LlmError::Provider(
-                                "ChatGPT completed without returning conversation history".into(),
-                            )),
-                        })
-                    }
-                    Ok(_) => None,
-                    Err(error) => Some(Err(LlmError::Provider(format!(
-                        "ChatGPT request failed: {error}"
-                    )))),
-                }
+            let events = stream.map(|item| match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
+                    text,
+                ))) => ChatGptStreamEvent::Text(text.text),
+                Ok(MultiTurnStreamItem::FinalResponse(_)) => ChatGptStreamEvent::Finished,
+                Ok(_) => ChatGptStreamEvent::Ignored,
+                Err(error) => ChatGptStreamEvent::Failed(error.to_string()),
             });
-            Ok(Box::pin(events) as ProviderStream)
+            Ok(stream_events(
+                events,
+                ConversationAssembler::new(history, prompt),
+            ))
         })
+    }
+}
+
+enum ChatGptStreamEvent {
+    Text(String),
+    Finished,
+    Failed(String),
+    Ignored,
+}
+
+struct ConversationAssembler {
+    history: Vec<ConversationMessage>,
+    prompt: String,
+    response: String,
+    terminal: bool,
+}
+
+impl ConversationAssembler {
+    fn new(history: Vec<ConversationMessage>, prompt: String) -> Self {
+        Self {
+            history,
+            prompt,
+            response: String::new(),
+            terminal: false,
+        }
+    }
+
+    fn handle(&mut self, event: ChatGptStreamEvent) -> Option<Result<ProviderEvent, LlmError>> {
+        if self.terminal {
+            return None;
+        }
+
+        match event {
+            ChatGptStreamEvent::Text(text) => {
+                self.response.push_str(&text);
+                Some(Ok(ProviderEvent::TextDelta(text)))
+            }
+            ChatGptStreamEvent::Finished => {
+                self.terminal = true;
+                Some(Ok(ProviderEvent::Completed(completed_history(
+                    std::mem::take(&mut self.history),
+                    std::mem::take(&mut self.prompt),
+                    std::mem::take(&mut self.response),
+                ))))
+            }
+            ChatGptStreamEvent::Failed(message) => {
+                self.terminal = true;
+                Some(Err(chatgpt_stream_error(message)))
+            }
+            ChatGptStreamEvent::Ignored => None,
+        }
+    }
+}
+
+fn stream_events<S>(stream: S, assembler: ConversationAssembler) -> ProviderStream
+where
+    S: Stream<Item = ChatGptStreamEvent> + Send + 'static,
+{
+    Box::pin(
+        stream
+            .scan(assembler, |assembler, event| {
+                future::ready(Some(assembler.handle(event)))
+            })
+            .filter_map(future::ready),
+    )
+}
+
+fn rig_history(history: &[ConversationMessage]) -> Vec<Message> {
+    history
+        .iter()
+        .map(|message| match message {
+            ConversationMessage::User(text) => Message::user(text),
+            ConversationMessage::Assistant(text) => Message::assistant(text),
+        })
+        .collect()
+}
+
+fn completed_history(
+    mut history: Vec<ConversationMessage>,
+    prompt: String,
+    response: String,
+) -> Vec<ConversationMessage> {
+    history.push(ConversationMessage::User(prompt));
+    history.push(ConversationMessage::Assistant(response));
+    history
+}
+
+fn chatgpt_stream_error(message: String) -> LlmError {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid access token")
+    {
+        LlmError::AuthenticationRequired
+    } else {
+        LlmError::Provider(format!("ChatGPT request failed: {message}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ChatGptStreamEvent, ConversationAssembler, chatgpt_stream_error, rig_history, stream_events,
+    };
+    use crate::llm::{ConversationMessage, LlmError, ProviderEvent};
+    use futures::{StreamExt, stream};
+    use rig_core::completion::Message;
+
+    #[test]
+    fn translates_portable_history_only_inside_the_chatgpt_adapter() {
+        let history = vec![
+            ConversationMessage::User("first".into()),
+            ConversationMessage::Assistant("first response".into()),
+        ];
+
+        assert_eq!(
+            rig_history(&history),
+            vec![Message::user("first"), Message::assistant("first response")]
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_text_and_final_response_commit_the_portable_transcript() {
+        let events = stream_events(
+            stream::iter([
+                ChatGptStreamEvent::Text("second ".into()),
+                ChatGptStreamEvent::Text("response".into()),
+                ChatGptStreamEvent::Finished,
+            ]),
+            ConversationAssembler::new(
+                vec![ConversationMessage::User("first".into())],
+                "second".into(),
+            ),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(matches!(
+            &events[0],
+            Ok(ProviderEvent::TextDelta(text)) if text == "second "
+        ));
+        assert!(matches!(
+            &events[1],
+            Ok(ProviderEvent::TextDelta(text)) if text == "response"
+        ));
+        assert!(matches!(
+            &events[2],
+            Ok(ProviderEvent::Completed(history)) if history == &vec![
+                ConversationMessage::User("first".into()),
+                ConversationMessage::User("second".into()),
+                ConversationMessage::Assistant("second response".into()),
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_failures_do_not_emit_a_conversation_commit() {
+        let events = stream_events(
+            stream::iter([
+                ChatGptStreamEvent::Text("partial".into()),
+                ChatGptStreamEvent::Failed("network unavailable".into()),
+            ]),
+            ConversationAssembler::new(Vec::new(), "prompt".into()),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(matches!(
+            &events[0],
+            Ok(ProviderEvent::TextDelta(text)) if text == "partial"
+        ));
+        let error = match &events[1] {
+            Err(error) => error,
+            Ok(_) => panic!("a failed stream must not emit a completion"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "ChatGPT request failed: network unavailable"
+        );
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_partial_stream_does_not_emit_a_conversation_commit() {
+        let mut events = stream_events(
+            stream::iter([ChatGptStreamEvent::Text("partial".into())]).chain(stream::pending()),
+            ConversationAssembler::new(Vec::new(), "prompt".into()),
+        );
+
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(ProviderEvent::TextDelta(text))) if text == "partial"
+        ));
+        drop(events);
+    }
+
+    #[tokio::test]
+    async fn items_after_a_final_response_are_ignored() {
+        let events = stream_events(
+            stream::iter([
+                ChatGptStreamEvent::Text("complete".into()),
+                ChatGptStreamEvent::Finished,
+                ChatGptStreamEvent::Text("late text".into()),
+                ChatGptStreamEvent::Failed("late error".into()),
+            ]),
+            ConversationAssembler::new(Vec::new(), "prompt".into()),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], Ok(ProviderEvent::TextDelta(text)) if text == "complete"));
+        assert!(matches!(&events[1], Ok(ProviderEvent::Completed(_))));
+    }
+
+    #[test]
+    fn rejected_chatgpt_access_token_requires_authentication() {
+        assert_eq!(
+            chatgpt_stream_error("HttpError: Invalid status code: 401 Unauthorized".into()),
+            LlmError::AuthenticationRequired
+        );
+    }
+
+    #[test]
+    fn ignored_provider_events_do_not_advance_the_transcript() {
+        let mut assembler = ConversationAssembler::new(
+            vec![ConversationMessage::User("first".into())],
+            "second".into(),
+        );
+        assert!(assembler.handle(ChatGptStreamEvent::Ignored).is_none());
+        assert!(matches!(
+            assembler.handle(ChatGptStreamEvent::Finished),
+            Some(Ok(ProviderEvent::Completed(history))) if history == vec![
+                ConversationMessage::User("first".into()),
+                ConversationMessage::User("second".into()),
+                ConversationMessage::Assistant(String::new()),
+            ]
+        ));
     }
 }

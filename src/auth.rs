@@ -401,11 +401,50 @@ enum FlowControl {
     Shutdown,
 }
 
+#[cfg(not(windows))]
 fn replace_auth_file(
     temporary_path: &std::path::Path,
     auth_path: &std::path::Path,
 ) -> AnyResult<()> {
     fs::rename(temporary_path, auth_path).context("failed to install new auth data")
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+}
+
+#[cfg(windows)]
+fn replace_auth_file(
+    temporary_path: &std::path::Path,
+    auth_path: &std::path::Path,
+) -> AnyResult<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let temporary_path = temporary_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let auth_path = auth_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // Both paths are NUL-terminated UTF-16 paths owned by the vectors above.
+    let moved = unsafe {
+        MoveFileExW(
+            temporary_path.as_ptr(),
+            auth_path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to install new auth data");
+    }
+    Ok(())
 }
 
 fn run_auth_coordinator(commands: Receiver<AuthCommand>, events: Sender<AuthEvent>) {

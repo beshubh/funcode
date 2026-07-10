@@ -3,7 +3,6 @@ use futures::{
     future::BoxFuture,
     stream::{BoxStream, Stream},
 };
-use rig_core::completion::Message;
 use std::{
     fmt,
     pin::Pin,
@@ -24,7 +23,13 @@ pub(crate) enum LlmEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ConversationCommit {
-    history: Vec<Message>,
+    history: Vec<ConversationMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConversationMessage {
+    User(String),
+    Assistant(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,8 +67,8 @@ impl LlmConfig {
     }
 
     pub(crate) fn with_model(model: impl Into<String>) -> Result<Self, LlmError> {
-        let model = model.into();
-        if model.trim().is_empty() {
+        let model = model.into().trim().to_owned();
+        if model.is_empty() {
             return Err(LlmError::Configuration(
                 "FUNCODE_MODEL must not be empty".into(),
             ));
@@ -75,12 +80,12 @@ impl LlmConfig {
 #[derive(Clone)]
 pub(crate) struct ProviderRequest {
     pub(crate) prompt: String,
-    pub(crate) history: Vec<Message>,
+    pub(crate) history: Vec<ConversationMessage>,
 }
 
 pub(crate) enum ProviderEvent {
     TextDelta(String),
-    Completed(Vec<Message>),
+    Completed(Vec<ConversationMessage>),
 }
 
 pub(crate) type ProviderStream = BoxStream<'static, Result<ProviderEvent, LlmError>>;
@@ -95,7 +100,7 @@ pub(crate) trait Provider: Send + Sync {
 #[derive(Clone)]
 pub(crate) struct LlmClient {
     provider: Arc<dyn Provider>,
-    history: Arc<Mutex<Vec<Message>>>,
+    history: Arc<Mutex<Vec<ConversationMessage>>>,
 }
 
 impl LlmClient {
@@ -146,7 +151,8 @@ impl LlmClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        LlmClient, LlmError, LlmEvent, Provider, ProviderEvent, ProviderRequest, ProviderStream,
+        ConversationMessage, LlmClient, LlmError, LlmEvent, Provider, ProviderEvent,
+        ProviderRequest, ProviderStream,
     };
     use futures::{StreamExt, future::BoxFuture, stream};
     use std::{
@@ -163,8 +169,8 @@ mod tests {
         ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
             Box::pin(async move {
                 let history = vec![
-                    rig_core::completion::Message::user(request.prompt),
-                    rig_core::completion::Message::assistant("hello world"),
+                    ConversationMessage::User(request.prompt),
+                    ConversationMessage::Assistant("hello world".into()),
                 ];
                 Ok(Box::pin(stream::iter([
                     Ok(ProviderEvent::TextDelta("hello ".into())),
@@ -211,8 +217,8 @@ mod tests {
     async fn completed_history_is_sent_with_the_next_prompt() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let first_history = vec![
-            rig_core::completion::Message::user("first"),
-            rig_core::completion::Message::assistant("first response"),
+            ConversationMessage::User("first".into()),
+            ConversationMessage::Assistant("first response".into()),
         ];
         let provider = RecordingProvider {
             requests: Arc::clone(&requests),
@@ -287,6 +293,12 @@ mod tests {
             error,
             LlmError::Configuration("FUNCODE_MODEL must not be empty".into())
         );
+    }
+
+    #[test]
+    fn model_configuration_trims_whitespace() {
+        let config = super::LlmConfig::with_model(" gpt-5.4 ").unwrap();
+        assert_eq!(config.model, "gpt-5.4");
     }
 
     #[tokio::test]
