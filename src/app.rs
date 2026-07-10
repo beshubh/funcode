@@ -1,4 +1,7 @@
-use crate::agent::{AgentEvent, RequestId};
+use crate::{
+    agent::{AgentEvent, RequestId},
+    auth::AuthEvent,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::{Duration, Instant};
 
@@ -10,6 +13,58 @@ pub enum Screen {
     #[default]
     Home,
     Chat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthProvider {
+    ChatGptSubscription,
+}
+
+impl AuthProvider {
+    pub const ALL: [Self; 1] = [Self::ChatGptSubscription];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ChatGptSubscription => "ChatGPT subscription",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::ChatGptSubscription => "Sign in through your browser",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthDialogPhase {
+    Selecting,
+    Starting,
+    WaitingForBrowser {
+        authorization_url: String,
+        browser_opened: bool,
+    },
+    Succeeded {
+        account_id: Option<String>,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthDialog {
+    pub phase: AuthDialogPhase,
+    pub selected: usize,
+}
+
+impl Default for AuthDialog {
+    fn default() -> Self {
+        Self {
+            phase: AuthDialogPhase::Selecting,
+            selected: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +111,12 @@ pub enum AppAction {
     },
     Cancel {
         request_id: RequestId,
+    },
+    Authenticate {
+        provider: AuthProvider,
+    },
+    CancelAuthentication {
+        quit: bool,
     },
     Quit,
 }
@@ -176,9 +237,11 @@ pub struct App {
     pub thinking_expanded: bool,
     pub tools_expanded: bool,
     pub active_tool: Option<ToolActivity>,
+    pub auth_dialog: Option<AuthDialog>,
     next_request_id: RequestId,
     last_escape: Option<Instant>,
     cancellation_requested: bool,
+    auth_only: bool,
 }
 
 impl App {
@@ -190,9 +253,22 @@ impl App {
         }
     }
 
+    pub fn for_auth() -> Self {
+        let mut app = Self {
+            auth_only: true,
+            ..Self::new()
+        };
+        app.open_auth_dialog();
+        app
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent, now: Instant) -> Option<AppAction> {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Some(AppAction::Quit);
+        }
+
+        if self.auth_dialog.is_some() {
+            return self.handle_auth_key(key);
         }
 
         if self.screen == Screen::Home {
@@ -280,7 +356,7 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        if self.screen == Screen::Chat {
+        if self.screen == Screen::Chat && self.auth_dialog.is_none() {
             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
             self.composer.insert_text(&normalized);
             self.last_escape = None;
@@ -371,6 +447,30 @@ impl App {
         }
     }
 
+    pub fn handle_auth_event(&mut self, event: AuthEvent) {
+        let Some(dialog) = self.auth_dialog.as_mut() else {
+            return;
+        };
+        match event {
+            AuthEvent::BrowserOpened {
+                authorization_url,
+                browser_opened,
+            } => {
+                dialog.phase = AuthDialogPhase::WaitingForBrowser {
+                    authorization_url,
+                    browser_opened,
+                };
+            }
+            AuthEvent::Succeeded { account_id } => {
+                dialog.phase = AuthDialogPhase::Succeeded { account_id };
+            }
+            AuthEvent::Failed { message } => {
+                dialog.phase = AuthDialogPhase::Failed { message };
+            }
+            AuthEvent::Cancelled => self.auth_dialog = None,
+        }
+    }
+
     pub fn tick(&mut self) {
         self.animation_frame = self.animation_frame.wrapping_add(1);
         if self
@@ -398,6 +498,88 @@ impl App {
     pub fn toggle_tools(&mut self) {
         if self.active_tool.is_some() {
             self.tools_expanded = !self.tools_expanded;
+        }
+    }
+
+    pub fn open_auth_dialog(&mut self) {
+        self.auth_dialog = Some(AuthDialog::default());
+        self.last_escape = None;
+    }
+
+    pub fn select_auth_provider(&mut self) -> Option<AppAction> {
+        let dialog = self.auth_dialog.as_mut()?;
+        if dialog.phase != AuthDialogPhase::Selecting {
+            return None;
+        }
+        let provider = *AuthProvider::ALL.get(dialog.selected)?;
+        dialog.phase = AuthDialogPhase::Starting;
+        Some(AppAction::Authenticate { provider })
+    }
+
+    pub fn move_auth_selection(&mut self, direction: i8) {
+        let Some(dialog) = self.auth_dialog.as_mut() else {
+            return;
+        };
+        if dialog.phase != AuthDialogPhase::Selecting {
+            return;
+        }
+        let provider_count = AuthProvider::ALL.len();
+        if direction < 0 {
+            dialog.selected = if dialog.selected == 0 {
+                provider_count - 1
+            } else {
+                dialog.selected - 1
+            };
+        } else {
+            dialog.selected = if dialog.selected + 1 >= provider_count {
+                0
+            } else {
+                dialog.selected + 1
+            };
+        }
+    }
+
+    fn handle_auth_key(&mut self, key: KeyEvent) -> Option<AppAction> {
+        match key.code {
+            KeyCode::Esc => {
+                let should_cancel = self.auth_dialog.as_ref().is_some_and(|dialog| {
+                    matches!(
+                        dialog.phase,
+                        AuthDialogPhase::Starting | AuthDialogPhase::WaitingForBrowser { .. }
+                    )
+                });
+                self.auth_dialog = None;
+                if should_cancel {
+                    Some(AppAction::CancelAuthentication {
+                        quit: self.auth_only,
+                    })
+                } else if self.auth_only {
+                    Some(AppAction::Quit)
+                } else {
+                    None
+                }
+            }
+            KeyCode::Up => {
+                self.move_auth_selection(-1);
+                None
+            }
+            KeyCode::Down => {
+                self.move_auth_selection(1);
+                None
+            }
+            KeyCode::Enter => match self.auth_dialog.as_ref().map(|dialog| &dialog.phase) {
+                Some(AuthDialogPhase::Selecting) => self.select_auth_provider(),
+                Some(AuthDialogPhase::Succeeded { .. }) => {
+                    self.auth_dialog = None;
+                    self.auth_only.then_some(AppAction::Quit)
+                }
+                Some(AuthDialogPhase::Failed { .. }) => {
+                    self.open_auth_dialog();
+                    None
+                }
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -430,6 +612,11 @@ impl App {
     }
 
     fn submit_composer(&mut self) -> Option<AppAction> {
+        if self.composer.text().trim() == "/auth" {
+            self.composer.take();
+            self.open_auth_dialog();
+            return None;
+        }
         if self.composer.text().trim() == "/exit" {
             self.composer.take();
             return Some(AppAction::Quit);
@@ -469,13 +656,98 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, AppAction, ResponseStatus, Screen};
-    use crate::agent::AgentEvent;
+    use super::{App, AppAction, AuthDialogPhase, AuthProvider, ResponseStatus, Screen};
+    use crate::{agent::AgentEvent, auth::AuthEvent};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::{Duration, Instant};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn auth_command_opens_the_provider_picker_without_submitting_a_prompt() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("/auth");
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
+        assert!(app.turns.is_empty());
+        assert_eq!(
+            app.auth_dialog.as_ref().map(|dialog| &dialog.phase),
+            Some(&AuthDialogPhase::Selecting)
+        );
+    }
+
+    #[test]
+    fn enter_selects_chatgpt_subscription_and_escape_closes_the_picker() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.open_auth_dialog();
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::Authenticate {
+                provider: AuthProvider::ChatGptSubscription,
+            })
+        );
+
+        app.open_auth_dialog();
+        assert_eq!(app.handle_key(key(KeyCode::Esc), Instant::now()), None);
+        assert!(app.auth_dialog.is_none());
+    }
+
+    #[test]
+    fn browser_auth_events_are_reflected_in_the_dialog() {
+        let mut app = App::new();
+        app.open_auth_dialog();
+        app.select_auth_provider();
+
+        app.handle_auth_event(AuthEvent::BrowserOpened {
+            authorization_url: "https://example.test/sign-in".into(),
+            browser_opened: true,
+        });
+        assert!(matches!(
+            app.auth_dialog.as_ref().map(|dialog| &dialog.phase),
+            Some(AuthDialogPhase::WaitingForBrowser { .. })
+        ));
+
+        app.handle_auth_event(AuthEvent::Succeeded {
+            account_id: Some("workspace-123".into()),
+        });
+        assert_eq!(
+            app.auth_dialog.as_ref().map(|dialog| &dialog.phase),
+            Some(&AuthDialogPhase::Succeeded {
+                account_id: Some("workspace-123".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn auth_only_mode_starts_in_the_picker_and_exits_after_success() {
+        let mut app = App::for_auth();
+        assert!(app.auth_dialog.is_some());
+
+        app.select_auth_provider();
+        app.handle_auth_event(AuthEvent::Succeeded { account_id: None });
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::Quit)
+        );
+    }
+
+    #[test]
+    fn provider_picker_accepts_arrow_navigation_with_one_provider() {
+        let mut app = App::new();
+        app.open_auth_dialog();
+
+        app.handle_key(key(KeyCode::Down), Instant::now());
+        app.handle_key(key(KeyCode::Up), Instant::now());
+
+        assert_eq!(
+            app.auth_dialog.as_ref().map(|dialog| dialog.selected),
+            Some(0)
+        );
     }
 
     #[test]

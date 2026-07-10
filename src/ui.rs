@@ -1,12 +1,13 @@
 use crate::{
-    app::{App, ResponseStatus, Screen},
+    app::{App, AuthProvider, ResponseStatus, Screen},
     theme::Theme,
 };
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
+    style::Modifier,
     text::{Line, Span, Text},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph, Wrap},
 };
 
 const CHAT_MIN_WIDTH: u16 = 60;
@@ -18,18 +19,25 @@ const HOME_MIN_HEIGHT: u16 = 20;
 pub enum UiTarget {
     Thinking,
     Tools,
+    AuthProvider,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UiRegions {
     pub thinking: Option<Rect>,
     pub tools: Option<Rect>,
+    pub auth_provider: Option<Rect>,
 }
 
 impl UiRegions {
     pub fn target_at(self, column: u16, row: u16) -> Option<UiTarget> {
         let position = Position::new(column, row);
-        if self.thinking.is_some_and(|area| area.contains(position)) {
+        if self
+            .auth_provider
+            .is_some_and(|area| area.contains(position))
+        {
+            Some(UiTarget::AuthProvider)
+        } else if self.thinking.is_some_and(|area| area.contains(position)) {
             Some(UiTarget::Thinking)
         } else if self.tools.is_some_and(|area| area.contains(position)) {
             Some(UiTarget::Tools)
@@ -41,7 +49,7 @@ impl UiRegions {
 
 pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
     let area = frame.area();
-    match app.screen {
+    let mut regions = match app.screen {
         Screen::Home if area.width < HOME_MIN_WIDTH || area.height < HOME_MIN_HEIGHT => {
             render_too_small(frame, area, HOME_MIN_WIDTH, HOME_MIN_HEIGHT, theme);
             UiRegions::default()
@@ -55,6 +63,123 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
             UiRegions::default()
         }
         Screen::Chat => render_chat(frame, area, app, theme),
+    };
+
+    if app.auth_dialog.is_some() && area.width >= HOME_MIN_WIDTH && area.height >= HOME_MIN_HEIGHT {
+        regions = UiRegions {
+            auth_provider: render_auth_dialog(frame, area, app, theme),
+            ..UiRegions::default()
+        };
+    }
+    regions
+}
+
+fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Option<Rect> {
+    let width = area.width.saturating_sub(4).min(64);
+    let height = 12.min(area.height.saturating_sub(2));
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(panel_block(" Authenticate ", theme), dialog_area);
+
+    let inner = dialog_area.inner(Margin::new(2, 1));
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(4),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+
+    let dialog = app.auth_dialog.as_ref()?;
+    match &dialog.phase {
+        crate::app::AuthDialogPhase::Selecting => {
+            frame.render_widget(
+                Paragraph::new("Choose how to authenticate").style(theme.heading),
+                rows[0],
+            );
+            let option = Paragraph::new(Text::from(vec![
+                Line::styled(
+                    format!(" {} ", AuthProvider::ChatGptSubscription.label()),
+                    theme.status.add_modifier(Modifier::REVERSED),
+                ),
+                Line::styled(
+                    format!(" {}", AuthProvider::ChatGptSubscription.description()),
+                    theme.muted,
+                ),
+            ]))
+            .block(panel_block(" OpenAI ", theme));
+            frame.render_widget(option, rows[1]);
+            frame.render_widget(
+                Paragraph::new("↑/↓ select · Enter open · click · Esc close").style(theme.muted),
+                rows[2],
+            );
+            Some(rows[1])
+        }
+        crate::app::AuthDialogPhase::Starting => {
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::styled("Preparing browser sign-in…", theme.status),
+                    Line::styled("Esc cancels", theme.muted),
+                ]))
+                .wrap(Wrap { trim: false }),
+                inner,
+            );
+            None
+        }
+        crate::app::AuthDialogPhase::WaitingForBrowser {
+            authorization_url,
+            browser_opened,
+        } => {
+            let heading = if *browser_opened {
+                "Finish signing in through your browser"
+            } else {
+                "Open this URL in your browser"
+            };
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::styled(heading, theme.status),
+                    Line::styled(authorization_url.clone(), theme.muted),
+                    Line::from(""),
+                    Line::styled("Waiting for ChatGPT… · Esc cancel", theme.muted),
+                ]))
+                .wrap(Wrap { trim: false }),
+                inner,
+            );
+            None
+        }
+        crate::app::AuthDialogPhase::Succeeded { account_id } => {
+            let detail = account_id.as_deref().map_or_else(
+                || "Credentials saved".to_owned(),
+                |id| format!("Connected to {id}"),
+            );
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::styled("✓ Authenticated with ChatGPT", theme.status),
+                    Line::styled(detail, theme.muted),
+                    Line::from(""),
+                    Line::styled("Enter close", theme.muted),
+                ])),
+                inner,
+            );
+            None
+        }
+        crate::app::AuthDialogPhase::Failed { message } => {
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::styled("ChatGPT sign-in failed", theme.warning),
+                    Line::styled(message.clone(), theme.muted),
+                    Line::from(""),
+                    Line::styled("Enter choose provider · Esc close", theme.muted),
+                ]))
+                .wrap(Wrap { trim: false }),
+                inner,
+            );
+            None
+        }
     }
 }
 
@@ -157,6 +282,10 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::from(vec![
             Span::styled("/help", theme.status),
             Span::raw("      show command help"),
+        ]),
+        Line::from(vec![
+            Span::styled("/auth", theme.status),
+            Span::raw("      authenticate with a provider"),
         ]),
         Line::from(vec![
             Span::styled("/exit", theme.status),
@@ -398,12 +527,14 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
             .scroll((vertical_scroll, 0)),
         area,
     );
-    frame.set_cursor_position((
-        inner.x.saturating_add(cursor_column),
-        inner
-            .y
-            .saturating_add(cursor_row.saturating_sub(vertical_scroll)),
-    ));
+    if app.auth_dialog.is_none() {
+        frame.set_cursor_position((
+            inner.x.saturating_add(cursor_column),
+            inner
+                .y
+                .saturating_add(cursor_row.saturating_sub(vertical_scroll)),
+        ));
+    }
 }
 
 fn composer_cursor(text: &str, cursor: usize, width: u16) -> (u16, u16) {
@@ -524,6 +655,25 @@ mod tests {
         assert!(regions.tools.is_none());
         assert_eq!(top_left, " ");
         assert!(cursor_visible);
+    }
+
+    #[test]
+    fn auth_dialog_lists_chatgpt_subscription_as_a_clickable_provider() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.turns.push(Turn::queued(1, "hello".into()));
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.open_auth_dialog();
+
+        let (screen, cursor_visible, regions, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("Authenticate"));
+        assert!(screen.contains("ChatGPT subscription"));
+        assert!(screen.contains("browser"));
+        assert!(regions.auth_provider.is_some());
+        assert!(regions.thinking.is_none());
+        assert!(regions.tools.is_none());
+        assert!(!cursor_visible);
     }
 
     #[test]
