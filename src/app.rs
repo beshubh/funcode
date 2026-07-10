@@ -1,6 +1,7 @@
 use crate::{
     agent::{AgentEvent, RequestId},
     auth::AuthEvent,
+    commands::{Command, CommandRegistry},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::{Duration, Instant};
@@ -121,6 +122,19 @@ pub enum AppAction {
     Quit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuggestionKind {
+    Command,
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    pub label: String,
+    pub description: String,
+    pub kind: SuggestionKind,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Composer {
     text: String,
@@ -217,6 +231,11 @@ impl Composer {
                 .drain(self.cursor..self.cursor + character.len_utf8());
         }
     }
+
+    fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+    }
 }
 
 fn byte_index_at_character(text: &str, character_index: usize) -> usize {
@@ -238,6 +257,9 @@ pub struct App {
     pub tools_expanded: bool,
     pub active_tool: Option<ToolActivity>,
     pub auth_dialog: Option<AuthDialog>,
+    commands: CommandRegistry,
+    workspace_files: Vec<String>,
+    suggestion_selected: usize,
     next_request_id: RequestId,
     last_escape: Option<Instant>,
     cancellation_requested: bool,
@@ -249,8 +271,20 @@ impl App {
         Self {
             follow_output: true,
             next_request_id: 1,
+            commands: CommandRegistry::with_builtins(),
             ..Self::default()
         }
+    }
+
+    pub fn with_files<I, S>(files: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut app = Self::new();
+        app.workspace_files = files.into_iter().map(Into::into).collect();
+        app.workspace_files.sort();
+        app
     }
 
     pub fn for_auth() -> Self {
@@ -286,6 +320,23 @@ impl App {
         }
         self.last_escape = None;
 
+        if !self.suggestions().is_empty() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Tab => {
+                    return self.activate_suggestion(self.selected_suggestion());
+                }
+                KeyCode::Up => {
+                    self.move_suggestion_selection(-1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.move_suggestion_selection(1);
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.composer.insert_text("\n");
@@ -302,6 +353,7 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.composer.insert_text(&character.to_string());
+                self.suggestion_selected = 0;
                 None
             }
             KeyCode::Left => {
@@ -335,10 +387,12 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.composer.backspace();
+                self.suggestion_selected = 0;
                 None
             }
             KeyCode::Delete => {
                 self.composer.delete();
+                self.suggestion_selected = 0;
                 None
             }
             KeyCode::PageUp => {
@@ -359,8 +413,92 @@ impl App {
         if self.screen == Screen::Chat && self.auth_dialog.is_none() {
             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
             self.composer.insert_text(&normalized);
+            self.suggestion_selected = 0;
             self.last_escape = None;
         }
+    }
+
+    pub fn register_command(&mut self, command: impl Command + 'static) {
+        self.commands.register(command);
+    }
+
+    pub fn suggestions(&self) -> Vec<Suggestion> {
+        let text = self.composer.text();
+        if self.composer.cursor() == text.len()
+            && text.starts_with('/')
+            && !text.chars().any(char::is_whitespace)
+        {
+            let commands: Vec<_> = self
+                .commands
+                .matching(&text[1..])
+                .map(|command| Suggestion {
+                    label: format!("/{}", command.name()),
+                    description: command.description().to_owned(),
+                    kind: SuggestionKind::Command,
+                })
+                .collect();
+            if !commands.is_empty() {
+                return commands;
+            }
+        }
+
+        let Some((_, query)) = active_file_query(text, self.composer.cursor()) else {
+            return Vec::new();
+        };
+        let query = query.to_lowercase();
+        self.workspace_files
+            .iter()
+            .filter(|path| path.to_lowercase().contains(&query))
+            .take(8)
+            .map(|path| Suggestion {
+                label: path.clone(),
+                description: "File".to_owned(),
+                kind: SuggestionKind::File,
+            })
+            .collect()
+    }
+
+    pub fn activate_suggestion(&mut self, index: usize) -> Option<AppAction> {
+        let suggestion = self.suggestions().get(index)?.clone();
+        match suggestion.kind {
+            SuggestionKind::Command => {
+                self.composer.take();
+                self.commands
+                    .find(suggestion.label.trim_start_matches('/'))?
+                    .execute(self)
+            }
+            SuggestionKind::File => {
+                let (range, _) = active_file_query(self.composer.text(), self.composer.cursor())?;
+                self.composer
+                    .replace_range(range, &format!("@{} ", suggestion.label));
+                self.suggestion_selected = 0;
+                None
+            }
+        }
+    }
+
+    pub fn selected_suggestion(&self) -> usize {
+        self.suggestion_selected
+            .min(self.suggestions().len().saturating_sub(1))
+    }
+
+    pub fn set_suggestion_selection(&mut self, index: usize) {
+        if index < self.suggestions().len() {
+            self.suggestion_selected = index;
+        }
+    }
+
+    pub fn move_suggestion_selection(&mut self, direction: i8) {
+        let count = self.suggestions().len();
+        if count == 0 {
+            return;
+        }
+        let current = self.selected_suggestion();
+        self.suggestion_selected = if direction < 0 {
+            current.checked_sub(1).unwrap_or(count - 1)
+        } else {
+            (current + 1) % count
+        };
     }
 
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
@@ -612,14 +750,14 @@ impl App {
     }
 
     fn submit_composer(&mut self) -> Option<AppAction> {
-        if self.composer.text().trim() == "/auth" {
+        let command = self
+            .composer
+            .text()
+            .strip_prefix('/')
+            .and_then(|name| self.commands.find(name));
+        if let Some(command) = command {
             self.composer.take();
-            self.open_auth_dialog();
-            return None;
-        }
-        if self.composer.text().trim() == "/exit" {
-            self.composer.take();
-            return Some(AppAction::Quit);
+            return command.execute(self);
         }
         if self.composer.text().trim().is_empty() {
             return None;
@@ -654,15 +792,106 @@ impl App {
     }
 }
 
+fn active_file_query(text: &str, cursor: usize) -> Option<(std::ops::Range<usize>, &str)> {
+    let start = text[..cursor].rfind('@')?;
+    let query = &text[start + 1..cursor];
+    (!query.chars().any(char::is_whitespace)).then_some((start..cursor, query))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{App, AppAction, AuthDialogPhase, AuthProvider, ResponseStatus, Screen};
-    use crate::{agent::AgentEvent, auth::AuthEvent};
+    use super::{
+        App, AppAction, AuthDialogPhase, AuthProvider, ResponseStatus, Screen, SuggestionKind,
+    };
+    use crate::{agent::AgentEvent, auth::AuthEvent, commands::Command};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::{Duration, Instant};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn slash_at_the_start_discovers_and_runs_registered_commands() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("/a");
+
+        let suggestions = app.suggestions();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].label, "/auth");
+        assert_eq!(suggestions[0].kind, SuggestionKind::Command);
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
+        assert!(app.auth_dialog.is_some());
+        assert!(app.composer.text().is_empty());
+    }
+
+    #[test]
+    fn at_query_anywhere_in_the_composer_inserts_the_selected_file() {
+        let mut app = App::with_files(["Cargo.toml", "src/main.rs", "src/runtime.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("please inspect @src/ma");
+
+        let suggestions = app.suggestions();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].label, "src/main.rs");
+        assert_eq!(suggestions[0].kind, SuggestionKind::File);
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
+        assert_eq!(app.composer.text(), "please inspect @src/main.rs ");
+    }
+
+    #[test]
+    fn arrow_keys_choose_a_command_and_slash_text_with_arguments_submits_normally() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("/");
+
+        app.handle_key(key(KeyCode::Down), Instant::now());
+        assert_eq!(app.selected_suggestion(), 1);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::Quit)
+        );
+
+        app.composer.insert_text("/auth later");
+        assert!(app.suggestions().is_empty());
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::Submit { prompt, .. }) if prompt == "/auth later"
+        ));
+    }
+
+    #[derive(Debug)]
+    struct ToggleToolsCommand;
+
+    impl Command for ToggleToolsCommand {
+        fn name(&self) -> &'static str {
+            "toggle-tools"
+        }
+
+        fn description(&self) -> &'static str {
+            "Toggle tools"
+        }
+
+        fn execute(&self, app: &mut App) -> Option<AppAction> {
+            app.tools_expanded = !app.tools_expanded;
+            None
+        }
+    }
+
+    #[test]
+    fn a_new_command_only_needs_a_trait_implementation_and_registration() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.register_command(ToggleToolsCommand);
+        app.composer.insert_text("/toggle-tools");
+
+        app.handle_key(key(KeyCode::Enter), Instant::now());
+
+        assert!(app.tools_expanded);
+        assert!(app.composer.text().is_empty());
     }
 
     #[test]

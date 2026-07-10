@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, AuthProvider, ResponseStatus, Screen},
+    app::{App, AuthProvider, ResponseStatus, Screen, Suggestion, SuggestionKind},
     theme::Theme,
 };
 use ratatui::{
@@ -20,23 +20,32 @@ pub enum UiTarget {
     Thinking,
     Tools,
     AuthProvider,
+    Suggestion(usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UiRegions {
     pub thinking: Option<Rect>,
     pub tools: Option<Rect>,
     pub auth_provider: Option<Rect>,
+    pub suggestions: Vec<Rect>,
 }
 
 impl UiRegions {
-    pub fn target_at(self, column: u16, row: u16) -> Option<UiTarget> {
+    pub fn target_at(&self, column: u16, row: u16) -> Option<UiTarget> {
         let position = Position::new(column, row);
         if self
             .auth_provider
             .is_some_and(|area| area.contains(position))
         {
             Some(UiTarget::AuthProvider)
+        } else if let Some((index, _)) = self
+            .suggestions
+            .iter()
+            .enumerate()
+            .find(|(_, area)| area.contains(position))
+        {
+            Some(UiTarget::Suggestion(index))
         } else if self.thinking.is_some_and(|area| area.contains(position)) {
             Some(UiTarget::Thinking)
         } else if self.tools.is_some_and(|area| area.contains(position)) {
@@ -304,6 +313,7 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
 fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> UiRegions {
     let inner = area.inner(Margin::new(1, 1));
     let contextual_height = contextual_widgets_height(app);
+    let suggestions = app.suggestions();
 
     let rows = Layout::vertical([
         Constraint::Min(5),
@@ -314,9 +324,57 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
     .split(inner);
 
     render_messages(frame, rows[0], app, theme);
-    let regions = render_contextual_widgets(frame, rows[1], app, theme);
+    let mut regions = render_contextual_widgets(frame, rows[1], app, theme);
     render_activity(frame, rows[2], app, theme);
-    render_composer(frame, rows[3], app, theme);
+    let composer_area = rows[3];
+    let suggestion_height =
+        (suggestions.len() as u16 + 2).min(composer_area.y.saturating_sub(inner.y));
+    let suggestion_area = Rect::new(
+        composer_area.x,
+        composer_area.y.saturating_sub(suggestion_height),
+        composer_area.width,
+        suggestion_height,
+    );
+    regions.suggestions = render_suggestions(frame, suggestion_area, app, &suggestions, theme);
+    render_composer(frame, composer_area, app, theme);
+    regions
+}
+
+fn render_suggestions(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    suggestions: &[Suggestion],
+    theme: &Theme,
+) -> Vec<Rect> {
+    if suggestions.is_empty() || area.is_empty() {
+        return Vec::new();
+    }
+
+    let title = match suggestions[0].kind {
+        SuggestionKind::Command => " Commands ",
+        SuggestionKind::File => " Files ",
+    };
+    let block = panel_block(title, theme);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let mut regions = Vec::with_capacity(suggestions.len());
+    for (index, suggestion) in suggestions.iter().enumerate() {
+        let row = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
+        let line = Line::from(vec![
+            Span::styled(format!(" {}", suggestion.label), theme.status),
+            Span::styled(format!("  {}", suggestion.description), theme.muted),
+        ]);
+        let style = if index == app.selected_suggestion() {
+            ratatui::style::Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            ratatui::style::Style::default()
+        };
+        frame.render_widget(Paragraph::new(line).style(style), row);
+        regions.push(row);
+    }
     regions
 }
 
@@ -655,6 +713,76 @@ mod tests {
         assert!(regions.tools.is_none());
         assert_eq!(top_left, " ");
         assert!(cursor_visible);
+    }
+
+    #[test]
+    fn file_suggestions_render_above_the_composer_with_clickable_rows() {
+        let mut app = App::with_files(["src/app.rs", "src/main.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("inspect @src/");
+
+        let (screen, _, regions, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("Files"));
+        assert!(screen.contains("src/app.rs"));
+        assert!(screen.contains("src/main.rs"));
+        assert_eq!(regions.suggestions.len(), 2);
+        let second = regions.suggestions[1];
+        assert_eq!(
+            regions.target_at(second.x, second.y),
+            Some(UiTarget::Suggestion(1))
+        );
+    }
+
+    #[test]
+    fn selected_suggestion_has_visible_reverse_highlighting() {
+        let mut app = App::with_files(["src/app.rs", "src/main.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("@src/");
+        app.set_suggestion_selection(1);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut regions = UiRegions::default();
+
+        terminal
+            .draw(|frame| regions = render(frame, &app, &Theme::default()))
+            .unwrap();
+
+        let selected = regions.suggestions[1];
+        let style = terminal
+            .backend()
+            .buffer()
+            .cell(Position::new(selected.x, selected.y))
+            .unwrap()
+            .style();
+        assert!(
+            style
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn suggestion_popup_keeps_the_composer_visible_in_a_busy_small_terminal() {
+        let mut app = App::with_files(["src/app.rs"]);
+        app.screen = Screen::Chat;
+        app.turns.push(Turn::queued(5, "prompt".into()));
+        app.handle_agent_event(AgentEvent::Started { request_id: 5 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 5,
+            name: "read_file".into(),
+            summary: "Reading".into(),
+        });
+        app.toggle_thinking();
+        app.toggle_tools();
+        app.composer.insert_text("@src/");
+
+        let (screen, cursor_visible, regions, _) = render_to_string(&app, 60, 20);
+
+        assert!(screen.contains("src/app.rs"));
+        assert!(screen.contains("@src/"));
+        assert!(cursor_visible);
+        assert_eq!(regions.suggestions.len(), 1);
     }
 
     #[test]
