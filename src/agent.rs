@@ -20,6 +20,14 @@ pub enum AgentEvent {
         request_id: RequestId,
         text: String,
     },
+    ToolStarted {
+        request_id: RequestId,
+        name: String,
+        summary: String,
+    },
+    ToolFinished {
+        request_id: RequestId,
+    },
     Completed {
         request_id: RequestId,
     },

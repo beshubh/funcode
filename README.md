@@ -20,7 +20,10 @@ Press Enter on the home screen to open the chat.
 - PageUp/PageDown: scroll the transcript
 - End: return to the latest transcript content when scrolled up
 - Esc twice within 500 ms: interrupt the active response and continue with the next queued prompt
+- Click Thinking or Tools: expand or collapse the widget while that activity is running
 - `/exit` or Ctrl+C: quit
 
 Prompts submitted while the runner is busy are shown immediately and processed in FIFO order.
-The `/sessions` and `/models` commands displayed on the home screen are placeholders.
+Thinking is only shown while the runner is thinking. Tools is only shown during an active tool call;
+the phase-one fake runner does not call tools. The commands displayed on the home screen are
+placeholders.

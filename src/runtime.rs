@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -47,6 +48,7 @@ fn run_event_loop(terminal: &mut AppTerminal) -> Result<()> {
     let mut runner = AgentTaskRunner::spawn();
     let mut next_tick = Instant::now() + TICK_RATE;
     let mut should_quit = false;
+    let mut regions = ui::UiRegions::default();
 
     while !should_quit {
         while let Some(agent_event) = runner.try_event() {
@@ -54,7 +56,7 @@ fn run_event_loop(terminal: &mut AppTerminal) -> Result<()> {
         }
 
         terminal
-            .draw(|frame| ui::render(frame, &app, &theme))
+            .draw(|frame| regions = ui::render(frame, &app, &theme))
             .context("failed to draw the terminal UI")?;
 
         let timeout = next_tick.saturating_duration_since(Instant::now());
@@ -66,6 +68,13 @@ fn run_event_loop(terminal: &mut AppTerminal) -> Result<()> {
                     }
                 }
                 Event::Paste(text) => app.handle_paste(&text),
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    match regions.target_at(mouse.column, mouse.row) {
+                        Some(ui::UiTarget::Thinking) => app.toggle_thinking(),
+                        Some(ui::UiTarget::Tools) => app.toggle_tools(),
+                        None => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -118,8 +127,14 @@ impl TerminalSession {
         };
 
         let setup_result = (|| -> Result<()> {
-            execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste, Hide)
-                .context("failed to enter the alternate terminal screen")?;
+            execute!(
+                stdout(),
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                EnableMouseCapture,
+                Hide
+            )
+            .context("failed to enter the alternate terminal screen")?;
 
             if supports_keyboard_enhancement().unwrap_or(false) {
                 execute!(
@@ -160,7 +175,13 @@ fn restore_terminal(keyboard_enhancement: bool) {
     if keyboard_enhancement {
         let _ = execute!(output, PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(output, Show, DisableBracketedPaste, LeaveAlternateScreen);
+    let _ = execute!(
+        output,
+        Show,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
 }
 

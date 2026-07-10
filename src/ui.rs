@@ -4,7 +4,7 @@ use crate::{
 };
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
     text::{Line, Span, Text},
     widgets::{Block, Paragraph, Wrap},
 };
@@ -14,28 +14,58 @@ const CHAT_MIN_HEIGHT: u16 = 20;
 const HOME_MIN_WIDTH: u16 = 40;
 const HOME_MIN_HEIGHT: u16 = 16;
 
-pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiTarget {
+    Thinking,
+    Tools,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UiRegions {
+    pub thinking: Option<Rect>,
+    pub tools: Option<Rect>,
+}
+
+impl UiRegions {
+    pub fn target_at(self, column: u16, row: u16) -> Option<UiTarget> {
+        let position = Position::new(column, row);
+        if self.thinking.is_some_and(|area| area.contains(position)) {
+            Some(UiTarget::Thinking)
+        } else if self.tools.is_some_and(|area| area.contains(position)) {
+            Some(UiTarget::Tools)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
     let area = frame.area();
     match app.screen {
         Screen::Home if area.width < HOME_MIN_WIDTH || area.height < HOME_MIN_HEIGHT => {
             render_too_small(frame, area, HOME_MIN_WIDTH, HOME_MIN_HEIGHT, theme);
+            UiRegions::default()
         }
         Screen::Chat if area.width < CHAT_MIN_WIDTH || area.height < CHAT_MIN_HEIGHT => {
             render_too_small(frame, area, CHAT_MIN_WIDTH, CHAT_MIN_HEIGHT, theme);
+            UiRegions::default()
         }
-        Screen::Home => render_home(frame, area, theme),
+        Screen::Home => {
+            render_home(frame, area, theme);
+            UiRegions::default()
+        }
         Screen::Chat => render_chat(frame, area, app, theme),
     }
 }
 
 fn render_home(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-    let outer = Block::bordered()
-        .border_set(theme.border_set)
-        .border_style(theme.outer_border);
-    let inner = outer.inner(area).inner(Margin::new(2, 1));
-    frame.render_widget(outer, area);
-
-    let rows = Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).split(inner);
+    let inner = area.inner(Margin::new(2, 1));
+    let rows = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(10),
+        Constraint::Min(0),
+    ])
+    .split(inner);
     frame.render_widget(
         Paragraph::new(Line::styled("funcode", theme.title))
             .alignment(Alignment::Center)
@@ -43,34 +73,33 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         rows[0],
     );
 
-    if area.width >= 90 {
-        let panels = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .spacing(3)
-            .split(rows[1]);
-        render_home_help(frame, panels[0], theme);
-        render_home_status(frame, panels[1], theme);
-    } else {
-        let panels = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .spacing(1)
-            .split(rows[1]);
-        render_home_help(frame, panels[0], theme);
-        render_home_status(frame, panels[1], theme);
-    }
+    let columns = Layout::horizontal([Constraint::Length(44), Constraint::Min(0)]).split(rows[1]);
+    render_home_help(frame, columns[0], theme);
 }
 
 fn render_home_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     let help = Text::from(vec![
-        Line::styled("Commands", theme.heading),
-        Line::from(""),
+        Line::styled("Common commands", theme.heading),
         Line::from(vec![
             Span::styled("/sessions", theme.status),
             Span::raw("  list sessions"),
         ]),
         Line::from(vec![
             Span::styled("/models", theme.status),
-            Span::raw("    list models"),
+            Span::raw("    choose a model"),
         ]),
-        Line::from(""),
+        Line::from(vec![
+            Span::styled("/new", theme.status),
+            Span::raw("       start a new session"),
+        ]),
+        Line::from(vec![
+            Span::styled("/help", theme.status),
+            Span::raw("      show command help"),
+        ]),
+        Line::from(vec![
+            Span::styled("/exit", theme.status),
+            Span::raw("      quit funcode"),
+        ]),
         Line::styled("Enter start  ·  Ctrl+C quit", theme.muted),
     ]);
     frame.render_widget(
@@ -81,45 +110,23 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     );
 }
 
-fn render_home_status(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-    let status = Text::from(vec![
-        Line::styled("Phase 1", theme.heading),
-        Line::from(""),
-        Line::from(vec![Span::styled("Mode: ", theme.muted), Span::raw("demo")]),
-        Line::from(vec![
-            Span::styled("Model: ", theme.muted),
-            Span::raw("not connected"),
-        ]),
-        Line::from(vec![
-            Span::styled("Session: ", theme.muted),
-            Span::raw("new"),
-        ]),
-    ]);
-    frame.render_widget(
-        Paragraph::new(status).block(panel_block("Status", theme)),
-        area,
-    );
-}
-
-fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let outer = Block::bordered()
-        .border_set(theme.border_set)
-        .border_style(theme.outer_border);
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
+fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> UiRegions {
+    let inner = area.inner(Margin::new(1, 1));
+    let contextual_height = contextual_widgets_height(app);
 
     let rows = Layout::vertical([
         Constraint::Min(5),
-        Constraint::Length(7),
+        Constraint::Length(contextual_height),
         Constraint::Length(1),
         Constraint::Length(5),
     ])
     .split(inner);
 
     render_messages(frame, rows[0], app, theme);
-    render_agent_status(frame, rows[1], app, theme);
+    let regions = render_contextual_widgets(frame, rows[1], app, theme);
     render_activity(frame, rows[2], app, theme);
     render_composer(frame, rows[3], app, theme);
+    regions
 }
 
 fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
@@ -191,39 +198,105 @@ fn response_lines(response: &str) -> Vec<Line<'static>> {
     }
 }
 
-fn render_agent_status(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let columns = Layout::horizontal([Constraint::Length(32), Constraint::Min(0)]).split(area);
-    let boxes = Layout::vertical([Constraint::Length(3), Constraint::Length(3)])
-        .spacing(1)
-        .split(columns[0]);
+fn contextual_widgets_height(app: &App) -> u16 {
+    let thinking = app
+        .is_thinking()
+        .then_some(if app.thinking_expanded { 5 } else { 3 });
+    let tools = app
+        .active_tool
+        .as_ref()
+        .map(|_| if app.tools_expanded { 5 } else { 3 });
 
-    let thinking = match app.active_request.and_then(|id| {
-        app.turns
-            .iter()
-            .find(|turn| turn.request_id == id)
-            .map(|turn| &turn.response_status)
-    }) {
-        Some(ResponseStatus::Thinking) => {
-            let frames = ["|", "/", "-", "\\"];
-            format!(
-                "Thinking {}",
-                frames[(app.animation_frame / 2) % frames.len()]
-            )
-        }
-        Some(ResponseStatus::Streaming) => "Thinking > done".to_owned(),
-        _ => "Thinking > idle".to_owned(),
+    match (thinking, tools) {
+        (Some(thinking), Some(tools)) => thinking + tools + 1,
+        (Some(thinking), None) => thinking,
+        (None, Some(tools)) => tools,
+        (None, None) => 0,
+    }
+}
+
+fn render_contextual_widgets(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+) -> UiRegions {
+    let mut regions = UiRegions::default();
+    if area.is_empty() {
+        return regions;
+    }
+
+    let width = area.width.min(40);
+    let mut row = area.y;
+
+    if app.is_thinking() {
+        let height = if app.thinking_expanded { 5 } else { 3 };
+        let thinking_area = Rect::new(area.x, row, width, height);
+        render_thinking(frame, thinking_area, app, theme);
+        regions.thinking = Some(thinking_area);
+        row = row.saturating_add(height + 1);
+    }
+
+    if let Some(tool) = &app.active_tool {
+        let height = if app.tools_expanded { 5 } else { 3 };
+        let tools_area = Rect::new(area.x, row, width, height);
+        render_tools(frame, tools_area, app, tool, theme);
+        regions.tools = Some(tools_area);
+    }
+
+    regions
+}
+
+fn render_thinking(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let frames = ["|", "/", "-", "\\"];
+    let spinner = frames[(app.animation_frame / 2) % frames.len()];
+    let title = if app.thinking_expanded {
+        "Thinking · click to collapse"
+    } else {
+        "Thinking · click to expand"
     };
+    let content = if app.thinking_expanded {
+        Text::from(vec![
+            Line::styled(
+                format!("Working through the request {spinner}"),
+                theme.status,
+            ),
+            Line::styled("Preparing a response summary…", theme.muted),
+        ])
+    } else {
+        Text::from(Line::styled(format!("working {spinner}"), theme.status))
+    };
+
     frame.render_widget(
-        Paragraph::new(thinking)
-            .style(theme.status)
-            .block(panel_block("Thinking", theme)),
-        boxes[0],
+        Paragraph::new(content).block(panel_block(title, theme)),
+        area,
     );
+}
+
+fn render_tools(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    tool: &crate::app::ToolActivity,
+    theme: &Theme,
+) {
+    let title = if app.tools_expanded {
+        "Tools · click to collapse"
+    } else {
+        "Tools · click to expand"
+    };
+    let content = if app.tools_expanded {
+        Text::from(vec![
+            Line::styled(tool.name.clone(), theme.status),
+            Line::styled(tool.summary.clone(), theme.muted),
+        ])
+    } else {
+        Text::from(Line::styled(tool.name.clone(), theme.status))
+    };
+
     frame.render_widget(
-        Paragraph::new("no tools used")
-            .style(theme.muted)
-            .block(panel_block("Tools", theme)),
-        boxes[1],
+        Paragraph::new(content).block(panel_block(title, theme)),
+        area,
     );
 }
 
@@ -337,51 +410,118 @@ fn render_too_small(
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{UiRegions, UiTarget, render};
     use crate::{
         agent::AgentEvent,
         app::{App, Screen, Turn},
         theme::Theme,
     };
-    use ratatui::{Terminal, backend::TestBackend, style::Color};
+    use ratatui::{Terminal, backend::TestBackend, layout::Position, style::Color};
 
-    fn render_to_string(app: &App, width: u16, height: u16) -> (String, bool) {
+    fn render_to_string(app: &App, width: u16, height: u16) -> (String, bool, UiRegions, String) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
+        let mut regions = UiRegions::default();
         terminal
-            .draw(|frame| render(frame, app, &Theme::default()))
+            .draw(|frame| regions = render(frame, app, &Theme::default()))
             .unwrap();
         (
             terminal.backend().to_string(),
             terminal.backend().cursor_visible(),
+            regions,
+            terminal
+                .backend()
+                .buffer()
+                .cell(Position::new(0, 0))
+                .unwrap()
+                .symbol()
+                .to_owned(),
         )
     }
 
     #[test]
-    fn home_screen_renders_funcode_help_and_demo_status() {
-        let (screen, cursor_visible) = render_to_string(&App::new(), 100, 30);
+    fn home_screen_has_no_app_border_and_one_compact_help_widget() {
+        let (screen, cursor_visible, _, top_left) = render_to_string(&App::new(), 100, 30);
 
         assert!(screen.contains("funcode"));
         assert!(screen.contains("/sessions"));
-        assert!(screen.contains("Model: not connected"));
+        assert!(screen.contains("/help"));
+        assert!(!screen.contains("Model: not connected"));
+        assert_eq!(top_left, " ");
         assert!(!cursor_visible);
     }
 
     #[test]
-    fn chat_screen_renders_wireframe_sections_and_input_cursor() {
+    fn idle_chat_hides_thinking_and_tools_and_has_no_app_border() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+
+        let (screen, cursor_visible, regions, top_left) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("Agent messages"));
+        assert!(!screen.contains("Thinking"));
+        assert!(!screen.contains("Tools"));
+        assert!(screen.contains("Type something"));
+        assert!(regions.thinking.is_none());
+        assert!(regions.tools.is_none());
+        assert_eq!(top_left, " ");
+        assert!(cursor_visible);
+    }
+
+    #[test]
+    fn thinking_is_a_clickable_collapsed_widget_only_while_thinking() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.turns.push(Turn::queued(1, "hello".into()));
         app.handle_agent_event(AgentEvent::Started { request_id: 1 });
 
-        let (screen, cursor_visible) = render_to_string(&app, 100, 30);
+        let (screen, _, regions, _) = render_to_string(&app, 100, 30);
 
-        assert!(screen.contains("Agent messages"));
         assert!(screen.contains("Thinking"));
-        assert!(screen.contains("Tools"));
-        assert!(screen.contains("Type something"));
+        assert!(!screen.contains("Working through the request"));
+        assert!(!screen.contains("Tools"));
         assert!(screen.contains("Waiting"));
-        assert!(cursor_visible);
+        let thinking = regions.thinking.unwrap();
+        assert_eq!(
+            regions.target_at(thinking.x, thinking.y),
+            Some(UiTarget::Thinking)
+        );
+
+        app.toggle_thinking();
+        let (expanded, _, _, _) = render_to_string(&app, 100, 30);
+        assert!(expanded.contains("Working through the request"));
+
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 1,
+            text: "reply".into(),
+        });
+        let (streaming, _, regions, _) = render_to_string(&app, 100, 30);
+        assert!(!streaming.contains("Thinking"));
+        assert!(regions.thinking.is_none());
+    }
+
+    #[test]
+    fn tools_widget_only_appears_for_an_active_tool_and_expands_on_click() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.turns.push(Turn::queued(3, "inspect".into()));
+        app.handle_agent_event(AgentEvent::Started { request_id: 3 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 3,
+            name: "read_file".into(),
+            summary: "Reading src/main.rs".into(),
+        });
+
+        let (collapsed, _, regions, _) = render_to_string(&app, 100, 30);
+        assert!(collapsed.contains("Tools"));
+        assert!(collapsed.contains("read_file"));
+        assert!(!collapsed.contains("Reading src/main.rs"));
+        let tools = regions.tools.unwrap();
+        assert_eq!(regions.target_at(tools.x, tools.y), Some(UiTarget::Tools));
+
+        app.toggle_tools();
+        let (expanded, _, _, _) = render_to_string(&app, 100, 30);
+        assert!(expanded.contains("Reading src/main.rs"));
     }
 
     #[test]
@@ -389,7 +529,7 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::Chat;
 
-        let (screen, _) = render_to_string(&app, 40, 10);
+        let (screen, _, _, _) = render_to_string(&app, 40, 10);
 
         assert!(screen.contains("Terminal too small"));
         assert!(screen.contains("60x20"));
@@ -400,7 +540,9 @@ mod tests {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &App::new(), &Theme::default()))
+            .draw(|frame| {
+                let _ = render(frame, &App::new(), &Theme::default());
+            })
             .unwrap();
 
         assert!(

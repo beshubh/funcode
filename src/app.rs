@@ -30,6 +30,13 @@ pub struct Turn {
     pub response_status: ResponseStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolActivity {
+    pub request_id: RequestId,
+    pub name: String,
+    pub summary: String,
+}
+
 impl Turn {
     pub(crate) fn queued(request_id: RequestId, prompt: String) -> Self {
         Self {
@@ -166,6 +173,9 @@ pub struct App {
     pub animation_frame: usize,
     pub scroll_from_bottom: usize,
     pub follow_output: bool,
+    pub thinking_expanded: bool,
+    pub tools_expanded: bool,
+    pub active_tool: Option<ToolActivity>,
     next_request_id: RequestId,
     last_escape: Option<Instant>,
     cancellation_requested: bool,
@@ -286,6 +296,9 @@ impl App {
                     turn.response_status = ResponseStatus::Thinking;
                     self.active_request = Some(request_id);
                     self.cancellation_requested = false;
+                    self.thinking_expanded = false;
+                    self.tools_expanded = false;
+                    self.active_tool = None;
                 }
             }
             AgentEvent::TextDelta { request_id, text } => {
@@ -297,6 +310,31 @@ impl App {
                 {
                     turn.response_status = ResponseStatus::Streaming;
                     turn.response.push_str(&text);
+                    self.thinking_expanded = false;
+                }
+            }
+            AgentEvent::ToolStarted {
+                request_id,
+                name,
+                summary,
+            } => {
+                if self.active_request == Some(request_id) {
+                    self.active_tool = Some(ToolActivity {
+                        request_id,
+                        name,
+                        summary,
+                    });
+                    self.tools_expanded = false;
+                }
+            }
+            AgentEvent::ToolFinished { request_id } => {
+                if self
+                    .active_tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.request_id == request_id)
+                {
+                    self.active_tool = None;
+                    self.tools_expanded = false;
                 }
             }
             AgentEvent::Completed { request_id } => {
@@ -340,6 +378,26 @@ impl App {
             .is_some_and(|pressed| pressed.elapsed() > INTERRUPT_WINDOW)
         {
             self.last_escape = None;
+        }
+    }
+
+    pub fn is_thinking(&self) -> bool {
+        self.active_request.is_some_and(|request_id| {
+            self.turns.iter().any(|turn| {
+                turn.request_id == request_id && turn.response_status == ResponseStatus::Thinking
+            })
+        })
+    }
+
+    pub fn toggle_thinking(&mut self) {
+        if self.is_thinking() {
+            self.thinking_expanded = !self.thinking_expanded;
+        }
+    }
+
+    pub fn toggle_tools(&mut self) {
+        if self.active_tool.is_some() {
+            self.tools_expanded = !self.tools_expanded;
         }
     }
 
@@ -402,6 +460,9 @@ impl App {
             self.active_request = None;
             self.cancellation_requested = false;
             self.last_escape = None;
+            self.thinking_expanded = false;
+            self.tools_expanded = false;
+            self.active_tool = None;
         }
     }
 }
@@ -561,5 +622,26 @@ mod tests {
             ),
             Some(AppAction::Cancel { request_id: 12 })
         );
+    }
+
+    #[test]
+    fn tool_activity_can_expand_and_is_removed_when_the_tool_finishes() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.turns.push(super::Turn::queued(13, "inspect".into()));
+        app.handle_agent_event(AgentEvent::Started { request_id: 13 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 13,
+            name: "read_file".into(),
+            summary: "Reading Cargo.toml".into(),
+        });
+
+        app.toggle_tools();
+        assert!(app.tools_expanded);
+        assert_eq!(app.active_tool.as_ref().unwrap().name, "read_file");
+
+        app.handle_agent_event(AgentEvent::ToolFinished { request_id: 13 });
+        assert!(app.active_tool.is_none());
+        assert!(!app.tools_expanded);
     }
 }

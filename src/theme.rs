@@ -5,7 +5,6 @@ use ratatui::{
 
 #[derive(Debug, Clone)]
 pub struct Theme {
-    pub outer_border: Style,
     pub panel_border: Style,
     pub title: Style,
     pub heading: Style,
@@ -21,7 +20,6 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            outer_border: Style::default().fg(Color::Gray),
             panel_border: Style::default().fg(Color::DarkGray),
             title: Style::default()
                 .fg(Color::Cyan)
