@@ -318,7 +318,7 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     let block = panel_block(
-        "Input · Enter send · Shift+Enter newline · /exit quit",
+        "Enter send · Shift+Enter new line",
         theme,
     );
     let inner = block.inner(area);
