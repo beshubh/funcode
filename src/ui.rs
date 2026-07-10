@@ -12,7 +12,7 @@ use ratatui::{
 const CHAT_MIN_WIDTH: u16 = 60;
 const CHAT_MIN_HEIGHT: u16 = 20;
 const HOME_MIN_WIDTH: u16 = 40;
-const HOME_MIN_HEIGHT: u16 = 16;
+const HOME_MIN_HEIGHT: u16 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiTarget {
@@ -61,20 +61,82 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
 fn render_home(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     let inner = area.inner(Margin::new(2, 1));
     let rows = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(7),
+        Constraint::Length(1),
         Constraint::Length(10),
         Constraint::Min(0),
     ])
     .split(inner);
     frame.render_widget(
-        Paragraph::new(Line::styled("funcode", theme.title))
-            .alignment(Alignment::Center)
-            .block(Block::new().padding(ratatui::widgets::Padding::top(1))),
+        Paragraph::new(fun_logo(theme)).alignment(Alignment::Center),
         rows[0],
     );
 
-    let columns = Layout::horizontal([Constraint::Length(44), Constraint::Min(0)]).split(rows[1]);
+    let columns = Layout::horizontal([Constraint::Length(44), Constraint::Min(0)]).split(rows[2]);
     render_home_help(frame, columns[0], theme);
+}
+
+fn fun_logo(theme: &Theme) -> Text<'static> {
+    let accent = theme.logo_accent;
+    let neutral = theme.logo_neutral;
+    Text::from(vec![
+        Line::from(vec![
+            Span::styled("██████████", accent),
+            Span::raw("                      "),
+        ]),
+        Line::from(vec![
+            Span::styled("██████████", accent),
+            Span::raw("                      "),
+        ]),
+        Line::from(vec![
+            Span::styled("██████", accent),
+            Span::raw("                          "),
+        ]),
+        Line::from(vec![
+            Span::styled("██", neutral),
+            Span::raw("         "),
+            Span::styled("██", accent),
+            Span::raw("    "),
+            Span::styled("██", accent),
+            Span::raw("   "),
+            Span::styled("███████", neutral),
+            Span::raw("   "),
+        ]),
+        Line::from(vec![
+            Span::styled("██", neutral),
+            Span::raw("         "),
+            Span::styled("██", accent),
+            Span::raw("    "),
+            Span::styled("██", accent),
+            Span::raw("   "),
+            Span::styled("██", neutral),
+            Span::raw("    "),
+            Span::styled("██", neutral),
+            Span::raw("  "),
+        ]),
+        Line::from(vec![
+            Span::styled("██", neutral),
+            Span::raw("         "),
+            Span::styled("██", accent),
+            Span::raw("    "),
+            Span::styled("██", accent),
+            Span::raw("   "),
+            Span::styled("██", neutral),
+            Span::raw("    "),
+            Span::styled("██", neutral),
+            Span::raw("  "),
+        ]),
+        Line::from(vec![
+            Span::styled("██", neutral),
+            Span::raw("          "),
+            Span::styled("██████", accent),
+            Span::raw("    "),
+            Span::styled("██", neutral),
+            Span::raw("    "),
+            Span::styled("██", neutral),
+            Span::raw("  "),
+        ]),
+    ])
 }
 
 fn render_home_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -438,7 +500,7 @@ mod tests {
     fn home_screen_has_no_app_border_and_one_compact_help_widget() {
         let (screen, cursor_visible, _, top_left) = render_to_string(&App::new(), 100, 30);
 
-        assert!(screen.contains("funcode"));
+        assert!(screen.contains("██████████"));
         assert!(screen.contains("/sessions"));
         assert!(screen.contains("/help"));
         assert!(!screen.contains("Model: not connected"));
@@ -557,19 +619,33 @@ mod tests {
     fn default_rendering_does_not_force_a_white_background() {
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
         terminal
             .draw(|frame| {
-                let _ = render(frame, &App::new(), &Theme::default());
+                let _ = render(frame, &App::new(), &theme);
             })
             .unwrap();
 
+        let cells = terminal.backend().buffer().content();
         assert!(
-            terminal
-                .backend()
-                .buffer()
-                .content()
+            cells
                 .iter()
-                .all(|cell| cell.style().bg != Some(Color::White))
+                .all(|cell| cell.style().bg == Some(Color::Reset))
+        );
+        assert!(
+            cells
+                .iter()
+                .any(|cell| cell.style().fg == theme.logo_accent.fg)
+        );
+        assert!(
+            cells
+                .iter()
+                .any(|cell| cell.style().fg == theme.logo_neutral.fg)
+        );
+        assert!(
+            cells
+                .iter()
+                .all(|cell| cell.style().fg != Some(Color::Black))
         );
     }
 }

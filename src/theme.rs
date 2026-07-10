@@ -6,7 +6,8 @@ use ratatui::{
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub panel_border: Style,
-    pub title: Style,
+    pub logo_accent: Style,
+    pub logo_neutral: Style,
     pub heading: Style,
     pub user: Style,
     pub agent: Style,
@@ -21,8 +22,11 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             panel_border: Style::default().fg(Color::DarkGray),
-            title: Style::default()
-                .fg(Color::Cyan)
+            logo_accent: Style::default()
+                .fg(Color::Rgb(181, 255, 0))
+                .add_modifier(Modifier::BOLD),
+            logo_neutral: Style::default()
+                .fg(Color::Rgb(172, 180, 188))
                 .add_modifier(Modifier::BOLD),
             heading: Style::default().add_modifier(Modifier::BOLD),
             user: Style::default()
