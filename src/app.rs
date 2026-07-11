@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 const INTERRUPT_WINDOW: Duration = Duration::from_millis(500);
 const SCROLL_STEP: usize = 5;
+pub(crate) const FILE_SUGGESTION_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Screen {
@@ -151,6 +152,9 @@ pub struct App {
     active_theme: ThemeId,
     commands: CommandRegistry,
     workspace_files: Vec<String>,
+    indexed_workspace_search: bool,
+    indexed_suggestion_query: Option<String>,
+    indexed_file_suggestions: Vec<String>,
     suggestion_selected: usize,
     models_selected: usize,
     current_model: String,
@@ -187,7 +191,56 @@ impl App {
     {
         self.workspace_files = files.into_iter().map(Into::into).collect();
         self.workspace_files.sort();
+        self.indexed_workspace_search = false;
+        self.indexed_suggestion_query = None;
+        self.indexed_file_suggestions.clear();
         self.suggestion_selected = 0;
+    }
+
+    pub(crate) fn use_indexed_workspace_search(&mut self) {
+        self.indexed_workspace_search = true;
+        self.indexed_suggestion_query = None;
+        self.indexed_file_suggestions.clear();
+        self.suggestion_selected = 0;
+    }
+
+    pub(crate) fn workspace_file_query(&self) -> Option<String> {
+        self.composer
+            .active_file_query()
+            .map(|(_, query)| query.to_owned())
+    }
+
+    pub(crate) fn set_indexed_file_suggestions(&mut self, query: String, paths: Vec<String>) {
+        if self.workspace_file_query().as_deref() != Some(query.as_str()) {
+            return;
+        }
+        let same_query = self.indexed_suggestion_query.as_deref() == Some(query.as_str());
+        if same_query && self.indexed_file_suggestions == paths {
+            return;
+        }
+        let selected_path = if same_query {
+            self.indexed_file_suggestions
+                .get(self.suggestion_selected)
+                .cloned()
+        } else {
+            None
+        };
+        let previous_selection = self.suggestion_selected;
+        self.indexed_suggestion_query = Some(query);
+        self.indexed_file_suggestions = paths;
+        self.suggestion_selected = if same_query {
+            selected_path
+                .and_then(|selected| {
+                    self.indexed_file_suggestions
+                        .iter()
+                        .position(|path| path == &selected)
+                })
+                .unwrap_or_else(|| {
+                    previous_selection.min(self.indexed_file_suggestions.len().saturating_sub(1))
+                })
+        } else {
+            0
+        };
     }
 
     pub fn for_auth() -> Self {
@@ -392,11 +445,25 @@ impl App {
         let Some((_, query)) = self.composer.active_file_query() else {
             return Vec::new();
         };
+        if self.indexed_workspace_search {
+            if self.indexed_suggestion_query.as_deref() != Some(query) {
+                return Vec::new();
+            }
+            return self
+                .indexed_file_suggestions
+                .iter()
+                .map(|path| Suggestion {
+                    label: path.clone(),
+                    description: "File".to_owned(),
+                    kind: SuggestionKind::File,
+                })
+                .collect();
+        }
         let query = query.to_lowercase();
         self.workspace_files
             .iter()
             .filter(|path| path.to_lowercase().contains(&query))
-            .take(8)
+            .take(FILE_SUGGESTION_LIMIT)
             .map(|path| Suggestion {
                 label: path.clone(),
                 description: "File".to_owned(),
@@ -1257,6 +1324,79 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
         assert_eq!(app.composer.text(), "please inspect @src/main.rs");
         assert_eq!(app.composer.attachments()[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn indexed_at_query_attaches_the_ranked_file_snapshot() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.use_indexed_workspace_search();
+        app.composer.insert_text("please inspect @src/maim");
+        app.set_indexed_file_suggestions("src/maim".into(), vec!["src/main.rs".into()]);
+
+        assert_eq!(app.suggestions()[0].label, "src/main.rs");
+        assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
+        assert_eq!(app.composer.text(), "please inspect @src/main.rs");
+        assert_eq!(app.composer.attachments()[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn late_indexed_suggestions_cannot_replace_the_current_query_snapshot() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.use_indexed_workspace_search();
+        app.composer.insert_text("@src/main");
+        app.set_indexed_file_suggestions("src/main".into(), vec!["src/main.rs".into()]);
+        assert_eq!(app.suggestions()[0].label, "src/main.rs");
+
+        app.composer.take_submission();
+        app.composer.insert_text("@src/runtime");
+        app.set_indexed_file_suggestions("src/main".into(), vec!["src/main.rs".into()]);
+
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn indexed_refresh_preserves_the_selected_file_across_reranking() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.use_indexed_workspace_search();
+        app.composer.insert_text("@src");
+        app.set_indexed_file_suggestions(
+            "src".into(),
+            vec!["src/app.rs".into(), "src/runtime.rs".into()],
+        );
+        app.set_suggestion_selection(1);
+
+        app.set_indexed_file_suggestions(
+            "src".into(),
+            vec!["src/runtime.rs".into(), "src/app.rs".into()],
+        );
+
+        assert_eq!(app.selected_suggestion(), 0);
+        assert_eq!(app.suggestions()[0].label, "src/runtime.rs");
+    }
+
+    #[test]
+    fn indexed_results_for_a_new_query_reset_selection_to_the_first_file() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.use_indexed_workspace_search();
+        app.composer.insert_text("@src");
+        app.set_indexed_file_suggestions(
+            "src".into(),
+            vec!["src/app.rs".into(), "src/runtime.rs".into()],
+        );
+        app.set_suggestion_selection(1);
+
+        app.composer.insert_text("m");
+        app.set_indexed_file_suggestions(
+            "srcm".into(),
+            vec!["src/runtime.rs".into(), "src/main.rs".into()],
+        );
+
+        assert_eq!(app.selected_suggestion(), 0);
+        assert_eq!(app.suggestions()[0].label, "src/runtime.rs");
     }
 
     #[test]

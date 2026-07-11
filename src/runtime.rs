@@ -1,6 +1,6 @@
 use crate::{
     agent::{AgentEvent, AgentTaskRunner},
-    app::{App, AppAction, AuthProvider},
+    app::{App, AppAction, AuthProvider, FILE_SUGGESTION_LIMIT},
     auth::{AuthEvent, AuthStore, AuthTaskRunner},
     clipboard::{ClipboardEvent, ClipboardTaskRunner},
     llm::{LlmClient, LlmConfig},
@@ -33,6 +33,7 @@ use std::{
 };
 
 const TICK_RATE: Duration = Duration::from_millis(50);
+const WORKSPACE_SUGGESTION_REFRESH: Duration = Duration::from_millis(500);
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -144,13 +145,25 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     let mut regions = ui::UiRegions::default();
     let mut selection = TerminalSelection::default();
     let mut rendered_buffer = Buffer::empty(ratatui::layout::Rect::default());
+    let mut last_workspace_search: Option<(String, Instant)> = None;
+    let mut workspace_search_ready = false;
 
     while !should_quit {
-        if let Some(files) = workspace_runner
-            .as_ref()
-            .and_then(workspace::WorkspaceTaskRunner::try_files)
-        {
-            app.set_workspace_files(files);
+        if let Some(workspace_runner) = workspace_runner.as_ref() {
+            while let Some(event) = workspace_runner.try_event() {
+                match event {
+                    workspace::WorkspaceEvent::Ready { warning } => {
+                        app.use_indexed_workspace_search();
+                        workspace_search_ready = true;
+                        if let Some(warning) = warning {
+                            app.set_notice(warning);
+                        }
+                    }
+                    workspace::WorkspaceEvent::Suggestions { query, paths } => {
+                        app.set_indexed_file_suggestions(query, paths);
+                    }
+                }
+            }
         }
         if let Some(runner) = runner.as_ref() {
             while let Some(agent_event) = runner.try_event() {
@@ -179,6 +192,27 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                     }
                 }
             }
+        }
+
+        let workspace_query = app.workspace_file_query();
+        if workspace_search_ready
+            && let (Some(workspace_runner), Some(query)) =
+                (workspace_runner.as_ref(), workspace_query.as_ref())
+        {
+            let should_refresh =
+                last_workspace_search
+                    .as_ref()
+                    .is_none_or(|(last_query, requested_at)| {
+                        last_query != query
+                            || requested_at.elapsed() >= WORKSPACE_SUGGESTION_REFRESH
+                    });
+            if should_refresh
+                && workspace_runner.request_suggestions(query.clone(), FILE_SUGGESTION_LIMIT)
+            {
+                last_workspace_search = Some((query.clone(), Instant::now()));
+            }
+        } else if workspace_query.is_none() {
+            last_workspace_search = None;
         }
 
         terminal
