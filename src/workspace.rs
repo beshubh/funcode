@@ -1,6 +1,33 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver},
+    thread,
+};
 
 const IGNORED_DIRECTORIES: &[&str] = &[".git", "node_modules", "target"];
+
+pub struct WorkspaceTaskRunner {
+    files: Receiver<Vec<String>>,
+}
+
+impl WorkspaceTaskRunner {
+    pub fn spawn(root: PathBuf) -> Self {
+        Self::spawn_with(move || discover_files(&root))
+    }
+
+    fn spawn_with(discover: impl FnOnce() -> Vec<String> + Send + 'static) -> Self {
+        let (files_tx, files) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = files_tx.send(discover());
+        });
+        Self { files }
+    }
+
+    pub fn try_files(&self) -> Option<Vec<String>> {
+        self.files.try_recv().ok()
+    }
+}
 
 pub fn discover_files(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
@@ -43,8 +70,28 @@ fn visit(root: &Path, directory: &Path, files: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::discover_files;
-    use std::{fs, time::SystemTime};
+    use super::{WorkspaceTaskRunner, discover_files};
+    use std::{
+        fs,
+        sync::mpsc,
+        time::{Duration, SystemTime},
+    };
+
+    #[test]
+    fn workspace_discovery_runs_without_blocking_the_caller() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let runner = WorkspaceTaskRunner::spawn_with(move || {
+            release_rx.recv().unwrap();
+            vec!["src/main.rs".to_owned()]
+        });
+
+        assert!(runner.try_files().is_none());
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            runner.files.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ["src/main.rs"]
+        );
+    }
 
     #[test]
     fn discovery_returns_relative_files_and_skips_build_directories() {

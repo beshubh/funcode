@@ -77,7 +77,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
             UiRegions::default()
         }
         Screen::Home => {
-            render_home(frame, area, theme);
+            render_home(frame, area, app, theme);
             UiRegions::default()
         }
         Screen::Chat => render_chat(frame, area, app, theme),
@@ -252,7 +252,7 @@ fn render_message_dialog(
     Some(Rect::new(rows[1].x, rows[1].y, copy_width, 1))
 }
 
-fn render_home(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     let inner = area.inner(Margin::new(2, 1));
     let rows = Layout::vertical([
         Constraint::Length(7),
@@ -267,7 +267,7 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     );
 
     let columns = Layout::horizontal([Constraint::Length(44), Constraint::Min(0)]).split(rows[2]);
-    render_home_help(frame, columns[0], theme);
+    render_home_help(frame, columns[0], app, theme);
 }
 
 fn fun_logo(theme: &Theme) -> Text<'static> {
@@ -333,19 +333,17 @@ fn fun_logo(theme: &Theme) -> Text<'static> {
     ])
 }
 
-fn render_home_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-    let help = Text::from(vec![
-        Line::styled("Common commands", theme.heading),
+fn render_home_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let mut lines = vec![Line::styled("Available commands", theme.heading)];
+    lines.extend(app.available_commands().into_iter().map(|command| {
         Line::from(vec![
-            Span::styled("/auth", theme.status),
-            Span::raw("      authenticate with a provider"),
-        ]),
-        Line::from(vec![
-            Span::styled("/exit", theme.status),
-            Span::raw("      quit funcode"),
-        ]),
-        Line::styled("Enter start  ·  /exit quit", theme.muted),
-    ]);
+            Span::styled(format!("{:<10}", command.label), theme.status),
+            Span::raw(command.description),
+        ])
+    }));
+    lines.push(Line::from(""));
+    lines.push(Line::styled("Enter start  ·  Ctrl+C quit", theme.muted));
+    let help = Text::from(lines);
     frame.render_widget(
         Paragraph::new(help)
             .wrap(Wrap { trim: false })
@@ -588,6 +586,7 @@ mod tests {
         assert!(screen.contains("/exit"));
         assert!(!screen.contains("/sessions"));
         assert!(!screen.contains("/help"));
+        assert!(!screen.contains("/models"));
         assert!(!screen.contains("Model: not connected"));
         assert_eq!(top_left, " ");
         assert!(!cursor_visible);

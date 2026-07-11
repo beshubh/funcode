@@ -25,9 +25,6 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io::{Stdout, stdout},
     panic,
-    path::PathBuf,
-    sync::mpsc::{self, Receiver, TryRecvError},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -75,13 +72,15 @@ pub fn run() -> Result<()> {
 }
 
 fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result<()> {
+    let workspace_runner = match launch_mode {
+        LaunchMode::Interactive => std::env::current_dir()
+            .ok()
+            .map(workspace::WorkspaceTaskRunner::spawn),
+        LaunchMode::AuthOnly => None,
+    };
     let mut app = match launch_mode {
         LaunchMode::Interactive => App::new(),
         LaunchMode::AuthOnly => App::for_auth(),
-    };
-    let mut workspace_discovery = match launch_mode {
-        LaunchMode::Interactive => std::env::current_dir().ok().map(start_workspace_discovery),
-        LaunchMode::AuthOnly => None,
     };
     let theme = Theme::default();
     let mut runner = match launch_mode {
@@ -101,15 +100,11 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     let mut regions = ui::UiRegions::default();
 
     while !should_quit {
-        if let Some(discovery) = workspace_discovery.as_ref() {
-            match discovery.try_recv() {
-                Ok(files) => {
-                    app.set_workspace_files(files);
-                    workspace_discovery = None;
-                }
-                Err(TryRecvError::Disconnected) => workspace_discovery = None,
-                Err(TryRecvError::Empty) => {}
-            }
+        if let Some(files) = workspace_runner
+            .as_ref()
+            .and_then(workspace::WorkspaceTaskRunner::try_files)
+        {
+            app.set_workspace_files(files);
         }
         if let Some(runner) = runner.as_ref() {
             while let Some(agent_event) = runner.try_event() {
@@ -159,14 +154,6 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     auth_runner.shutdown();
     clipboard.shutdown();
     Ok(())
-}
-
-fn start_workspace_discovery(root: PathBuf) -> Receiver<Vec<String>> {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = sender.send(workspace::discover_files(&root));
-    });
-    receiver
 }
 
 fn handle_mouse_event(
@@ -390,9 +377,7 @@ fn install_restoring_panic_hook(keyboard_enhancement: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LaunchMode, dispatch, handle_clipboard_event, handle_mouse_event, start_workspace_discovery,
-    };
+    use super::{LaunchMode, dispatch, handle_clipboard_event, handle_mouse_event};
     use crate::{
         app::{App, AppAction, Screen},
         auth::AuthTaskRunner,
@@ -401,7 +386,7 @@ mod tests {
     };
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
-    use std::{fs, time::Duration};
+    use std::time::Duration;
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
@@ -436,22 +421,6 @@ mod tests {
                 .contains("auth")
         );
         assert!(LaunchMode::parse(["auth", "extra"]).is_err());
-    }
-
-    #[test]
-    fn workspace_discovery_returns_files_from_a_background_worker() {
-        let root = std::env::temp_dir().join(format!("funcode-workspace-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("src/main.rs"), "").unwrap();
-
-        let receiver = start_workspace_discovery(root.clone());
-
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ["src/main.rs"]
-        );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

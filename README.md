@@ -45,6 +45,7 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - Esc twice within 500 ms: interrupt the active response and continue with the next queued prompt
 - Type `/` at the start of the composer: browse registered commands
 - Type `@` at the start of a token: insert a highlighted workspace-file reference in place
+- Unmatched `@text` stays plain text
 - Move the mouse over a suggestion to highlight it; click to activate it
 - Click a sent message: open a modal and copy its text and attached paths
 - Click a Thinking or tool block: expand its persistent activity summary
@@ -60,4 +61,4 @@ during an active tool call; the current agent does not call tools. New composer 
 the `Command` trait and are added through `App::register_command`; command actions can update app
 state and optionally return an `AppAction` for the runtime to dispatch. Commands can also insert
 inline mode tokens that affect the submitted request and later prompts. The commands displayed on
-the home screen are placeholders.
+the home screen and command popup both read from this registry, so they stay in sync.
