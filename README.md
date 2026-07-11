@@ -3,7 +3,7 @@
 `funcode` is an early terminal coding-agent prototype built with Rust and Ratatui. It connects to
 ChatGPT through the saved subscription login, streams model responses in the background, and keeps
 successfully completed turns as conversation context for the current session. Tool execution is not
-implemented yet.
+implemented yet. Composer suggestions are available for registered commands and workspace files.
 
 ## Run
 
@@ -36,17 +36,24 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 ## Controls
 
 - Enter: submit the composer
+- Up/Down: choose an open command or file suggestion
+- Tab or Enter: activate the selected suggestion
 - Shift+Enter: insert a newline on terminals with enhanced keyboard reporting
 - Ctrl+J: portable newline fallback
 - PageUp/PageDown: scroll the transcript
 - End: return to the latest transcript content when scrolled up
 - Esc twice within 500 ms: interrupt the active response and continue with the next queued prompt
 - Click Thinking or Tools: expand or collapse the widget while that activity is running
+- Type `/` at the start of the composer: browse registered commands
+- Type `@` anywhere in the composer: search workspace files
+- Move the mouse over a suggestion to highlight it; click to activate it
 - `/auth`: open the authentication picker
 - `/exit` or Ctrl+C: quit
 
 Prompts submitted while the runner is busy are shown immediately and processed in FIFO order. Only
 completed turns are included in later model context; failed or interrupted turns remain visible but
 are not sent again. Thinking is shown until the first response text arrives. Tools is only shown
-during an active tool call; the current agent does not call tools. The commands displayed on the home
-screen are placeholders.
+during an active tool call; the current agent does not call tools. New composer commands implement
+the `Command` trait and are added through `App::register_command`; command actions can update app
+state and optionally return an `AppAction` for the runtime to dispatch. The commands displayed on
+the home screen are placeholders.

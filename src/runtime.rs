@@ -4,7 +4,7 @@ use crate::{
     auth::{AuthEvent, AuthStore, AuthTaskRunner},
     llm::{LlmClient, LlmConfig},
     theme::Theme,
-    ui,
+    ui, workspace,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -72,7 +72,12 @@ pub fn run() -> Result<()> {
 
 fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result<()> {
     let mut app = match launch_mode {
-        LaunchMode::Interactive => App::new(),
+        LaunchMode::Interactive => {
+            let files = std::env::current_dir()
+                .map(|root| workspace::discover_files(&root))
+                .unwrap_or_default();
+            App::with_files(files)
+        }
         LaunchMode::AuthOnly => App::for_auth(),
     };
     let theme = Theme::default();
@@ -125,11 +130,36 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                                         dispatch(action, &mut app, runner.as_ref(), &auth_runner);
                                 }
                             }
+                            Some(ui::UiTarget::Suggestion(index)) => {
+                                if let Some(action) = app.activate_suggestion(index) {
+                                    should_quit =
+                                        dispatch(action, &mut app, runner.as_ref(), &auth_runner);
+                                }
+                            }
                             None => {}
                         }
                     }
-                    MouseEventKind::ScrollUp => app.move_auth_selection(-1),
-                    MouseEventKind::ScrollDown => app.move_auth_selection(1),
+                    MouseEventKind::Moved => {
+                        if let Some(ui::UiTarget::Suggestion(index)) =
+                            regions.target_at(mouse.column, mouse.row)
+                        {
+                            app.set_suggestion_selection(index);
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        if app.suggestions().is_empty() {
+                            app.move_auth_selection(-1);
+                        } else {
+                            app.move_suggestion_selection(-1);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if app.suggestions().is_empty() {
+                            app.move_auth_selection(1);
+                        } else {
+                            app.move_suggestion_selection(1);
+                        }
+                    }
                     _ => {}
                 },
                 _ => {}
