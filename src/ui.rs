@@ -25,6 +25,7 @@ pub enum UiTarget {
     Suggestion(usize),
     MessageCopy,
     Model(usize),
+    ModelRefresh,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,7 @@ pub struct UiRegions {
     pub suggestions: Vec<Rect>,
     pub message_copy: Option<Rect>,
     pub models: Vec<ModelRegion>,
+    pub model_refresh: Option<Rect>,
 }
 
 impl UiRegions {
@@ -57,6 +59,11 @@ impl UiRegions {
             .find(|(_, area)| area.contains(position))
         {
             Some(UiTarget::AuthProvider(index))
+        } else if self
+            .model_refresh
+            .is_some_and(|area| area.contains(position))
+        {
+            Some(UiTarget::ModelRefresh)
         } else if let Some(region) = self
             .models
             .iter()
@@ -108,7 +115,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
         && area.width >= CHAT_MIN_WIDTH
         && area.height >= CHAT_MIN_HEIGHT
     {
-        regions.models = render_models_dialog(frame, area, app, theme);
+        (regions.models, regions.model_refresh) = render_models_dialog(frame, area, app, theme);
     }
     regions
 }
@@ -118,9 +125,9 @@ fn render_models_dialog(
     area: Rect,
     app: &App,
     theme: &Theme,
-) -> Vec<ModelRegion> {
+) -> (Vec<ModelRegion>, Option<Rect>) {
     let Some(phase) = app.models_dialog.as_ref() else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let width = area.width.saturating_sub(6).min(78);
     let height = area.height.saturating_sub(4).min(24);
@@ -134,21 +141,26 @@ fn render_models_dialog(
     let block = panel_block(" Select model ", theme);
     let inner = block.inner(dialog_area).inner(Margin::new(1, 1));
     frame.render_widget(block, dialog_area);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let content_area = rows[0];
+    let footer_area = rows[1];
 
     let mut model_lines = Vec::new();
+    let mut refresh_enabled = false;
     let mut lines = match phase {
-        ModelsDialogPhase::Loading => vec![
-            Line::styled("Loading provider catalogs…", theme.status),
-            Line::from(""),
-            Line::styled("Esc close", theme.muted),
-        ],
-        ModelsDialogPhase::Failed(message) => vec![
-            Line::styled("Could not load models", theme.warning),
-            Line::styled(message.clone(), theme.muted),
-            Line::from(""),
-            Line::styled("Run /auth if sign-in is required · Esc close", theme.muted),
-        ],
+        ModelsDialogPhase::Loading => {
+            frame.render_widget(Paragraph::new("Esc close").style(theme.muted), footer_area);
+            vec![Line::styled("Loading provider catalogs…", theme.status)]
+        }
+        ModelsDialogPhase::Failed(message) => {
+            refresh_enabled = true;
+            vec![
+                Line::styled("Could not load models", theme.warning),
+                Line::styled(message.clone(), theme.muted),
+            ]
+        }
         ModelsDialogPhase::Loaded(catalogs) => {
+            refresh_enabled = true;
             let mut lines = Vec::new();
             let mut model_index = 0;
             for (provider_index, catalog) in catalogs.iter().enumerate() {
@@ -189,11 +201,6 @@ fn render_models_dialog(
                     model_index += 1;
                 }
             }
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                "↑/↓ select · Enter use · wheel scroll · Esc close",
-                theme.muted,
-            ));
             lines
         }
     };
@@ -207,25 +214,53 @@ fn render_models_dialog(
     {
         if *selected_line < scroll {
             scroll = *selected_line;
-        } else if *selected_line >= scroll.saturating_add(inner.height as usize) {
+        } else if *selected_line >= scroll.saturating_add(content_area.height as usize) {
             scroll = selected_line
                 .saturating_add(1)
-                .saturating_sub(inner.height as usize);
+                .saturating_sub(content_area.height as usize);
         }
     }
     let visible_regions = model_lines
         .into_iter()
         .filter_map(|(index, line)| {
             let visible_row = line.checked_sub(scroll)?;
-            (visible_row < inner.height as usize).then_some(ModelRegion {
+            (visible_row < content_area.height as usize).then_some(ModelRegion {
                 index,
-                area: Rect::new(inner.x, inner.y + visible_row as u16, inner.width, 1),
+                area: Rect::new(
+                    content_area.x,
+                    content_area.y + visible_row as u16,
+                    content_area.width,
+                    1,
+                ),
             })
         })
         .collect();
+    let refresh_region = refresh_enabled.then_some(Rect::new(
+        footer_area.x,
+        footer_area.y,
+        9.min(footer_area.width),
+        1,
+    ));
+    if refresh_enabled {
+        let help = if matches!(phase, ModelsDialogPhase::Failed(_)) {
+            "  r retry · /auth sign in · Esc close"
+        } else {
+            "  r refresh · ↑/↓ select · Enter use · Esc close"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" Refresh ", theme.status.add_modifier(Modifier::REVERSED)),
+                Span::styled(help, theme.muted),
+            ])),
+            footer_area,
+        );
+    }
     let scroll = scroll.min(u16::MAX as usize) as u16;
-    frame.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll, 0)), inner);
-    visible_regions
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
+        content_area,
+    );
+    (visible_regions, refresh_region)
 }
 
 fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Vec<Rect> {
@@ -864,13 +899,18 @@ mod tests {
             }],
         }]));
 
-        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+        let (screen, _, regions, _) = render_to_string(&app, 100, 30);
 
         assert!(screen.contains("Select model"));
         assert!(screen.contains("ChatGPT"));
         assert!(screen.contains("live provider API"));
         assert!(screen.contains("GPT Test"));
         assert!(screen.contains("gpt-test"));
+        let refresh = regions.model_refresh.unwrap();
+        assert_eq!(
+            regions.target_at(refresh.x, refresh.y),
+            Some(UiTarget::ModelRefresh)
+        );
     }
 
     #[test]
@@ -888,8 +928,9 @@ mod tests {
                 .collect(),
         }]));
 
-        let (first_screen, _, _, _) = render_to_string(&app, 100, 30);
+        let (first_screen, _, first_regions, _) = render_to_string(&app, 100, 30);
         assert!(!first_screen.contains("model-29"));
+        assert!(first_regions.model_refresh.is_some());
 
         for _ in 0..29 {
             app.handle_key(
@@ -900,9 +941,10 @@ mod tests {
                 std::time::Instant::now(),
             );
         }
-        let (last_screen, _, _, _) = render_to_string(&app, 100, 30);
+        let (last_screen, _, last_regions, _) = render_to_string(&app, 100, 30);
         assert!(last_screen.contains("model-29"));
         assert_eq!(app.selected_model_index(), 29);
+        assert!(last_regions.model_refresh.is_some());
     }
 
     #[test]

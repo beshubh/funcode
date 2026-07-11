@@ -254,6 +254,7 @@ fn handle_mouse_event(
             }
             Some(ui::UiTarget::Suggestion(index)) => app.activate_suggestion(index),
             Some(ui::UiTarget::Model(index)) => app.activate_model(index),
+            Some(ui::UiTarget::ModelRefresh) => app.refresh_models(),
             None => None,
         },
         MouseEventKind::Moved => {
@@ -382,6 +383,23 @@ fn dispatch(
                 None => {
                     app.handle_model_catalog_event(crate::model_catalog::ModelCatalogEvent::Failed(
                         "model discovery is unavailable in authentication-only mode".into(),
+                    ))
+                }
+            }
+            false
+        }
+        AppAction::RefreshModels => {
+            match model_runner {
+                Some(model_runner) => {
+                    if let Err(error) = model_runner.refresh() {
+                        app.handle_model_catalog_event(
+                            crate::model_catalog::ModelCatalogEvent::Failed(error.to_string()),
+                        );
+                    }
+                }
+                None => {
+                    app.handle_model_catalog_event(crate::model_catalog::ModelCatalogEvent::Failed(
+                        "model discovery is unavailable".into(),
                     ))
                 }
             }
@@ -631,6 +649,30 @@ mod tests {
             })
         );
         assert_eq!(app.current_model(), "model-b");
+    }
+
+    #[test]
+    fn clicking_model_refresh_bypasses_the_cached_catalog() {
+        let mut app = App::new();
+        app.open_models_dialog();
+        app.handle_model_catalog_event(ModelCatalogEvent::Loaded(Vec::new()));
+        let regions = UiRegions {
+            model_refresh: Some(Rect::new(4, 8, 9, 1)),
+            ..UiRegions::default()
+        };
+
+        assert_eq!(
+            handle_mouse_event(
+                &mut app,
+                &regions,
+                mouse(MouseEventKind::Up(MouseButton::Left), 4, 8),
+            ),
+            Some(AppAction::RefreshModels)
+        );
+        assert!(matches!(
+            app.models_dialog,
+            Some(crate::app::ModelsDialogPhase::Loading)
+        ));
     }
 
     #[test]

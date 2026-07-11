@@ -69,3 +69,6 @@ Model discovery runs outside the terminal event loop. Providers use their live m
 when one is available; provider adapters can return a built-in catalog when no discovery endpoint
 exists. The current ChatGPT subscription provider reads its live Codex model catalog after sign-in.
 The active model is shown in the composer border and applies to subsequent model requests.
+Provider catalogs are cached in `~/.funcode/models.json` for 24 hours. In the model picker, press
+`r` or click **Refresh** to bypass the cache, query authenticated providers, and replace the saved
+catalog.

@@ -42,13 +42,13 @@ pub(crate) enum LlmError {
     Internal(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct ModelInfo {
     pub(crate) id: String,
     pub(crate) display_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct ProviderModels {
     pub(crate) provider: String,
     pub(crate) source: String,
