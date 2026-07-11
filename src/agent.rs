@@ -8,6 +8,7 @@ use futures::StreamExt as _;
 use std::{
     collections::{HashSet, VecDeque},
     fmt,
+    path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
 };
@@ -95,11 +96,19 @@ pub struct AgentTaskRunner {
 }
 
 impl AgentTaskRunner {
+    #[cfg(test)]
     pub(crate) fn spawn(llm: LlmClient) -> Self {
+        Self::spawn_in(
+            llm,
+            std::env::current_dir().expect("tests have a current directory"),
+        )
+    }
+
+    pub(crate) fn spawn_in(llm: LlmClient, workspace_root: PathBuf) -> Self {
         let (command_tx, command_rx) = async_mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
-            let workspace_reader = WorkspaceFileReader::from_current_dir()
+            let workspace_reader = WorkspaceFileReader::new(workspace_root)
                 .expect("failed to configure the workspace file reader");
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -640,6 +649,7 @@ mod tests {
     use crate::transcript::ToolArtifact;
     use futures::{StreamExt as _, future::BoxFuture, stream};
     use std::{
+        fs,
         sync::{Arc, mpsc},
         thread,
         time::Duration,
@@ -682,13 +692,15 @@ mod tests {
 
     #[test]
     fn attached_workspace_files_emit_real_read_tool_events() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("project.txt"), "selected workspace").unwrap();
         let client = LlmClient::with_provider(Arc::new(EchoProvider));
-        let mut runner = AgentTaskRunner::spawn(client);
+        let mut runner = AgentTaskRunner::spawn_in(client, workspace.path().to_owned());
         runner
             .submit_with_attachments(
                 3,
                 "Review this".into(),
-                vec![crate::transcript::Attachment::workspace_file("Cargo.toml")],
+                vec![crate::transcript::Attachment::workspace_file("project.txt")],
             )
             .unwrap();
 
@@ -707,7 +719,7 @@ mod tests {
             AgentEvent::ToolFinished { request_id: 3, artifacts, .. }
                 if matches!(
                     artifacts.as_slice(),
-                    [ToolArtifact::CodeRange { path, .. }] if path == "Cargo.toml"
+                    [ToolArtifact::CodeRange { path, .. }] if path == "project.txt"
                 )
         )));
 

@@ -25,8 +25,10 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend, buffer::Buffer, layout::Position};
 use std::{
+    ffi::OsStr,
     io::{Stdout, stdout},
     panic,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -34,9 +36,9 @@ const TICK_RATE: Duration = Duration::from_millis(50);
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LaunchMode {
-    Interactive,
+    Interactive(PathBuf),
     AuthOnly,
 }
 
@@ -44,18 +46,30 @@ impl LaunchMode {
     fn parse<I, S>(args: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
-        S: AsRef<str>,
+        S: AsRef<OsStr>,
     {
         let mut args = args.into_iter();
         match (args.next(), args.next()) {
-            (None, None) => Ok(Self::Interactive),
-            (Some(command), None) if command.as_ref() == "auth" => Ok(Self::AuthOnly),
-            (Some(command), None) => anyhow::bail!(
-                "unknown command '{}'; supported command: auth",
-                command.as_ref()
+            (None, None) => Self::interactive(
+                std::env::current_dir()
+                    .context("could not determine the current directory for the workspace")?,
             ),
-            _ => anyhow::bail!("too many arguments; usage: funcode [auth]"),
+            (Some(command), None) if command.as_ref() == OsStr::new("auth") => Ok(Self::AuthOnly),
+            (Some(path), None) => Self::interactive(PathBuf::from(path.as_ref())),
+            _ => anyhow::bail!("too many arguments; usage: funcode [PATH] | funcode auth"),
         }
+    }
+
+    fn interactive(path: PathBuf) -> Result<Self> {
+        let display = path.display().to_string();
+        let workspace = std::fs::canonicalize(&path)
+            .with_context(|| format!("could not open workspace '{display}'"))?;
+        anyhow::ensure!(
+            workspace.is_dir(),
+            "workspace '{}' is not a directory",
+            workspace.display()
+        );
+        Ok(Self::Interactive(workspace))
     }
 }
 
@@ -74,14 +88,16 @@ pub fn run() -> Result<()> {
 }
 
 fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result<()> {
-    let workspace_runner = match launch_mode {
-        LaunchMode::Interactive => std::env::current_dir()
-            .ok()
-            .map(workspace::WorkspaceTaskRunner::spawn),
+    let workspace_root = match &launch_mode {
+        LaunchMode::Interactive(workspace) => Some(workspace.clone()),
         LaunchMode::AuthOnly => None,
     };
-    let mut app = match launch_mode {
-        LaunchMode::Interactive => App::new(),
+    let workspace_runner = workspace_root
+        .as_ref()
+        .cloned()
+        .map(workspace::WorkspaceTaskRunner::spawn);
+    let mut app = match &launch_mode {
+        LaunchMode::Interactive(_) => App::new(),
         LaunchMode::AuthOnly => App::for_auth(),
     };
     let (theme_load, mut theme_runner) = match ThemeConfigStore::standard() {
@@ -101,8 +117,8 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     if let Some(warning) = theme_load.warning {
         app.set_notice(warning);
     }
-    let (mut runner, mut model_runner) = match launch_mode {
-        LaunchMode::Interactive => {
+    let (mut runner, mut model_runner) = match &launch_mode {
+        LaunchMode::Interactive(_) => {
             let config = LlmConfig::from_env().context("failed to load LLM configuration")?;
             let auth_store =
                 AuthStore::standard().context("failed to locate ChatGPT credentials")?;
@@ -112,7 +128,10 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                     .context("failed to read the selected model")?,
             );
             (
-                Some(AgentTaskRunner::spawn(llm.clone())),
+                Some(AgentTaskRunner::spawn_in(
+                    llm.clone(),
+                    workspace_root.expect("interactive mode has a workspace"),
+                )),
                 Some(ModelCatalogTaskRunner::spawn(llm)),
             )
         }
@@ -610,19 +629,24 @@ mod tests {
     }
 
     #[test]
-    fn auth_is_the_supported_cli_subcommand() {
-        assert_eq!(
+    fn launch_mode_accepts_the_current_workspace_and_auth_subcommand() {
+        assert!(matches!(
             LaunchMode::parse(Vec::<String>::new()).unwrap(),
-            LaunchMode::Interactive
-        );
+            LaunchMode::Interactive(_)
+        ));
         assert_eq!(LaunchMode::parse(["auth"]).unwrap(), LaunchMode::AuthOnly);
-        assert!(
-            LaunchMode::parse(["unknown"])
-                .unwrap_err()
-                .to_string()
-                .contains("auth")
-        );
         assert!(LaunchMode::parse(["auth", "extra"]).is_err());
+    }
+
+    #[test]
+    fn a_project_path_selects_that_workspace_and_invalid_paths_fail_early() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            LaunchMode::parse([workspace.path().as_os_str()]).unwrap(),
+            LaunchMode::Interactive(workspace.path().canonicalize().unwrap())
+        );
+        assert!(LaunchMode::parse([workspace.path().join("missing")]).is_err());
     }
 
     #[test]

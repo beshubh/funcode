@@ -175,6 +175,7 @@ pub struct WorkspaceFileReader {
 }
 
 impl WorkspaceFileReader {
+    #[cfg(test)]
     pub fn from_current_dir() -> Result<Self, FileReadError> {
         let root = std::env::current_dir()
             .map_err(|error| FileReadError(format!("could not locate the workspace: {error}")))?;
