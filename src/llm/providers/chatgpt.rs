@@ -12,7 +12,7 @@ use rig_core::{
 };
 
 const SYSTEM_INSTRUCTIONS: &str =
-    "You are Funcode, a helpful coding assistant. Give clear, accurate, practical answers.";
+    "You are Funcode, a helpful and fun coding assistant. Give clear, accurate, practical answers.";
 
 pub(in crate::llm) struct ChatGptProvider {
     model: String,
@@ -63,6 +63,9 @@ impl Provider for ChatGptProvider {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
                     text,
                 ))) => ChatGptStreamEvent::Text(text.text),
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::ReasoningDelta { reasoning, .. },
+                )) => ChatGptStreamEvent::ReasoningSummary(reasoning),
                 Ok(MultiTurnStreamItem::FinalResponse(_)) => ChatGptStreamEvent::Finished,
                 Ok(_) => ChatGptStreamEvent::Ignored,
                 Err(error) => ChatGptStreamEvent::Failed(error.to_string()),
@@ -77,6 +80,7 @@ impl Provider for ChatGptProvider {
 
 enum ChatGptStreamEvent {
     Text(String),
+    ReasoningSummary(String),
     Finished,
     Failed(String),
     Ignored,
@@ -108,6 +112,9 @@ impl ConversationAssembler {
             ChatGptStreamEvent::Text(text) => {
                 self.response.push_str(&text);
                 Some(Ok(ProviderEvent::TextDelta(text)))
+            }
+            ChatGptStreamEvent::ReasoningSummary(summary) => {
+                Some(Ok(ProviderEvent::ReasoningDelta(summary)))
             }
             ChatGptStreamEvent::Finished => {
                 self.terminal = true;
@@ -224,6 +231,34 @@ mod tests {
                 ConversationMessage::User("second".into()),
                 ConversationMessage::Assistant("second response".into()),
             ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn streams_provider_reasoning_summaries_without_putting_them_in_assistant_text() {
+        let events = stream_events(
+            stream::iter([
+                ChatGptStreamEvent::ReasoningSummary("Checking the file list.".into()),
+                ChatGptStreamEvent::Text("Done".into()),
+                ChatGptStreamEvent::Finished,
+            ]),
+            ConversationAssembler::new(Vec::new(), "inspect".into()),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(matches!(
+            &events[0],
+            Ok(ProviderEvent::ReasoningDelta(summary)) if summary == "Checking the file list."
+        ));
+        assert!(matches!(&events[1], Ok(ProviderEvent::TextDelta(text)) if text == "Done"));
+        assert!(matches!(
+            &events[2],
+            Ok(ProviderEvent::Completed(history))
+                if history == &vec![
+                    ConversationMessage::User("inspect".into()),
+                    ConversationMessage::Assistant("Done".into()),
+                ]
         ));
     }
 

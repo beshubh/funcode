@@ -2,6 +2,7 @@ use crate::{
     agent::{AgentEvent, RequestId},
     auth::AuthEvent,
     commands::{Command, CommandRegistry},
+    transcript::{Attachment, EntryId, EntryKind, Transcript, TranscriptEvent},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::{Duration, Instant};
@@ -69,46 +70,11 @@ impl Default for AuthDialog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResponseStatus {
-    Queued,
-    Thinking,
-    Streaming,
-    Completed,
-    Interrupted,
-    Failed(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Turn {
-    pub request_id: RequestId,
-    pub prompt: String,
-    pub response: String,
-    pub response_status: ResponseStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolActivity {
-    pub request_id: RequestId,
-    pub name: String,
-    pub summary: String,
-}
-
-impl Turn {
-    pub(crate) fn queued(request_id: RequestId, prompt: String) -> Self {
-        Self {
-            request_id,
-            prompt,
-            response: String::new(),
-            response_status: ResponseStatus::Queued,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
     Submit {
         request_id: RequestId,
         prompt: String,
+        attachments: Vec<Attachment>,
     },
     Cancel {
         request_id: RequestId,
@@ -118,6 +84,9 @@ pub enum AppAction {
     },
     CancelAuthentication {
         quit: bool,
+    },
+    CopyToClipboard {
+        text: String,
     },
     Quit,
 }
@@ -139,6 +108,7 @@ pub struct Suggestion {
 pub struct Composer {
     text: String,
     cursor: usize,
+    attachments: Vec<Attachment>,
 }
 
 impl Composer {
@@ -150,6 +120,10 @@ impl Composer {
         self.cursor
     }
 
+    pub fn attachments(&self) -> &[Attachment] {
+        &self.attachments
+    }
+
     pub fn insert_text(&mut self, text: &str) {
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
@@ -158,6 +132,20 @@ impl Composer {
     fn take(&mut self) -> String {
         self.cursor = 0;
         std::mem::take(&mut self.text)
+    }
+
+    fn take_submission(&mut self) -> (String, Vec<Attachment>) {
+        (self.take(), std::mem::take(&mut self.attachments))
+    }
+
+    fn attach_file(&mut self, path: String) {
+        if !self
+            .attachments
+            .iter()
+            .any(|attachment| attachment.path == path)
+        {
+            self.attachments.push(Attachment::workspace_file(path));
+        }
     }
 
     fn move_left(&mut self) {
@@ -248,14 +236,14 @@ fn byte_index_at_character(text: &str, character_index: usize) -> usize {
 pub struct App {
     pub screen: Screen,
     pub composer: Composer,
-    pub turns: Vec<Turn>,
+    pub transcript: Transcript,
     pub active_request: Option<RequestId>,
     pub animation_frame: usize,
     pub scroll_from_bottom: usize,
     pub follow_output: bool,
-    pub thinking_expanded: bool,
-    pub tools_expanded: bool,
-    pub active_tool: Option<ToolActivity>,
+    pub expanded_entries: Vec<EntryId>,
+    pub message_dialog: Option<EntryId>,
+    pub notice: Option<String>,
     pub auth_dialog: Option<AuthDialog>,
     commands: CommandRegistry,
     workspace_files: Vec<String>,
@@ -282,9 +270,17 @@ impl App {
         S: Into<String>,
     {
         let mut app = Self::new();
-        app.workspace_files = files.into_iter().map(Into::into).collect();
-        app.workspace_files.sort();
+        app.set_workspace_files(files);
         app
+    }
+
+    pub(crate) fn set_workspace_files<I, S>(&mut self, files: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.workspace_files = files.into_iter().map(Into::into).collect();
+        self.workspace_files.sort();
     }
 
     pub fn for_auth() -> Self {
@@ -303,6 +299,10 @@ impl App {
 
         if self.auth_dialog.is_some() {
             return self.handle_auth_key(key);
+        }
+
+        if self.message_dialog.is_some() {
+            return self.handle_message_dialog_key(key);
         }
 
         if self.screen == Screen::Home {
@@ -396,13 +396,11 @@ impl App {
                 None
             }
             KeyCode::PageUp => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(SCROLL_STEP);
-                self.follow_output = false;
+                self.scroll_transcript_up();
                 None
             }
             KeyCode::PageDown => {
-                self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(SCROLL_STEP);
-                self.follow_output = self.scroll_from_bottom == 0;
+                self.scroll_transcript_down();
                 None
             }
             _ => None,
@@ -416,6 +414,16 @@ impl App {
             self.suggestion_selected = 0;
             self.last_escape = None;
         }
+    }
+
+    pub fn scroll_transcript_up(&mut self) {
+        self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(SCROLL_STEP);
+        self.follow_output = false;
+    }
+
+    pub fn scroll_transcript_down(&mut self) {
+        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(SCROLL_STEP);
+        self.follow_output = self.scroll_from_bottom == 0;
     }
 
     pub fn register_command(&mut self, command: impl Command + 'static) {
@@ -469,8 +477,8 @@ impl App {
             }
             SuggestionKind::File => {
                 let (range, _) = active_file_query(self.composer.text(), self.composer.cursor())?;
-                self.composer
-                    .replace_range(range, &format!("@{} ", suggestion.label));
+                self.composer.replace_range(range, "");
+                self.composer.attach_file(suggestion.label);
                 self.suggestion_selected = 0;
                 None
             }
@@ -502,86 +510,111 @@ impl App {
     }
 
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
-        match event {
+        let (request_id, transcript_event, finishes_request) = match event {
             AgentEvent::Started { request_id } => {
-                if let Some(turn) = self.turn_mut(request_id)
-                    && turn.response_status == ResponseStatus::Queued
-                {
-                    turn.response_status = ResponseStatus::Thinking;
+                if self.transcript.is_queued(request_id) {
                     self.active_request = Some(request_id);
                     self.cancellation_requested = false;
-                    self.thinking_expanded = false;
-                    self.tools_expanded = false;
-                    self.active_tool = None;
                 }
+                (
+                    request_id,
+                    TranscriptEvent::Started {
+                        turn_id: request_id,
+                    },
+                    false,
+                )
             }
-            AgentEvent::TextDelta { request_id, text } => {
-                if let Some(turn) = self.turn_mut(request_id)
-                    && matches!(
-                        turn.response_status,
-                        ResponseStatus::Thinking | ResponseStatus::Streaming
-                    )
-                {
-                    turn.response_status = ResponseStatus::Streaming;
-                    turn.response.push_str(&text);
-                    self.thinking_expanded = false;
-                }
-            }
+            AgentEvent::TextDelta { request_id, text } => (
+                request_id,
+                TranscriptEvent::TextDelta {
+                    turn_id: request_id,
+                    text,
+                },
+                false,
+            ),
+            AgentEvent::ReasoningDelta {
+                request_id,
+                summary,
+            } => (
+                request_id,
+                TranscriptEvent::ReasoningDelta {
+                    turn_id: request_id,
+                    summary,
+                },
+                false,
+            ),
             AgentEvent::ToolStarted {
                 request_id,
+                call_id,
                 name,
                 summary,
-            } => {
-                if self.active_request == Some(request_id) {
-                    self.active_tool = Some(ToolActivity {
-                        request_id,
-                        name,
-                        summary,
-                    });
-                    self.tools_expanded = false;
-                }
-            }
-            AgentEvent::ToolFinished { request_id } => {
-                if self
-                    .active_tool
-                    .as_ref()
-                    .is_some_and(|tool| tool.request_id == request_id)
-                {
-                    self.active_tool = None;
-                    self.tools_expanded = false;
-                }
-            }
-            AgentEvent::Completed { request_id } => {
-                if let Some(turn) = self.turn_mut(request_id)
-                    && matches!(
-                        turn.response_status,
-                        ResponseStatus::Thinking | ResponseStatus::Streaming
-                    )
-                {
-                    turn.response_status = ResponseStatus::Completed;
-                }
-                self.finish_request(request_id);
-            }
-            AgentEvent::Interrupted { request_id } => {
-                if let Some(turn) = self.turn_mut(request_id)
-                    && matches!(
-                        turn.response_status,
-                        ResponseStatus::Thinking | ResponseStatus::Streaming
-                    )
-                {
-                    turn.response_status = ResponseStatus::Interrupted;
-                }
-                self.finish_request(request_id);
-            }
+            } => (
+                request_id,
+                TranscriptEvent::ToolStarted {
+                    turn_id: request_id,
+                    call_id,
+                    name,
+                    summary,
+                },
+                false,
+            ),
+            AgentEvent::ToolFinished {
+                request_id,
+                call_id,
+                summary,
+                artifacts,
+            } => (
+                request_id,
+                TranscriptEvent::ToolFinished {
+                    turn_id: request_id,
+                    call_id,
+                    summary,
+                    artifacts,
+                },
+                false,
+            ),
+            AgentEvent::ToolFailed {
+                request_id,
+                call_id,
+                message,
+            } => (
+                request_id,
+                TranscriptEvent::ToolFailed {
+                    turn_id: request_id,
+                    call_id,
+                    message,
+                },
+                false,
+            ),
+            AgentEvent::Completed { request_id } => (
+                request_id,
+                TranscriptEvent::Completed {
+                    turn_id: request_id,
+                },
+                true,
+            ),
+            AgentEvent::Interrupted { request_id } => (
+                request_id,
+                TranscriptEvent::Interrupted {
+                    turn_id: request_id,
+                },
+                true,
+            ),
             AgentEvent::Failed {
                 request_id,
                 message,
-            } => {
-                if let Some(turn) = self.turn_mut(request_id) {
-                    turn.response_status = ResponseStatus::Failed(message);
-                }
-                self.finish_request(request_id);
-            }
+            } => (
+                request_id,
+                TranscriptEvent::Failed {
+                    turn_id: request_id,
+                    message,
+                },
+                true,
+            ),
+        };
+        self.transcript.apply(transcript_event);
+        if finishes_request {
+            self.finish_request(request_id);
         }
     }
 
@@ -619,24 +652,56 @@ impl App {
         }
     }
 
-    pub fn is_thinking(&self) -> bool {
-        self.active_request.is_some_and(|request_id| {
-            self.turns.iter().any(|turn| {
-                turn.request_id == request_id && turn.response_status == ResponseStatus::Thinking
-            })
+    pub fn toggle_entry(&mut self, entry_id: EntryId) {
+        if let Some(index) = self
+            .expanded_entries
+            .iter()
+            .position(|expanded| *expanded == entry_id)
+        {
+            self.expanded_entries.remove(index);
+        } else {
+            self.expanded_entries.push(entry_id);
+        }
+    }
+
+    pub fn entry_is_expanded(&self, entry_id: EntryId) -> bool {
+        self.expanded_entries.contains(&entry_id)
+    }
+
+    pub fn open_message_dialog(&mut self, entry_id: EntryId) {
+        if self.transcript.user_message(entry_id).is_some() {
+            self.message_dialog = Some(entry_id);
+        }
+    }
+
+    pub fn activate_transcript_entry(&mut self, entry_id: EntryId) {
+        let kind = self
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .map(|entry| &entry.kind);
+        match kind {
+            Some(EntryKind::User(_)) => self.open_message_dialog(entry_id),
+            Some(EntryKind::Reasoning(_) | EntryKind::Tool(_)) => self.toggle_entry(entry_id),
+            Some(EntryKind::Assistant(_)) | None => {}
+        }
+    }
+
+    pub fn close_message_dialog(&mut self) {
+        self.message_dialog = None;
+    }
+
+    pub fn copy_message_dialog(&mut self) -> Option<AppAction> {
+        let entry_id = self.message_dialog?;
+        let message = self.transcript.user_message(entry_id)?;
+        Some(AppAction::CopyToClipboard {
+            text: message.copy_text(),
         })
     }
 
-    pub fn toggle_thinking(&mut self) {
-        if self.is_thinking() {
-            self.thinking_expanded = !self.thinking_expanded;
-        }
-    }
-
-    pub fn toggle_tools(&mut self) {
-        if self.active_tool.is_some() {
-            self.tools_expanded = !self.tools_expanded;
-        }
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
     }
 
     pub fn open_auth_dialog(&mut self) {
@@ -652,6 +717,15 @@ impl App {
         let provider = *AuthProvider::ALL.get(dialog.selected)?;
         dialog.phase = AuthDialogPhase::Starting;
         Some(AppAction::Authenticate { provider })
+    }
+
+    pub fn set_auth_selection(&mut self, index: usize) {
+        let Some(dialog) = self.auth_dialog.as_mut() else {
+            return;
+        };
+        if dialog.phase == AuthDialogPhase::Selecting && index < AuthProvider::ALL.len() {
+            dialog.selected = index;
+        }
     }
 
     pub fn move_auth_selection(&mut self, direction: i8) {
@@ -721,6 +795,17 @@ impl App {
         }
     }
 
+    fn handle_message_dialog_key(&mut self, key: KeyEvent) -> Option<AppAction> {
+        match key.code {
+            KeyCode::Esc => {
+                self.close_message_dialog();
+                None
+            }
+            KeyCode::Enter | KeyCode::Char('c') => self.copy_message_dialog(),
+            _ => None,
+        }
+    }
+
     fn handle_escape(&mut self, now: Instant) -> Option<AppAction> {
         self.active_request?;
         if self.cancellation_requested {
@@ -763,21 +848,20 @@ impl App {
             return None;
         }
 
-        let prompt = self.composer.take();
+        let (prompt, attachments) = self.composer.take_submission();
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
-        self.turns.push(Turn::queued(request_id, prompt.clone()));
+        self.transcript
+            .submit(request_id, prompt.clone(), attachments.clone());
         if self.follow_output {
             self.scroll_from_bottom = 0;
         }
 
-        Some(AppAction::Submit { request_id, prompt })
-    }
-
-    fn turn_mut(&mut self, request_id: RequestId) -> Option<&mut Turn> {
-        self.turns
-            .iter_mut()
-            .find(|turn| turn.request_id == request_id)
+        Some(AppAction::Submit {
+            request_id,
+            prompt,
+            attachments,
+        })
     }
 
     fn finish_request(&mut self, request_id: RequestId) {
@@ -785,25 +869,33 @@ impl App {
             self.active_request = None;
             self.cancellation_requested = false;
             self.last_escape = None;
-            self.thinking_expanded = false;
-            self.tools_expanded = false;
-            self.active_tool = None;
         }
     }
 }
 
 fn active_file_query(text: &str, cursor: usize) -> Option<(std::ops::Range<usize>, &str)> {
     let start = text[..cursor].rfind('@')?;
+    let is_token_start = start == 0
+        || text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
+    if !is_token_start {
+        return None;
+    }
     let query = &text[start + 1..cursor];
     (!query.chars().any(char::is_whitespace)).then_some((start..cursor, query))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        App, AppAction, AuthDialogPhase, AuthProvider, ResponseStatus, Screen, SuggestionKind,
+    use super::{App, AppAction, AuthDialogPhase, AuthProvider, Screen, SuggestionKind};
+    use crate::{
+        agent::AgentEvent,
+        auth::AuthEvent,
+        commands::Command,
+        transcript::{AssistantStatus, EntryKind, ToolArtifact},
     };
-    use crate::{agent::AgentEvent, auth::AuthEvent, commands::Command};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::{Duration, Instant};
 
@@ -828,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn at_query_anywhere_in_the_composer_inserts_the_selected_file() {
+    fn at_query_at_a_token_boundary_attaches_the_selected_file() {
         let mut app = App::with_files(["Cargo.toml", "src/main.rs", "src/runtime.rs"]);
         app.screen = Screen::Chat;
         app.composer.insert_text("please inspect @src/ma");
@@ -839,7 +931,30 @@ mod tests {
         assert_eq!(suggestions[0].kind, SuggestionKind::File);
 
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
-        assert_eq!(app.composer.text(), "please inspect @src/main.rs ");
+        assert_eq!(app.composer.text(), "please inspect ");
+        assert_eq!(app.composer.attachments()[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn at_query_does_not_trigger_inside_an_email_like_token() {
+        let mut app = App::with_files(["src/main.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("contact me@example.com");
+
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn at_query_triggers_at_the_start_or_after_whitespace() {
+        let mut app = App::with_files(["src/main.rs"]);
+        app.screen = Screen::Chat;
+
+        app.composer.insert_text("@src/ma");
+        assert_eq!(app.suggestions()[0].label, "src/main.rs");
+
+        app.composer.take();
+        app.composer.insert_text("inspect @src/ma");
+        assert_eq!(app.suggestions()[0].label, "src/main.rs");
     }
 
     #[test]
@@ -876,7 +991,7 @@ mod tests {
         }
 
         fn execute(&self, app: &mut App) -> Option<AppAction> {
-            app.tools_expanded = !app.tools_expanded;
+            app.set_notice("command executed");
             None
         }
     }
@@ -890,7 +1005,7 @@ mod tests {
 
         app.handle_key(key(KeyCode::Enter), Instant::now());
 
-        assert!(app.tools_expanded);
+        assert_eq!(app.notice.as_deref(), Some("command executed"));
         assert!(app.composer.text().is_empty());
     }
 
@@ -901,7 +1016,7 @@ mod tests {
         app.composer.insert_text("/auth");
 
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
-        assert!(app.turns.is_empty());
+        assert!(app.transcript.entries().is_empty());
         assert_eq!(
             app.auth_dialog.as_ref().map(|dialog| &dialog.phase),
             Some(&AuthDialogPhase::Selecting)
@@ -992,9 +1107,13 @@ mod tests {
             Some(AppAction::Submit {
                 request_id: 1,
                 prompt: "hello".into(),
+                attachments: Vec::new(),
             })
         );
-        assert_eq!(app.turns[0].response_status, ResponseStatus::Queued);
+        assert!(matches!(
+            &app.transcript.entries()[1].kind,
+            EntryKind::Assistant(message) if message.status == AssistantStatus::Queued
+        ));
 
         app.handle_agent_event(AgentEvent::Started { request_id: 1 });
         app.handle_agent_event(AgentEvent::TextDelta {
@@ -1003,15 +1122,18 @@ mod tests {
         });
         app.handle_agent_event(AgentEvent::Completed { request_id: 1 });
 
-        assert_eq!(app.turns[0].response, "streamed");
-        assert_eq!(app.turns[0].response_status, ResponseStatus::Completed);
+        assert!(matches!(
+            &app.transcript.entries()[1].kind,
+            EntryKind::Assistant(message)
+                if message.text == "streamed" && message.status == AssistantStatus::Completed
+        ));
     }
 
     #[test]
     fn two_escape_presses_within_500ms_cancel_only_the_active_request() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.turns.push(super::Turn::queued(7, "prompt".into()));
+        app.transcript.submit(7, "prompt".into(), Vec::new());
         app.handle_agent_event(AgentEvent::Started { request_id: 7 });
         let start = Instant::now();
 
@@ -1063,7 +1185,7 @@ mod tests {
     fn an_expired_or_broken_escape_sequence_does_not_cancel() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.turns.push(super::Turn::queued(4, "prompt".into()));
+        app.transcript.submit(4, "prompt".into(), Vec::new());
         app.handle_agent_event(AgentEvent::Started { request_id: 4 });
         let start = Instant::now();
 
@@ -1083,7 +1205,7 @@ mod tests {
     fn completed_turns_ignore_late_stream_events() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.turns.push(super::Turn::queued(9, "prompt".into()));
+        app.transcript.submit(9, "prompt".into(), Vec::new());
         app.handle_agent_event(AgentEvent::Started { request_id: 9 });
         app.handle_agent_event(AgentEvent::Completed { request_id: 9 });
         app.handle_agent_event(AgentEvent::TextDelta {
@@ -1091,8 +1213,26 @@ mod tests {
             text: "late".into(),
         });
 
-        assert!(app.turns[0].response.is_empty());
-        assert_eq!(app.turns[0].response_status, ResponseStatus::Completed);
+        assert!(matches!(
+            &app.transcript.entries()[1].kind,
+            EntryKind::Assistant(message)
+                if message.text.is_empty() && message.status == AssistantStatus::Completed
+        ));
+    }
+
+    #[test]
+    fn late_started_event_does_not_reactivate_a_completed_turn() {
+        let mut app = App::new();
+        app.transcript.submit(9, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 9 });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 9 });
+        app.handle_agent_event(AgentEvent::Started { request_id: 9 });
+
+        assert!(app.active_request.is_none());
+        assert!(matches!(
+            &app.transcript.entries()[1].kind,
+            EntryKind::Assistant(message) if message.status == AssistantStatus::Completed
+        ));
     }
 
     #[test]
@@ -1113,7 +1253,7 @@ mod tests {
     fn legacy_alt_escape_encoding_interrupts_the_active_request() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.turns.push(super::Turn::queued(12, "prompt".into()));
+        app.transcript.submit(12, "prompt".into(), Vec::new());
         app.handle_agent_event(AgentEvent::Started { request_id: 12 });
 
         assert_eq!(
@@ -1126,23 +1266,53 @@ mod tests {
     }
 
     #[test]
-    fn tool_activity_can_expand_and_is_removed_when_the_tool_finishes() {
+    fn tool_activity_persists_and_can_expand_after_the_tool_finishes() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.turns.push(super::Turn::queued(13, "inspect".into()));
+        app.transcript.submit(13, "inspect".into(), Vec::new());
         app.handle_agent_event(AgentEvent::Started { request_id: 13 });
         app.handle_agent_event(AgentEvent::ToolStarted {
             request_id: 13,
+            call_id: 4,
             name: "read_file".into(),
             summary: "Reading Cargo.toml".into(),
         });
 
-        app.toggle_tools();
-        assert!(app.tools_expanded);
-        assert_eq!(app.active_tool.as_ref().unwrap().name, "read_file");
+        let tool_id = app.transcript.entries()[3].id;
+        app.activate_transcript_entry(tool_id);
+        assert!(app.entry_is_expanded(tool_id));
 
-        app.handle_agent_event(AgentEvent::ToolFinished { request_id: 13 });
-        assert!(app.active_tool.is_none());
-        assert!(!app.tools_expanded);
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            request_id: 13,
+            call_id: 4,
+            summary: None,
+            artifacts: vec![ToolArtifact::FileReference("Cargo.toml".into())],
+        });
+        assert!(matches!(
+            &app.transcript.entries()[3].kind,
+            EntryKind::Tool(tool) if tool.artifacts.len() == 1
+        ));
+    }
+
+    #[test]
+    fn clicking_a_user_message_opens_a_copyable_modal_with_its_attachments() {
+        let mut app = App::with_files(["src/lib.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("Review @src/lib.rs");
+        app.activate_suggestion(0);
+        let _ = app.handle_key(key(KeyCode::Enter), Instant::now());
+        let user_entry = app.transcript.entries()[0].id;
+
+        app.activate_transcript_entry(user_entry);
+        assert_eq!(app.message_dialog, Some(user_entry));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('c')), Instant::now()),
+            Some(AppAction::CopyToClipboard {
+                text: "Review \n\nAttached files:\n- src/lib.rs".into(),
+            })
+        );
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc), Instant::now()), None);
+        assert!(app.message_dialog.is_none());
     }
 }

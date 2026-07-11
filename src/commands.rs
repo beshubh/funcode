@@ -94,3 +94,56 @@ impl Command for ExitCommand {
         Some(AppAction::Quit)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, CommandRegistry};
+    use crate::app::{App, AppAction};
+
+    #[derive(Debug)]
+    struct TestCommand {
+        name: &'static str,
+    }
+
+    impl Command for TestCommand {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn description(&self) -> &'static str {
+            "Test command"
+        }
+
+        fn execute(&self, _app: &mut App) -> Option<AppAction> {
+            None
+        }
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_and_preserves_registration_order() {
+        let mut registry = CommandRegistry::empty();
+        registry.register(TestCommand { name: "auth" });
+        registry.register(TestCommand { name: "author" });
+        registry.register(TestCommand { name: "exit" });
+
+        let names: Vec<_> = registry
+            .matching("AU")
+            .map(|command| command.name())
+            .collect();
+
+        assert_eq!(names, ["auth", "author"]);
+    }
+
+    #[test]
+    fn find_requires_an_exact_command_name() {
+        let mut registry = CommandRegistry::empty();
+        registry.register(TestCommand { name: "auth" });
+
+        assert_eq!(
+            registry.find("auth").map(|command| command.name()),
+            Some("auth")
+        );
+        assert!(registry.find("Auth").is_none());
+        assert!(registry.find("au").is_none());
+    }
+}

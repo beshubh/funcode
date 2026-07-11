@@ -43,10 +43,11 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - PageUp/PageDown: scroll the transcript
 - End: return to the latest transcript content when scrolled up
 - Esc twice within 500 ms: interrupt the active response and continue with the next queued prompt
-- Click Thinking or Tools: expand or collapse the widget while that activity is running
 - Type `/` at the start of the composer: browse registered commands
-- Type `@` anywhere in the composer: search workspace files
+- Type `@` at the start of a token: attach a workspace file to the next message
 - Move the mouse over a suggestion to highlight it; click to activate it
+- Click a sent message: open a modal and copy its text and attached paths
+- Click a Thinking or tool block: expand its persistent activity summary
 - `/auth`: open the authentication picker
 - `/exit` or Ctrl+C: quit
 

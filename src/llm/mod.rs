@@ -18,6 +18,7 @@ pub(crate) type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent, LlmError>
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LlmEvent {
     TextDelta(String),
+    ReasoningDelta(String),
     Completed(ConversationCommit),
 }
 
@@ -85,6 +86,7 @@ pub(crate) struct ProviderRequest {
 
 pub(crate) enum ProviderEvent {
     TextDelta(String),
+    ReasoningDelta(String),
     Completed(Vec<ConversationMessage>),
 }
 
@@ -132,6 +134,7 @@ impl LlmClient {
             .await?;
         Ok(Box::pin(stream.map(move |event| match event? {
             ProviderEvent::TextDelta(text) => Ok(LlmEvent::TextDelta(text)),
+            ProviderEvent::ReasoningDelta(summary) => Ok(LlmEvent::ReasoningDelta(summary)),
             ProviderEvent::Completed(history) => {
                 Ok(LlmEvent::Completed(ConversationCommit { history }))
             }
@@ -239,7 +242,7 @@ mod tests {
             .into_iter()
             .find_map(|event| match event.unwrap() {
                 LlmEvent::Completed(commit) => Some(commit),
-                LlmEvent::TextDelta(_) => None,
+                LlmEvent::TextDelta(_) | LlmEvent::ReasoningDelta(_) => None,
             })
             .unwrap();
         client.commit(commit).unwrap();

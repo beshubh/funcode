@@ -6,6 +6,7 @@ authors = ["Shubham"]
 
 [dependencies]
 anyhow = "1.0.103"
+arboard = "3.6.1"
 base64 = "0.22.1"
 crossterm = "0.29.0"
 futures = "0.3.32"

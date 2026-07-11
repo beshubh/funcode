@@ -8,6 +8,7 @@ pub struct Theme {
     pub panel_border: Style,
     pub logo_accent: Style,
     pub logo_neutral: Style,
+    pub attachment_badge: Style,
     pub heading: Style,
     pub user: Style,
     pub agent: Style,
@@ -20,14 +21,16 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
+        let accent = Color::Rgb(181, 255, 0);
         Self {
             panel_border: Style::default().fg(Color::DarkGray),
-            logo_accent: Style::default()
-                .fg(Color::Rgb(181, 255, 0))
-                .add_modifier(Modifier::BOLD),
+            logo_accent: Style::default().fg(accent).add_modifier(Modifier::BOLD),
             logo_neutral: Style::default()
                 .fg(Color::Rgb(172, 180, 188))
                 .add_modifier(Modifier::BOLD),
+            attachment_badge: Style::default()
+                .fg(accent)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
             heading: Style::default().add_modifier(Modifier::BOLD),
             user: Style::default()
                 .fg(Color::Yellow)

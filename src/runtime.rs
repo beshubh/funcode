@@ -2,6 +2,7 @@ use crate::{
     agent::{AgentEvent, AgentTaskRunner},
     app::{App, AppAction, AuthProvider},
     auth::{AuthEvent, AuthStore, AuthTaskRunner},
+    clipboard::{ClipboardEvent, ClipboardTaskRunner},
     llm::{LlmClient, LlmConfig},
     theme::Theme,
     ui, workspace,
@@ -24,6 +25,9 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     io::{Stdout, stdout},
     panic,
+    path::PathBuf,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -72,13 +76,12 @@ pub fn run() -> Result<()> {
 
 fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result<()> {
     let mut app = match launch_mode {
-        LaunchMode::Interactive => {
-            let files = std::env::current_dir()
-                .map(|root| workspace::discover_files(&root))
-                .unwrap_or_default();
-            App::with_files(files)
-        }
+        LaunchMode::Interactive => App::new(),
         LaunchMode::AuthOnly => App::for_auth(),
+    };
+    let mut workspace_discovery = match launch_mode {
+        LaunchMode::Interactive => std::env::current_dir().ok().map(start_workspace_discovery),
+        LaunchMode::AuthOnly => None,
     };
     let theme = Theme::default();
     let mut runner = match launch_mode {
@@ -92,11 +95,22 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         LaunchMode::AuthOnly => None,
     };
     let mut auth_runner = AuthTaskRunner::spawn();
+    let mut clipboard = ClipboardTaskRunner::spawn();
     let mut next_tick = Instant::now() + TICK_RATE;
     let mut should_quit = false;
     let mut regions = ui::UiRegions::default();
 
     while !should_quit {
+        if let Some(discovery) = workspace_discovery.as_ref() {
+            match discovery.try_recv() {
+                Ok(files) => {
+                    app.set_workspace_files(files);
+                    workspace_discovery = None;
+                }
+                Err(TryRecvError::Disconnected) => workspace_discovery = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         if let Some(runner) = runner.as_ref() {
             while let Some(agent_event) = runner.try_event() {
                 app.handle_agent_event(agent_event);
@@ -104,6 +118,9 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         }
         while let Some(auth_event) = auth_runner.try_event() {
             app.handle_auth_event(auth_event);
+        }
+        while let Some(clipboard_event) = clipboard.try_event() {
+            handle_clipboard_event(&mut app, clipboard_event);
         }
 
         terminal
@@ -115,53 +132,17 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
             match event::read().context("failed to read terminal input")? {
                 Event::Key(key) if matches!(key.kind, KeyEventKind::Press) => {
                     if let Some(action) = app.handle_key(key, Instant::now()) {
-                        should_quit = dispatch(action, &mut app, runner.as_ref(), &auth_runner);
+                        should_quit =
+                            dispatch(action, &mut app, runner.as_ref(), &auth_runner, &clipboard);
                     }
                 }
                 Event::Paste(text) => app.handle_paste(&text),
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        match regions.target_at(mouse.column, mouse.row) {
-                            Some(ui::UiTarget::Thinking) => app.toggle_thinking(),
-                            Some(ui::UiTarget::Tools) => app.toggle_tools(),
-                            Some(ui::UiTarget::AuthProvider) => {
-                                if let Some(action) = app.select_auth_provider() {
-                                    should_quit =
-                                        dispatch(action, &mut app, runner.as_ref(), &auth_runner);
-                                }
-                            }
-                            Some(ui::UiTarget::Suggestion(index)) => {
-                                if let Some(action) = app.activate_suggestion(index) {
-                                    should_quit =
-                                        dispatch(action, &mut app, runner.as_ref(), &auth_runner);
-                                }
-                            }
-                            None => {}
-                        }
+                Event::Mouse(mouse) => {
+                    if let Some(action) = handle_mouse_event(&mut app, &regions, mouse) {
+                        should_quit =
+                            dispatch(action, &mut app, runner.as_ref(), &auth_runner, &clipboard);
                     }
-                    MouseEventKind::Moved => {
-                        if let Some(ui::UiTarget::Suggestion(index)) =
-                            regions.target_at(mouse.column, mouse.row)
-                        {
-                            app.set_suggestion_selection(index);
-                        }
-                    }
-                    MouseEventKind::ScrollUp => {
-                        if app.suggestions().is_empty() {
-                            app.move_auth_selection(-1);
-                        } else {
-                            app.move_suggestion_selection(-1);
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if app.suggestions().is_empty() {
-                            app.move_auth_selection(1);
-                        } else {
-                            app.move_suggestion_selection(1);
-                        }
-                    }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
         }
@@ -176,7 +157,68 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         runner.shutdown();
     }
     auth_runner.shutdown();
+    clipboard.shutdown();
     Ok(())
+}
+
+fn start_workspace_discovery(root: PathBuf) -> Receiver<Vec<String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(workspace::discover_files(&root));
+    });
+    receiver
+}
+
+fn handle_mouse_event(
+    app: &mut App,
+    regions: &ui::UiRegions,
+    mouse: crossterm::event::MouseEvent,
+) -> Option<AppAction> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => match regions.target_at(mouse.column, mouse.row)
+        {
+            Some(ui::UiTarget::TranscriptEntry(entry_id)) => {
+                app.activate_transcript_entry(entry_id);
+                None
+            }
+            Some(ui::UiTarget::MessageCopy) => app.copy_message_dialog(),
+            Some(ui::UiTarget::AuthProvider(index)) => {
+                app.set_auth_selection(index);
+                app.select_auth_provider()
+            }
+            Some(ui::UiTarget::Suggestion(index)) => app.activate_suggestion(index),
+            None => None,
+        },
+        MouseEventKind::Moved => {
+            match regions.target_at(mouse.column, mouse.row) {
+                Some(ui::UiTarget::Suggestion(index)) => app.set_suggestion_selection(index),
+                Some(ui::UiTarget::AuthProvider(index)) => app.set_auth_selection(index),
+                _ => {}
+            }
+            None
+        }
+        MouseEventKind::ScrollUp => {
+            if app.auth_dialog.is_some() {
+                app.move_auth_selection(-1);
+            } else if !app.suggestions().is_empty() {
+                app.move_suggestion_selection(-1);
+            } else if app.message_dialog.is_none() {
+                app.scroll_transcript_up();
+            }
+            None
+        }
+        MouseEventKind::ScrollDown => {
+            if app.auth_dialog.is_some() {
+                app.move_auth_selection(1);
+            } else if !app.suggestions().is_empty() {
+                app.move_suggestion_selection(1);
+            } else if app.message_dialog.is_none() {
+                app.scroll_transcript_down();
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn dispatch(
@@ -184,12 +226,19 @@ fn dispatch(
     app: &mut App,
     runner: Option<&AgentTaskRunner>,
     auth_runner: &AuthTaskRunner,
+    clipboard: &ClipboardTaskRunner,
 ) -> bool {
     match action {
-        AppAction::Submit { request_id, prompt } => {
+        AppAction::Submit {
+            request_id,
+            prompt,
+            attachments,
+        } => {
             match runner {
                 Some(runner) => {
-                    if let Err(error) = runner.submit(request_id, prompt) {
+                    if let Err(error) =
+                        runner.submit_with_attachments(request_id, prompt, attachments)
+                    {
                         app.handle_agent_event(AgentEvent::Failed {
                             request_id,
                             message: error.to_string(),
@@ -238,7 +287,20 @@ fn dispatch(
             }
             quit
         }
+        AppAction::CopyToClipboard { text } => {
+            if let Err(error) = clipboard.copy(text) {
+                app.set_notice(error.to_string());
+            }
+            false
+        }
         AppAction::Quit => true,
+    }
+}
+
+fn handle_clipboard_event(app: &mut App, event: ClipboardEvent) {
+    match event {
+        ClipboardEvent::Copied => app.set_notice("Message copied"),
+        ClipboardEvent::Failed(error) => app.set_notice(error),
     }
 }
 
@@ -324,7 +386,37 @@ fn install_restoring_panic_hook(keyboard_enhancement: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::LaunchMode;
+    use super::{
+        LaunchMode, dispatch, handle_clipboard_event, handle_mouse_event, start_workspace_discovery,
+    };
+    use crate::{
+        app::{App, AppAction, Screen},
+        auth::AuthTaskRunner,
+        clipboard::{Clipboard, ClipboardTaskRunner},
+        ui::UiRegions,
+    };
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+    use std::{fs, time::Duration};
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingClipboard;
+
+    impl Clipboard for RecordingClipboard {
+        fn copy(&mut self, text: &str) -> Result<(), String> {
+            assert_eq!(text, "copied message");
+            Ok(())
+        }
+    }
 
     #[test]
     fn auth_is_the_supported_cli_subcommand() {
@@ -340,5 +432,101 @@ mod tests {
                 .contains("auth")
         );
         assert!(LaunchMode::parse(["auth", "extra"]).is_err());
+    }
+
+    #[test]
+    fn workspace_discovery_returns_files_from_a_background_worker() {
+        let root = std::env::temp_dir().join(format!("funcode-workspace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "").unwrap();
+
+        let receiver = start_workspace_discovery(root.clone());
+
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ["src/main.rs"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mouse_click_activates_the_suggestion_under_the_pointer() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("/exit");
+        let regions = UiRegions {
+            suggestions: vec![Rect::new(4, 5, 12, 1)],
+            ..UiRegions::default()
+        };
+
+        assert_eq!(
+            handle_mouse_event(
+                &mut app,
+                &regions,
+                mouse(MouseEventKind::Down(MouseButton::Left), 4, 5)
+            ),
+            Some(AppAction::Quit)
+        );
+    }
+
+    #[test]
+    fn mouse_hover_and_wheel_choose_suggestions() {
+        let mut app = App::with_files(["src/app.rs", "src/main.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("@src/");
+        let regions = UiRegions {
+            suggestions: vec![Rect::new(4, 5, 12, 1), Rect::new(4, 6, 12, 1)],
+            ..UiRegions::default()
+        };
+
+        handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::Moved, 4, 6));
+        assert_eq!(app.selected_suggestion(), 1);
+
+        handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!(app.selected_suggestion(), 0);
+
+        handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
+        assert_eq!(app.selected_suggestion(), 1);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_transcript_when_no_overlay_owns_it() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        let regions = UiRegions::default();
+
+        handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!(app.scroll_from_bottom, 5);
+        assert!(!app.follow_output);
+
+        handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
+        assert_eq!(app.scroll_from_bottom, 0);
+        assert!(app.follow_output);
+    }
+
+    #[test]
+    fn copy_action_uses_the_clipboard_and_shows_confirmation() {
+        let mut app = App::new();
+        let mut auth_runner = AuthTaskRunner::spawn();
+        let mut clipboard = ClipboardTaskRunner::spawn_with(RecordingClipboard);
+
+        assert!(!dispatch(
+            AppAction::CopyToClipboard {
+                text: "copied message".into(),
+            },
+            &mut app,
+            None,
+            &auth_runner,
+            &clipboard,
+        ));
+        handle_clipboard_event(
+            &mut app,
+            clipboard.recv_timeout(Duration::from_secs(1)).unwrap(),
+        );
+        assert_eq!(app.notice.as_deref(), Some("Message copied"));
+
+        auth_runner.shutdown();
+        clipboard.shutdown();
     }
 }

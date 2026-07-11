@@ -1,4 +1,6 @@
 use crate::llm::{ConversationCommit, LlmClient, LlmEvent};
+use crate::tools::{ReadFile, WorkspaceFileReader};
+use crate::transcript::{Attachment, ToolArtifact, ToolCallId};
 use futures::StreamExt as _;
 use std::{
     collections::VecDeque,
@@ -19,13 +21,26 @@ pub enum AgentEvent {
         request_id: RequestId,
         text: String,
     },
+    ReasoningDelta {
+        request_id: RequestId,
+        summary: String,
+    },
     ToolStarted {
         request_id: RequestId,
+        call_id: ToolCallId,
         name: String,
         summary: String,
     },
     ToolFinished {
         request_id: RequestId,
+        call_id: ToolCallId,
+        summary: Option<String>,
+        artifacts: Vec<ToolArtifact>,
+    },
+    ToolFailed {
+        request_id: RequestId,
+        call_id: ToolCallId,
+        message: String,
     },
     Completed {
         request_id: RequestId,
@@ -44,6 +59,7 @@ enum AgentCommand {
     Submit {
         request_id: RequestId,
         prompt: String,
+        attachments: Vec<Attachment>,
     },
     Cancel {
         request_id: RequestId,
@@ -73,11 +89,13 @@ impl AgentTaskRunner {
         let (command_tx, command_rx) = async_mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
+            let workspace_reader = WorkspaceFileReader::from_current_dir()
+                .expect("failed to configure the workspace file reader");
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to create the LLM runtime");
-            runtime.block_on(run_coordinator(command_rx, event_tx, llm));
+            runtime.block_on(run_coordinator(command_rx, event_tx, llm, workspace_reader));
         });
 
         Self {
@@ -88,8 +106,21 @@ impl AgentTaskRunner {
     }
 
     pub fn submit(&self, request_id: RequestId, prompt: String) -> Result<(), RunnerUnavailable> {
+        self.submit_with_attachments(request_id, prompt, Vec::new())
+    }
+
+    pub fn submit_with_attachments(
+        &self,
+        request_id: RequestId,
+        prompt: String,
+        attachments: Vec<Attachment>,
+    ) -> Result<(), RunnerUnavailable> {
         self.commands
-            .send(AgentCommand::Submit { request_id, prompt })
+            .send(AgentCommand::Submit {
+                request_id,
+                prompt,
+                attachments,
+            })
             .map_err(|_| RunnerUnavailable)
     }
 
@@ -129,6 +160,7 @@ impl Drop for AgentTaskRunner {
 struct PendingRequest {
     request_id: RequestId,
     prompt: String,
+    attachments: Vec<Attachment>,
 }
 
 struct ActiveRequest {
@@ -141,6 +173,26 @@ enum RequestUpdate {
     TextDelta {
         request_id: RequestId,
         text: String,
+    },
+    ReasoningDelta {
+        request_id: RequestId,
+        summary: String,
+    },
+    ToolStarted {
+        request_id: RequestId,
+        call_id: ToolCallId,
+        name: String,
+        summary: String,
+    },
+    ToolFinished {
+        request_id: RequestId,
+        call_id: ToolCallId,
+        artifacts: Vec<ToolArtifact>,
+    },
+    ToolFailed {
+        request_id: RequestId,
+        call_id: ToolCallId,
+        message: String,
     },
     Completed {
         request_id: RequestId,
@@ -156,15 +208,25 @@ async fn run_coordinator(
     commands: async_mpsc::UnboundedReceiver<AgentCommand>,
     events: Sender<AgentEvent>,
     llm: LlmClient,
+    workspace_reader: WorkspaceFileReader,
 ) {
     let (update_tx, update_rx) = async_mpsc::unbounded_channel();
-    run_coordinator_with_updates(commands, events, llm, update_tx, update_rx).await;
+    run_coordinator_with_updates(
+        commands,
+        events,
+        llm,
+        workspace_reader,
+        update_tx,
+        update_rx,
+    )
+    .await;
 }
 
 async fn run_coordinator_with_updates(
     mut commands: async_mpsc::UnboundedReceiver<AgentCommand>,
     events: Sender<AgentEvent>,
     llm: LlmClient,
+    workspace_reader: WorkspaceFileReader,
     update_tx: async_mpsc::UnboundedSender<RequestUpdate>,
     mut update_rx: async_mpsc::UnboundedReceiver<RequestUpdate>,
 ) {
@@ -184,14 +246,19 @@ async fn run_coordinator_with_updates(
                 return;
             }
             let request_id = request.request_id;
-            let task = tokio::spawn(run_request(request, llm.clone(), update_tx.clone()));
+            let task = tokio::spawn(run_request(
+                request,
+                llm.clone(),
+                workspace_reader.clone(),
+                update_tx.clone(),
+            ));
             active = Some(ActiveRequest { request_id, task });
         }
 
         tokio::select! {
             command = commands.recv() => match command {
-                Some(AgentCommand::Submit { request_id, prompt }) => {
-                    pending.push_back(PendingRequest { request_id, prompt });
+                Some(AgentCommand::Submit { request_id, prompt, attachments }) => {
+                    pending.push_back(PendingRequest { request_id, prompt, attachments });
                 }
                 Some(AgentCommand::Cancel { request_id }) => {
                     if active.as_ref().map(|request| request.request_id) == Some(request_id) {
@@ -216,6 +283,10 @@ async fn run_coordinator_with_updates(
                 };
                 let request_id = match &update {
                     RequestUpdate::TextDelta { request_id, .. }
+                    | RequestUpdate::ReasoningDelta { request_id, .. }
+                    | RequestUpdate::ToolStarted { request_id, .. }
+                    | RequestUpdate::ToolFinished { request_id, .. }
+                    | RequestUpdate::ToolFailed { request_id, .. }
                     | RequestUpdate::Completed { request_id, .. }
                     | RequestUpdate::Failed { request_id, .. } => *request_id,
                 };
@@ -225,6 +296,23 @@ async fn run_coordinator_with_updates(
                 let event = match update {
                     RequestUpdate::TextDelta { request_id, text } => {
                         AgentEvent::TextDelta { request_id, text }
+                    }
+                    RequestUpdate::ReasoningDelta { request_id, summary } => {
+                        AgentEvent::ReasoningDelta { request_id, summary }
+                    }
+                    RequestUpdate::ToolStarted { request_id, call_id, name, summary } => {
+                        AgentEvent::ToolStarted { request_id, call_id, name, summary }
+                    }
+                    RequestUpdate::ToolFinished { request_id, call_id, artifacts } => {
+                        AgentEvent::ToolFinished {
+                            request_id,
+                            call_id,
+                            summary: None,
+                            artifacts,
+                        }
+                    }
+                    RequestUpdate::ToolFailed { request_id, call_id, message } => {
+                        AgentEvent::ToolFailed { request_id, call_id, message }
                     }
                     RequestUpdate::Completed { request_id, commit } => {
                         active = None;
@@ -252,10 +340,27 @@ async fn run_coordinator_with_updates(
 async fn run_request(
     request: PendingRequest,
     llm: LlmClient,
+    workspace_reader: WorkspaceFileReader,
     updates: async_mpsc::UnboundedSender<RequestUpdate>,
 ) {
     let request_id = request.request_id;
-    let mut stream = match llm.stream(request.prompt).await {
+    let files = match read_attachments(
+        request_id,
+        &request.attachments,
+        &workspace_reader,
+        &updates,
+    ) {
+        Ok(files) => files,
+        Err(message) => {
+            let _ = updates.send(RequestUpdate::Failed {
+                request_id,
+                message,
+            });
+            return;
+        }
+    };
+    let prompt = prompt_with_attachments(request.prompt, &files);
+    let mut stream = match llm.stream(prompt).await {
         Ok(stream) => stream,
         Err(error) => {
             let _ = updates.send(RequestUpdate::Failed {
@@ -271,6 +376,17 @@ async fn run_request(
             Ok(LlmEvent::TextDelta(text)) => {
                 if updates
                     .send(RequestUpdate::TextDelta { request_id, text })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(LlmEvent::ReasoningDelta(summary)) => {
+                if updates
+                    .send(RequestUpdate::ReasoningDelta {
+                        request_id,
+                        summary,
+                    })
                     .is_err()
                 {
                     return;
@@ -296,21 +412,145 @@ async fn run_request(
     });
 }
 
+fn read_attachments(
+    request_id: RequestId,
+    attachments: &[Attachment],
+    reader: &WorkspaceFileReader,
+    updates: &async_mpsc::UnboundedSender<RequestUpdate>,
+) -> Result<Vec<ReadFile>, String> {
+    attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| {
+            let call_id = attachment_call_id(request_id, index);
+            updates
+                .send(RequestUpdate::ToolStarted {
+                    request_id,
+                    call_id,
+                    name: "read_workspace_file".into(),
+                    summary: format!("Reading {}", attachment.path),
+                })
+                .map_err(|_| "the agent updates channel is unavailable".to_owned())?;
+            match reader.read(&attachment.path) {
+                Ok(file) => {
+                    updates
+                        .send(RequestUpdate::ToolFinished {
+                            request_id,
+                            call_id,
+                            artifacts: vec![ToolArtifact::CodeRange {
+                                path: file.path.clone(),
+                                start_line: 1,
+                                end_line: file.line_count,
+                                preview: Some(file.preview.clone()),
+                            }],
+                        })
+                        .map_err(|_| "the agent updates channel is unavailable".to_owned())?;
+                    Ok(file)
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = updates.send(RequestUpdate::ToolFailed {
+                        request_id,
+                        call_id,
+                        message: message.clone(),
+                    });
+                    Err(message)
+                }
+            }
+        })
+        .collect()
+}
+
+fn attachment_call_id(request_id: RequestId, index: usize) -> ToolCallId {
+    request_id.wrapping_shl(32).wrapping_add(index as u64)
+}
+
+fn prompt_with_attachments(prompt: String, files: &[ReadFile]) -> String {
+    if files.is_empty() {
+        return prompt;
+    }
+
+    let content = files
+        .iter()
+        .map(|file| {
+            format!(
+                "<attached-file path=\"{}\">\n{}\n</attached-file>",
+                file.path, file.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("{prompt}\n\nThe user explicitly attached these workspace files:\n\n{content}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCommand, AgentEvent, AgentTaskRunner, RequestUpdate, run_coordinator_with_updates,
+        AgentCommand, AgentEvent, AgentTaskRunner, RequestUpdate, prompt_with_attachments,
+        run_coordinator_with_updates,
     };
     use crate::llm::{
         ConversationMessage, LlmClient, LlmError, Provider, ProviderEvent, ProviderRequest,
         ProviderStream,
     };
+    use crate::tools::{ReadFile, WorkspaceFileReader};
+    use crate::transcript::ToolArtifact;
     use futures::{future::BoxFuture, stream};
     use std::{
         sync::{Arc, mpsc},
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn loaded_attachment_contents_are_provided_to_the_model() {
+        let prompt = prompt_with_attachments(
+            "Review this".into(),
+            &[ReadFile {
+                path: "src/app.rs".into(),
+                content: "fn main() {}".into(),
+                line_count: 1,
+                preview: "fn main() {}".into(),
+            }],
+        );
+
+        assert!(prompt.contains("src/app.rs"));
+        assert!(prompt.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn attached_workspace_files_emit_real_read_tool_events() {
+        let client = LlmClient::with_provider(Arc::new(EchoProvider));
+        let mut runner = AgentTaskRunner::spawn(client);
+        runner
+            .submit_with_attachments(
+                3,
+                "Review this".into(),
+                vec![crate::transcript::Attachment::workspace_file("Cargo.toml")],
+            )
+            .unwrap();
+
+        let mut events = Vec::new();
+        while !events.contains(&AgentEvent::Completed { request_id: 3 }) {
+            events.push(runner.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolStarted { request_id: 3, name, .. }
+                if name == "read_workspace_file"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolFinished { request_id: 3, artifacts, .. }
+                if matches!(
+                    artifacts.as_slice(),
+                    [ToolArtifact::CodeRange { path, .. }] if path == "Cargo.toml"
+                )
+        )));
+
+        runner.shutdown();
+    }
 
     struct EchoProvider;
 
@@ -477,6 +717,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
         let coordinator_update_tx = update_tx.clone();
+        let workspace_reader = WorkspaceFileReader::from_current_dir().unwrap();
         let coordinator = thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -486,6 +727,7 @@ mod tests {
                     command_rx,
                     event_tx,
                     client,
+                    workspace_reader,
                     coordinator_update_tx,
                     update_rx,
                 ));
@@ -495,6 +737,7 @@ mod tests {
             .send(AgentCommand::Submit {
                 request_id: 1,
                 prompt: "first".into(),
+                attachments: Vec::new(),
             })
             .unwrap();
         assert_eq!(
@@ -519,6 +762,7 @@ mod tests {
             .send(AgentCommand::Submit {
                 request_id: 2,
                 prompt: "second".into(),
+                attachments: Vec::new(),
             })
             .unwrap();
 

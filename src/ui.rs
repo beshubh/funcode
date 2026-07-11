@@ -1,6 +1,9 @@
+pub mod transcript;
+
 use crate::{
-    app::{App, AuthProvider, ResponseStatus, Screen, Suggestion, SuggestionKind},
+    app::{App, AuthProvider, Screen, Suggestion, SuggestionKind},
     theme::Theme,
+    transcript::EntryId,
 };
 use ratatui::{
     Frame,
@@ -17,28 +20,35 @@ const HOME_MIN_HEIGHT: u16 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiTarget {
-    Thinking,
-    Tools,
-    AuthProvider,
+    TranscriptEntry(EntryId),
+    AuthProvider(usize),
     Suggestion(usize),
+    MessageCopy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UiRegions {
-    pub thinking: Option<Rect>,
-    pub tools: Option<Rect>,
-    pub auth_provider: Option<Rect>,
+    pub transcript_entries: Vec<transcript::EntryRegion>,
+    pub auth_providers: Vec<Rect>,
     pub suggestions: Vec<Rect>,
+    pub message_copy: Option<Rect>,
 }
 
 impl UiRegions {
     pub fn target_at(&self, column: u16, row: u16) -> Option<UiTarget> {
         let position = Position::new(column, row);
         if self
-            .auth_provider
+            .message_copy
             .is_some_and(|area| area.contains(position))
         {
-            Some(UiTarget::AuthProvider)
+            Some(UiTarget::MessageCopy)
+        } else if let Some((index, _)) = self
+            .auth_providers
+            .iter()
+            .enumerate()
+            .find(|(_, area)| area.contains(position))
+        {
+            Some(UiTarget::AuthProvider(index))
         } else if let Some((index, _)) = self
             .suggestions
             .iter()
@@ -46,12 +56,11 @@ impl UiRegions {
             .find(|(_, area)| area.contains(position))
         {
             Some(UiTarget::Suggestion(index))
-        } else if self.thinking.is_some_and(|area| area.contains(position)) {
-            Some(UiTarget::Thinking)
-        } else if self.tools.is_some_and(|area| area.contains(position)) {
-            Some(UiTarget::Tools)
         } else {
-            None
+            self.transcript_entries
+                .iter()
+                .find(|region| region.area.contains(position))
+                .map(|region| UiTarget::TranscriptEntry(region.id))
         }
     }
 }
@@ -75,15 +84,17 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
     };
 
     if app.auth_dialog.is_some() && area.width >= HOME_MIN_WIDTH && area.height >= HOME_MIN_HEIGHT {
-        regions = UiRegions {
-            auth_provider: render_auth_dialog(frame, area, app, theme),
-            ..UiRegions::default()
-        };
+        regions.auth_providers = render_auth_dialog(frame, area, app, theme);
+    } else if app.message_dialog.is_some()
+        && area.width >= CHAT_MIN_WIDTH
+        && area.height >= CHAT_MIN_HEIGHT
+    {
+        regions.message_copy = render_message_dialog(frame, area, app, theme);
     }
     regions
 }
 
-fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Option<Rect> {
+fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Vec<Rect> {
     let width = area.width.saturating_sub(4).min(64);
     let height = 12.min(area.height.saturating_sub(2));
     let dialog_area = Rect::new(
@@ -103,30 +114,41 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
     ])
     .split(inner);
 
-    let dialog = app.auth_dialog.as_ref()?;
+    let Some(dialog) = app.auth_dialog.as_ref() else {
+        return Vec::new();
+    };
     match &dialog.phase {
         crate::app::AuthDialogPhase::Selecting => {
             frame.render_widget(
                 Paragraph::new("Choose how to authenticate").style(theme.heading),
                 rows[0],
             );
-            let option = Paragraph::new(Text::from(vec![
-                Line::styled(
-                    format!(" {} ", AuthProvider::ChatGptSubscription.label()),
-                    theme.status.add_modifier(Modifier::REVERSED),
-                ),
-                Line::styled(
-                    format!(" {}", AuthProvider::ChatGptSubscription.description()),
-                    theme.muted,
-                ),
-            ]))
-            .block(panel_block(" OpenAI ", theme));
-            frame.render_widget(option, rows[1]);
+            let provider_rows = Layout::vertical(
+                AuthProvider::ALL
+                    .iter()
+                    .map(|_| Constraint::Length(4))
+                    .collect::<Vec<_>>(),
+            )
+            .split(rows[1]);
+            for (index, provider) in AuthProvider::ALL.iter().enumerate() {
+                let selected = dialog.selected == index;
+                let label_style = if selected {
+                    theme.status.add_modifier(Modifier::REVERSED)
+                } else {
+                    theme.status
+                };
+                let option = Paragraph::new(Text::from(vec![
+                    Line::styled(format!(" {} ", provider.label()), label_style),
+                    Line::styled(format!(" {}", provider.description()), theme.muted),
+                ]))
+                .block(panel_block(" OpenAI ", theme));
+                frame.render_widget(option, provider_rows[index]);
+            }
             frame.render_widget(
                 Paragraph::new("↑/↓ select · Enter open · click · Esc close").style(theme.muted),
                 rows[2],
             );
-            Some(rows[1])
+            provider_rows.to_vec()
         }
         crate::app::AuthDialogPhase::Starting => {
             frame.render_widget(
@@ -137,7 +159,7 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
                 .wrap(Wrap { trim: false }),
                 inner,
             );
-            None
+            Vec::new()
         }
         crate::app::AuthDialogPhase::WaitingForBrowser {
             authorization_url,
@@ -158,7 +180,7 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
                 .wrap(Wrap { trim: false }),
                 inner,
             );
-            None
+            Vec::new()
         }
         crate::app::AuthDialogPhase::Succeeded { account_id } => {
             let detail = account_id.as_deref().map_or_else(
@@ -174,7 +196,7 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
                 ])),
                 inner,
             );
-            None
+            Vec::new()
         }
         crate::app::AuthDialogPhase::Failed { message } => {
             frame.render_widget(
@@ -187,9 +209,59 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
                 .wrap(Wrap { trim: false }),
                 inner,
             );
-            None
+            Vec::new()
         }
     }
+}
+
+fn render_message_dialog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+) -> Option<Rect> {
+    let entry_id = app.message_dialog?;
+    let message = app.transcript.user_message(entry_id)?;
+    let width = area.width.saturating_sub(8).min(72);
+    let height = area.height.saturating_sub(6).min(18);
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, dialog_area);
+    let block = panel_block(" Message ", theme);
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).split(inner);
+    let mut lines = message
+        .text
+        .split('\n')
+        .map(|line| Line::from(line.to_owned()))
+        .collect::<Vec<_>>();
+    if !message.attachments.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled("Attached files", theme.muted));
+        lines.extend(message.attachments.iter().map(|attachment| {
+            Line::styled(
+                format!(" [file] {} ", attachment.path),
+                theme.attachment_badge,
+            )
+        }));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    let action_line = Line::from(vec![
+        Span::styled(" Copy ", theme.status.add_modifier(Modifier::REVERSED)),
+        Span::styled("  Revert (coming soon)  ·  Esc close", theme.muted),
+    ]);
+    let copy_width = 6.min(rows[1].width);
+    frame.render_widget(Paragraph::new(action_line), rows[1]);
+    Some(Rect::new(rows[1].x, rows[1].y, copy_width, 1))
 }
 
 fn render_home(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -277,22 +349,6 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     let help = Text::from(vec![
         Line::styled("Common commands", theme.heading),
         Line::from(vec![
-            Span::styled("/sessions", theme.status),
-            Span::raw("  list sessions"),
-        ]),
-        Line::from(vec![
-            Span::styled("/models", theme.status),
-            Span::raw("    choose a model"),
-        ]),
-        Line::from(vec![
-            Span::styled("/new", theme.status),
-            Span::raw("       start a new session"),
-        ]),
-        Line::from(vec![
-            Span::styled("/help", theme.status),
-            Span::raw("      show command help"),
-        ]),
-        Line::from(vec![
             Span::styled("/auth", theme.status),
             Span::raw("      authenticate with a provider"),
         ]),
@@ -312,21 +368,22 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
 
 fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> UiRegions {
     let inner = area.inner(Margin::new(1, 1));
-    let contextual_height = contextual_widgets_height(app);
     let suggestions = app.suggestions();
+    let composer_height = composer_height(app, inner.width, theme);
 
     let rows = Layout::vertical([
         Constraint::Min(5),
-        Constraint::Length(contextual_height),
         Constraint::Length(1),
-        Constraint::Length(5),
+        Constraint::Length(composer_height),
     ])
     .split(inner);
 
-    render_messages(frame, rows[0], app, theme);
-    let mut regions = render_contextual_widgets(frame, rows[1], app, theme);
-    render_activity(frame, rows[2], app, theme);
-    let composer_area = rows[3];
+    let mut regions = UiRegions {
+        transcript_entries: transcript::render(frame, rows[0], app, theme),
+        ..UiRegions::default()
+    };
+    render_activity(frame, rows[1], app, theme);
+    let composer_area = rows[2];
     let suggestion_height =
         (suggestions.len() as u16 + 2).min(composer_area.y.saturating_sub(inner.y));
     let suggestion_area = Rect::new(
@@ -378,185 +435,22 @@ fn render_suggestions(
     regions
 }
 
-fn render_messages(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let content_area = area.inner(Margin::new(2, 0));
-    let mut text = conversation_text(app, theme);
-    if !app.follow_output {
-        text.lines
-            .insert(0, Line::styled("↑ End to follow", theme.muted));
-    }
-    let line_count = wrapped_line_count(&text, content_area.width.max(1));
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
-    let viewport_height = content_area.height as usize;
-    let maximum_top = line_count.saturating_sub(viewport_height);
-    let from_bottom = app.scroll_from_bottom.min(maximum_top);
-    let top = maximum_top
-        .saturating_sub(from_bottom)
-        .min(u16::MAX as usize) as u16;
-
-    frame.render_widget(paragraph.scroll((top, 0)), content_area);
-}
-
-fn conversation_text(app: &App, theme: &Theme) -> Text<'static> {
-    if app.turns.is_empty() {
-        return Text::from(Line::styled(
-            "No messages yet. Type something below to begin.",
-            theme.muted,
-        ));
-    }
-
-    let mut lines = Vec::new();
-    for turn in &app.turns {
-        lines.push(Line::styled("you", theme.user));
-        lines.extend(
-            turn.prompt
-                .split('\n')
-                .map(|line| Line::from(line.to_owned())),
-        );
-        lines.push(Line::styled("funcode", theme.agent));
-
-        match &turn.response_status {
-            ResponseStatus::Queued => lines.push(Line::styled("queued…", theme.muted)),
-            ResponseStatus::Thinking => lines.push(Line::styled("thinking…", theme.status)),
-            ResponseStatus::Streaming | ResponseStatus::Completed => {
-                lines.extend(response_lines(&turn.response));
-            }
-            ResponseStatus::Interrupted => {
-                lines.extend(response_lines(&turn.response));
-                lines.push(Line::styled("[interrupted]", theme.warning));
-            }
-            ResponseStatus::Failed(message) => {
-                lines.push(Line::styled(format!("[failed: {message}]"), theme.warning));
-            }
-        }
-        lines.push(Line::from(""));
-    }
-    Text::from(lines)
-}
-
-fn response_lines(response: &str) -> Vec<Line<'static>> {
-    if response.is_empty() {
-        vec![Line::from("")]
-    } else {
-        response
-            .split('\n')
-            .map(|line| Line::from(line.to_owned()))
-            .collect()
-    }
-}
-
-fn contextual_widgets_height(app: &App) -> u16 {
-    let thinking = app
-        .is_thinking()
-        .then_some(if app.thinking_expanded { 5 } else { 3 });
-    let tools = app
-        .active_tool
-        .as_ref()
-        .map(|_| if app.tools_expanded { 5 } else { 3 });
-
-    match (thinking, tools) {
-        (Some(thinking), Some(tools)) => thinking + tools + 1,
-        (Some(thinking), None) => thinking,
-        (None, Some(tools)) => tools,
-        (None, None) => 0,
-    }
-}
-
-fn render_contextual_widgets(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    theme: &Theme,
-) -> UiRegions {
-    let mut regions = UiRegions::default();
-    if area.is_empty() {
-        return regions;
-    }
-
-    let width = area.width.min(40);
-    let mut row = area.y;
-
-    if app.is_thinking() {
-        let height = if app.thinking_expanded { 5 } else { 3 };
-        let thinking_area = Rect::new(area.x, row, width, height);
-        render_thinking(frame, thinking_area, app, theme);
-        regions.thinking = Some(thinking_area);
-        row = row.saturating_add(height + 1);
-    }
-
-    if let Some(tool) = &app.active_tool {
-        let height = if app.tools_expanded { 5 } else { 3 };
-        let tools_area = Rect::new(area.x, row, width, height);
-        render_tools(frame, tools_area, app, tool, theme);
-        regions.tools = Some(tools_area);
-    }
-
-    regions
-}
-
-fn render_thinking(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let frames = ["|", "/", "-", "\\"];
-    let spinner = frames[(app.animation_frame / 2) % frames.len()];
-    let title = if app.thinking_expanded {
-        "Thinking · click to collapse"
-    } else {
-        "Thinking · click to expand"
-    };
-    let content = if app.thinking_expanded {
-        Text::from(vec![
-            Line::styled(
-                format!("Working through the request {spinner}"),
-                theme.status,
-            ),
-            Line::styled("Preparing a response summary…", theme.muted),
-        ])
-    } else {
-        Text::from(Line::styled(format!("working {spinner}"), theme.status))
-    };
-
-    frame.render_widget(
-        Paragraph::new(content).block(panel_block(title, theme)),
-        area,
-    );
-}
-
-fn render_tools(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &App,
-    tool: &crate::app::ToolActivity,
-    theme: &Theme,
-) {
-    let title = if app.tools_expanded {
-        "Tools · click to collapse"
-    } else {
-        "Tools · click to expand"
-    };
-    let content = if app.tools_expanded {
-        Text::from(vec![
-            Line::styled(tool.name.clone(), theme.status),
-            Line::styled(tool.summary.clone(), theme.muted),
-        ])
-    } else {
-        Text::from(Line::styled(tool.name.clone(), theme.status))
-    };
-
-    frame.render_widget(
-        Paragraph::new(content).block(panel_block(title, theme)),
-        area,
-    );
-}
-
 fn render_activity(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     let text = if app.active_request.is_some() {
         let dots = ".".repeat((app.animation_frame / 5) % 4);
         format!(" Waiting{dots}")
-    } else if app
-        .turns
-        .iter()
-        .any(|turn| turn.response_status == ResponseStatus::Queued)
-    {
+    } else if app.transcript.entries().iter().any(|entry| {
+        matches!(
+            entry.kind,
+            crate::transcript::EntryKind::Assistant(crate::transcript::AssistantMessage {
+                status: crate::transcript::AssistantStatus::Queued,
+                ..
+            })
+        )
+    }) {
         " Queued…".to_owned()
+    } else if let Some(notice) = &app.notice {
+        format!(" {notice}")
     } else {
         String::new()
     };
@@ -566,33 +460,74 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     let block = panel_block("Enter send · Shift+Enter new line", theme);
     let inner = block.inner(area);
+    let attachment_height = attachment_badge_height(app, inner.width, theme);
+    let rows =
+        Layout::vertical([Constraint::Length(attachment_height), Constraint::Min(1)]).split(inner);
+    let input_area = rows[1];
     let (cursor_column, cursor_row) = composer_cursor(
         app.composer.text(),
         app.composer.cursor(),
-        inner.width.max(1),
+        input_area.width.max(1),
     );
-    let vertical_scroll = cursor_row.saturating_sub(inner.height.saturating_sub(1));
+    let vertical_scroll = cursor_row.saturating_sub(input_area.height.saturating_sub(1));
     let content = if app.composer.text().is_empty() {
         Text::from(Line::styled("Type something…", theme.muted))
     } else {
         Text::styled(app.composer.text().to_owned(), theme.input)
     };
 
+    frame.render_widget(block, area);
+    if attachment_height > 0 {
+        frame.render_widget(
+            Paragraph::new(attachment_badges(app, theme)).wrap(Wrap { trim: false }),
+            rows[0],
+        );
+    }
     frame.render_widget(
         Paragraph::new(content)
-            .block(block)
             .wrap(Wrap { trim: false })
             .scroll((vertical_scroll, 0)),
-        area,
+        input_area,
     );
-    if app.auth_dialog.is_none() {
+    if app.auth_dialog.is_none() && app.message_dialog.is_none() {
         frame.set_cursor_position((
-            inner.x.saturating_add(cursor_column),
-            inner
+            input_area.x.saturating_add(cursor_column),
+            input_area
                 .y
                 .saturating_add(cursor_row.saturating_sub(vertical_scroll)),
         ));
     }
+}
+
+fn composer_height(app: &App, width: u16, theme: &Theme) -> u16 {
+    let inner_width = width.saturating_sub(2).max(1);
+    5u16.saturating_add(attachment_badge_height(app, inner_width, theme))
+}
+
+fn attachment_badge_height(app: &App, width: u16, theme: &Theme) -> u16 {
+    if app.composer.attachments().is_empty() {
+        return 0;
+    }
+    let width = width.max(1) as usize;
+    attachment_badges(app, theme)
+        .width()
+        .div_ceil(width)
+        .max(1)
+        .min(u16::MAX as usize) as u16
+}
+
+fn attachment_badges(app: &App, theme: &Theme) -> Line<'static> {
+    let mut spans = Vec::new();
+    for attachment in app.composer.attachments() {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            format!(" [file] {} ", attachment.path),
+            theme.attachment_badge,
+        ));
+    }
+    Line::from(spans)
 }
 
 fn composer_cursor(text: &str, cursor: usize, width: u16) -> (u16, u16) {
@@ -612,14 +547,6 @@ fn composer_cursor(text: &str, cursor: usize, width: u16) -> (u16, u16) {
         (final_width % width) as u16,
         row.min(u16::MAX as usize) as u16,
     )
-}
-
-fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {
-    let width = width.max(1) as usize;
-    text.lines
-        .iter()
-        .map(|line| line.width().div_ceil(width).max(1))
-        .sum()
 }
 
 fn panel_block<'a>(title: impl Into<Line<'a>>, theme: &Theme) -> Block<'a> {
@@ -659,10 +586,16 @@ mod tests {
     use super::{UiRegions, UiTarget, render};
     use crate::{
         agent::AgentEvent,
-        app::{App, Screen, Turn},
+        app::{App, Screen},
         theme::Theme,
+        transcript::ToolArtifact,
     };
-    use ratatui::{Terminal, backend::TestBackend, layout::Position, style::Color};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        layout::Position,
+        style::{Color, Modifier},
+    };
 
     fn render_to_string(app: &App, width: u16, height: u16) -> (String, bool, UiRegions, String) {
         let backend = TestBackend::new(width, height);
@@ -690,15 +623,17 @@ mod tests {
         let (screen, cursor_visible, _, top_left) = render_to_string(&App::new(), 100, 30);
 
         assert!(screen.contains("██████████"));
-        assert!(screen.contains("/sessions"));
-        assert!(screen.contains("/help"));
+        assert!(screen.contains("/auth"));
+        assert!(screen.contains("/exit"));
+        assert!(!screen.contains("/sessions"));
+        assert!(!screen.contains("/help"));
         assert!(!screen.contains("Model: not connected"));
         assert_eq!(top_left, " ");
         assert!(!cursor_visible);
     }
 
     #[test]
-    fn idle_chat_hides_thinking_and_tools_and_has_no_app_border() {
+    fn idle_chat_has_no_transcript_entry_regions_and_no_app_border() {
         let mut app = App::new();
         app.screen = Screen::Chat;
 
@@ -706,11 +641,8 @@ mod tests {
 
         assert!(!screen.contains("Agent messages"));
         assert!(screen.contains("No messages yet"));
-        assert!(!screen.contains("Thinking"));
-        assert!(!screen.contains("Tools"));
         assert!(screen.contains("Type something"));
-        assert!(regions.thinking.is_none());
-        assert!(regions.tools.is_none());
+        assert!(regions.transcript_entries.is_empty());
         assert_eq!(top_left, " ");
         assert!(cursor_visible);
     }
@@ -732,6 +664,45 @@ mod tests {
             regions.target_at(second.x, second.y),
             Some(UiTarget::Suggestion(1))
         );
+    }
+
+    #[test]
+    fn attached_files_render_as_badges_in_the_composer_before_send() {
+        let mut app = App::with_files(["src/app.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("Review @src/app.rs");
+        app.activate_suggestion(0);
+
+        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("[file] src/app.rs"));
+    }
+
+    #[test]
+    fn attachment_badges_use_the_theme_accent_color() {
+        let mut app = App::with_files(["src/app.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("@src/app.rs");
+        app.activate_suggestion(0);
+        let theme = Theme::default();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &app, &theme);
+            })
+            .unwrap();
+
+        let badge_cell = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "[")
+            .unwrap();
+        assert_eq!(badge_cell.style().fg, theme.logo_accent.fg);
+        assert!(badge_cell.style().add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -766,15 +737,14 @@ mod tests {
     fn suggestion_popup_keeps_the_composer_visible_in_a_busy_small_terminal() {
         let mut app = App::with_files(["src/app.rs"]);
         app.screen = Screen::Chat;
-        app.turns.push(Turn::queued(5, "prompt".into()));
+        app.transcript.submit(5, "prompt".into(), Vec::new());
         app.handle_agent_event(AgentEvent::Started { request_id: 5 });
         app.handle_agent_event(AgentEvent::ToolStarted {
             request_id: 5,
+            call_id: 1,
             name: "read_file".into(),
             summary: "Reading".into(),
         });
-        app.toggle_thinking();
-        app.toggle_tools();
         app.composer.insert_text("@src/");
 
         let (screen, cursor_visible, regions, _) = render_to_string(&app, 60, 20);
@@ -789,7 +759,7 @@ mod tests {
     fn auth_dialog_lists_chatgpt_subscription_as_a_clickable_provider() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.turns.push(Turn::queued(1, "hello".into()));
+        app.transcript.submit(1, "hello".into(), Vec::new());
         app.handle_agent_event(AgentEvent::Started { request_id: 1 });
         app.open_auth_dialog();
 
@@ -798,9 +768,13 @@ mod tests {
         assert!(screen.contains("Authenticate"));
         assert!(screen.contains("ChatGPT subscription"));
         assert!(screen.contains("browser"));
-        assert!(regions.auth_provider.is_some());
-        assert!(regions.thinking.is_none());
-        assert!(regions.tools.is_none());
+        assert_eq!(regions.auth_providers.len(), 1);
+        let provider = regions.auth_providers[0];
+        assert_eq!(
+            regions.target_at(provider.x, provider.y),
+            Some(UiTarget::AuthProvider(0))
+        );
+        assert!(!regions.transcript_entries.is_empty());
         assert!(!cursor_visible);
     }
 
@@ -808,7 +782,7 @@ mod tests {
     fn transcript_content_has_balanced_horizontal_padding() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.turns.push(Turn::queued(1, "x".repeat(54)));
+        app.transcript.submit(1, "x".repeat(54), Vec::new());
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -820,66 +794,187 @@ mod tests {
 
         assert_eq!(buffer.cell(Position::new(1, 1)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell(Position::new(2, 1)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell(Position::new(3, 1)).unwrap().symbol(), "y");
-        assert_eq!(buffer.cell(Position::new(56, 2)).unwrap().symbol(), "x");
+        assert_eq!(buffer.cell(Position::new(3, 1)).unwrap().symbol(), "┌");
+        assert_eq!(buffer.cell(Position::new(56, 2)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell(Position::new(57, 2)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell(Position::new(58, 2)).unwrap().symbol(), " ");
     }
 
     #[test]
-    fn thinking_is_a_clickable_collapsed_widget_only_while_thinking() {
+    fn reasoning_is_a_clickable_collapsed_transcript_block() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.turns.push(Turn::queued(1, "hello".into()));
+        app.transcript.submit(1, "hello".into(), Vec::new());
         app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::ReasoningDelta {
+            request_id: 1,
+            summary: "Checking the request.".into(),
+        });
 
         let (screen, _, regions, _) = render_to_string(&app, 100, 30);
 
-        assert!(screen.contains("Thinking"));
-        assert!(!screen.contains("Working through the request"));
-        assert!(!screen.contains("Tools"));
+        assert!(screen.contains("thinking"));
+        assert!(!screen.contains("Checking the request."));
         assert!(screen.contains("Waiting"));
-        let thinking = regions.thinking.unwrap();
+        let reasoning_id = app
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry.kind, crate::transcript::EntryKind::Reasoning(_)))
+            .unwrap()
+            .id;
+        let thinking = regions
+            .transcript_entries
+            .iter()
+            .find(|region| region.id == reasoning_id)
+            .copied()
+            .unwrap();
         assert_eq!(
-            regions.target_at(thinking.x, thinking.y),
-            Some(UiTarget::Thinking)
+            regions.target_at(thinking.area.x, thinking.area.y),
+            Some(UiTarget::TranscriptEntry(thinking.id))
         );
 
-        app.toggle_thinking();
+        app.activate_transcript_entry(thinking.id);
         let (expanded, _, _, _) = render_to_string(&app, 100, 30);
-        assert!(expanded.contains("Working through the request"));
+        assert!(expanded.contains("Checking the request."));
 
         app.handle_agent_event(AgentEvent::TextDelta {
             request_id: 1,
             text: "reply".into(),
         });
         let (streaming, _, regions, _) = render_to_string(&app, 100, 30);
-        assert!(!streaming.contains("Thinking"));
-        assert!(regions.thinking.is_none());
+        assert!(streaming.contains("thinking"));
+        assert!(!regions.transcript_entries.is_empty());
     }
 
     #[test]
-    fn tools_widget_only_appears_for_an_active_tool_and_expands_on_click() {
+    fn completed_reasoning_without_a_summary_does_not_keep_working() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.turns.push(Turn::queued(3, "inspect".into()));
+        app.transcript.submit(1, "hello".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 1 });
+        let reasoning_id = app
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry.kind, crate::transcript::EntryKind::Reasoning(_)))
+            .unwrap()
+            .id;
+        app.activate_transcript_entry(reasoning_id);
+
+        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("No reasoning summary was provided"));
+        assert!(!screen.contains("Working"));
+    }
+
+    #[test]
+    fn tools_are_persistent_clickable_transcript_blocks() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(3, "inspect".into(), Vec::new());
         app.handle_agent_event(AgentEvent::Started { request_id: 3 });
         app.handle_agent_event(AgentEvent::ToolStarted {
             request_id: 3,
+            call_id: 3,
             name: "read_file".into(),
             summary: "Reading src/main.rs".into(),
         });
 
         let (collapsed, _, regions, _) = render_to_string(&app, 100, 30);
-        assert!(collapsed.contains("Tools"));
+        assert!(collapsed.contains("tool"));
         assert!(collapsed.contains("read_file"));
-        assert!(!collapsed.contains("Reading src/main.rs"));
-        let tools = regions.tools.unwrap();
-        assert_eq!(regions.target_at(tools.x, tools.y), Some(UiTarget::Tools));
+        let tools = *regions.transcript_entries.last().unwrap();
+        assert_eq!(
+            regions.target_at(tools.area.x, tools.area.y),
+            Some(UiTarget::TranscriptEntry(tools.id))
+        );
 
-        app.toggle_tools();
+        app.activate_transcript_entry(tools.id);
         let (expanded, _, _, _) = render_to_string(&app, 100, 30);
         assert!(expanded.contains("Reading src/main.rs"));
+    }
+
+    #[test]
+    fn expanded_tool_output_can_scroll_through_content_larger_than_the_terminal() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(3, "inspect".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 3 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 3,
+            call_id: 3,
+            name: "read_file".into(),
+            summary: "Reading src/main.rs".into(),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            request_id: 3,
+            call_id: 3,
+            summary: None,
+            artifacts: vec![ToolArtifact::TextDetail(
+                (0..40)
+                    .map(|line| format!("tool-line-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )],
+        });
+        let tool_id = app.transcript.entries()[3].id;
+        app.activate_transcript_entry(tool_id);
+        let (bottom, _, _, _) = render_to_string(&app, 60, 20);
+
+        for _ in 0..5 {
+            app.scroll_transcript_up();
+        }
+        let (scrolled, _, _, _) = render_to_string(&app, 60, 20);
+
+        assert!(bottom.contains("tool-line-39"));
+        assert_ne!(bottom, scrolled);
+        assert!(scrolled.contains("↑ End to follow"));
+    }
+
+    #[test]
+    fn user_message_modal_exposes_copy_and_a_deferred_revert_control() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(
+            1,
+            "Review this".into(),
+            vec![crate::transcript::Attachment::workspace_file("src/app.rs")],
+        );
+        app.open_message_dialog(app.transcript.entries()[0].id);
+
+        let (screen, cursor_visible, regions, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("Message"));
+        assert!(screen.contains("Copy"));
+        assert!(screen.contains("Revert (coming soon)"));
+        assert!(screen.contains("[file] src/app.rs"));
+        assert!(regions.message_copy.is_some());
+        assert!(!cursor_visible);
+    }
+
+    #[test]
+    fn submitted_user_messages_render_attached_file_badges_in_the_transcript() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(
+            1,
+            "Please inspect this".into(),
+            vec![crate::transcript::Attachment::workspace_file("src/app.rs")],
+        );
+
+        let (screen, _, regions, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("┌─ you"));
+        assert!(screen.contains("[file] src/app.rs"));
+        assert_eq!(
+            regions.target_at(
+                regions.transcript_entries[0].area.x,
+                regions.transcript_entries[0].area.y,
+            ),
+            Some(UiTarget::TranscriptEntry(regions.transcript_entries[0].id))
+        );
     }
 
     #[test]
