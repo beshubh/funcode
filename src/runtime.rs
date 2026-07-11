@@ -6,7 +6,7 @@ use crate::{
     llm::{LlmClient, LlmConfig},
     model_catalog::ModelCatalogTaskRunner,
     terminal_selection::TerminalSelection,
-    theme::Theme,
+    theme::{Theme, ThemeConfigEvent, ThemeConfigLoad, ThemeConfigStore, ThemeConfigTaskRunner},
     ui, workspace,
 };
 use anyhow::{Context, Result};
@@ -84,7 +84,23 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         LaunchMode::Interactive => App::new(),
         LaunchMode::AuthOnly => App::for_auth(),
     };
-    let theme = Theme::default();
+    let (theme_load, mut theme_runner) = match ThemeConfigStore::standard() {
+        Ok(store) => (
+            store.load_or_default(),
+            Some(ThemeConfigTaskRunner::spawn(store)),
+        ),
+        Err(_) => (
+            ThemeConfigLoad {
+                config: Default::default(),
+                warning: Some("Could not locate theme configuration; using terminal".into()),
+            },
+            None,
+        ),
+    };
+    app.set_active_theme(theme_load.config.theme);
+    if let Some(warning) = theme_load.warning {
+        app.set_notice(warning);
+    }
     let (mut runner, mut model_runner) = match launch_mode {
         LaunchMode::Interactive => {
             let config = LlmConfig::from_env().context("failed to load LLM configuration")?;
@@ -133,9 +149,22 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         while let Some(clipboard_event) = clipboard.try_event() {
             handle_clipboard_event(&mut app, clipboard_event);
         }
+        if let Some(theme_runner) = theme_runner.as_ref() {
+            while let Some(event) = theme_runner.try_event() {
+                match event {
+                    ThemeConfigEvent::Saved(theme_id) => {
+                        app.set_notice(format!("Theme changed to {}", theme_id.display_name()));
+                    }
+                    ThemeConfigEvent::Failed(error) => {
+                        app.set_notice(format!("Could not save theme: {error}"));
+                    }
+                }
+            }
+        }
 
         terminal
             .draw(|frame| {
+                let theme = Theme::resolve(app.effective_theme_id());
                 regions = ui::render(frame, &app, &theme);
                 selection.highlight(frame.buffer_mut());
                 rendered_buffer = frame.buffer_mut().clone();
@@ -154,6 +183,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                             model_runner.as_ref(),
                             &auth_runner,
                             &clipboard,
+                            theme_runner.as_ref(),
                         );
                     }
                 }
@@ -174,6 +204,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                                     model_runner.as_ref(),
                                     &auth_runner,
                                     &clipboard,
+                                    theme_runner.as_ref(),
                                 );
                             }
                         }
@@ -198,6 +229,9 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     }
     auth_runner.shutdown();
     clipboard.shutdown();
+    if let Some(theme_runner) = theme_runner.as_mut() {
+        theme_runner.shutdown();
+    }
     Ok(())
 }
 
@@ -253,6 +287,14 @@ fn handle_mouse_event(
                 app.select_auth_provider()
             }
             Some(ui::UiTarget::Suggestion(index)) => app.activate_suggestion(index),
+            Some(ui::UiTarget::Mode(mode)) => {
+                app.select_mode(mode);
+                None
+            }
+            Some(ui::UiTarget::Theme(index)) => {
+                app.set_theme_selection(index);
+                app.commit_theme_selection()
+            }
             Some(ui::UiTarget::Model(index)) => app.activate_model(index),
             Some(ui::UiTarget::ModelRefresh) => app.refresh_models(),
             None => None,
@@ -261,6 +303,7 @@ fn handle_mouse_event(
             match regions.target_at(mouse.column, mouse.row) {
                 Some(ui::UiTarget::Suggestion(index)) => app.set_suggestion_selection(index),
                 Some(ui::UiTarget::AuthProvider(index)) => app.set_auth_selection(index),
+                Some(ui::UiTarget::Theme(index)) => app.set_theme_selection(index),
                 Some(ui::UiTarget::Model(index)) => app.set_model_selection(index),
                 _ => {}
             }
@@ -269,6 +312,8 @@ fn handle_mouse_event(
         MouseEventKind::ScrollUp => {
             if app.auth_dialog.is_some() {
                 app.move_auth_selection(-1);
+            } else if app.theme_dialog.is_some() {
+                app.move_theme_selection(-1);
             } else if app.models_dialog.is_some() {
                 app.scroll_models_up();
             } else if !app.suggestions().is_empty() {
@@ -281,6 +326,8 @@ fn handle_mouse_event(
         MouseEventKind::ScrollDown => {
             if app.auth_dialog.is_some() {
                 app.move_auth_selection(1);
+            } else if app.theme_dialog.is_some() {
+                app.move_theme_selection(1);
             } else if app.models_dialog.is_some() {
                 app.scroll_models_down();
             } else if !app.suggestions().is_empty() {
@@ -301,6 +348,7 @@ fn dispatch(
     model_runner: Option<&ModelCatalogTaskRunner>,
     auth_runner: &AuthTaskRunner,
     clipboard: &ClipboardTaskRunner,
+    theme_runner: Option<&ThemeConfigTaskRunner>,
 ) -> bool {
     match action {
         AppAction::Submit {
@@ -385,6 +433,17 @@ fn dispatch(
                         "model discovery is unavailable in authentication-only mode".into(),
                     ))
                 }
+            }
+            false
+        }
+        AppAction::SaveTheme { theme_id } => {
+            match theme_runner {
+                Some(runner) => {
+                    if let Err(error) = runner.save(theme_id) {
+                        app.set_notice(format!("Could not save theme: {error}"));
+                    }
+                }
+                None => app.set_notice("Could not locate theme configuration"),
             }
             false
         }
@@ -520,9 +579,11 @@ mod tests {
         app::{App, AppAction, Screen},
         auth::AuthTaskRunner,
         clipboard::{Clipboard, ClipboardTaskRunner},
+        composer::SessionMode,
         llm::{ModelInfo, ProviderModels},
         model_catalog::ModelCatalogEvent,
         terminal_selection::TerminalSelection,
+        theme::ThemeId,
         ui::{ModelRegion, UiRegions},
     };
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -602,6 +663,41 @@ mod tests {
 
         handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
         assert_eq!(app.selected_suggestion(), 1);
+    }
+
+    #[test]
+    fn mouse_switches_modes_and_previews_then_commits_themes() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        let mode_regions = UiRegions {
+            mode_tabs: vec![Rect::new(2, 2, 8, 1), Rect::new(11, 2, 9, 1)],
+            ..UiRegions::default()
+        };
+
+        handle_mouse_event(
+            &mut app,
+            &mode_regions,
+            mouse(MouseEventKind::Up(MouseButton::Left), 2, 2),
+        );
+        assert_eq!(app.effective_mode(), SessionMode::Plan);
+
+        app.open_theme_dialog();
+        let theme_regions = UiRegions {
+            theme_options: (0..4).map(|index| Rect::new(4, 5 + index, 20, 1)).collect(),
+            ..UiRegions::default()
+        };
+        handle_mouse_event(&mut app, &theme_regions, mouse(MouseEventKind::Moved, 4, 7));
+        assert_eq!(app.effective_theme_id(), ThemeId::Midnight);
+        assert_eq!(
+            handle_mouse_event(
+                &mut app,
+                &theme_regions,
+                mouse(MouseEventKind::Up(MouseButton::Left), 4, 7),
+            ),
+            Some(AppAction::SaveTheme {
+                theme_id: ThemeId::Midnight,
+            })
+        );
     }
 
     #[test]
@@ -764,6 +860,7 @@ mod tests {
             None,
             &auth_runner,
             &clipboard,
+            None,
         ));
         handle_clipboard_event(
             &mut app,

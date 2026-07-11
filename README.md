@@ -37,7 +37,8 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 
 - Enter: submit the composer
 - Up/Down: choose an open command or file suggestion
-- Tab or Enter: activate the selected suggestion
+- Tab: activate the selected suggestion when one is open; otherwise switch Plan/Build mode
+- Enter: submit the composer or activate the selected suggestion
 - Shift+Enter: insert a newline on terminals with enhanced keyboard reporting
 - Ctrl+J: portable newline fallback
 - PageUp/PageDown: scroll the transcript
@@ -50,10 +51,12 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - Drag across terminal text to select and automatically copy it to the clipboard
 - Click a sent message: open a modal and copy its text and attached paths
 - Click a Thinking or tool block: expand its persistent activity summary
+- Click the Plan or Build composer tab: switch the pending mode; submission makes it persistent
 - `/auth`: open the authentication picker
 - `/plan`: enable persistent plan mode for this and later prompts
 - `/build`: return to normal build mode
 - `/models`: choose a model from every configured provider; use arrows or hover, then Enter/click
+- `/theme`: preview and select a bundled color theme
 - `/exit`: quit
 
 Prompts submitted while the runner is busy are shown immediately and processed in FIFO order. Only
@@ -69,6 +72,19 @@ Model discovery runs outside the terminal event loop. Providers use their live m
 when one is available; provider adapters can return a built-in catalog when no discovery endpoint
 exists. The current ChatGPT subscription provider reads its live Codex model catalog after sign-in.
 The active model is shown in the composer border and applies to subsequent model requests.
+
+## Themes
+
+FunCode starts with the `terminal` theme, which leaves foreground and background colors to the
+terminal emulator and uses its ANSI cyan accent. `/theme` opens the bundled Terminal, Fun Dark,
+Midnight, and Paper themes. Arrow keys or mouse movement preview a theme, Enter or click saves it,
+and Escape restores the previous selection. The selected theme ID is stored atomically in
+`~/.funcode/config.json`.
+
+Theme colors are resolved through semantic roles rather than widget-specific color values. Accent
+drives activity, commands, selections, attachments, and the Fun logo; Plan and Build keep distinct
+orange and GitHub-style green mode colors across themes.
+
 Provider catalogs are cached in `~/.funcode/models.json` for 24 hours. In the model picker, press
 `r` or click **Refresh** to bypass the cache, query authenticated providers, and replace the saved
 catalog.

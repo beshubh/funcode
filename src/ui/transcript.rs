@@ -1,6 +1,6 @@
 use crate::{
     app::App,
-    theme::Theme,
+    theme::{Theme, ThemeRole},
     transcript::{ActivityStatus, AssistantStatus, Entry, EntryId, EntryKind, ToolArtifact},
 };
 use ratatui::{
@@ -27,7 +27,7 @@ pub(super) fn render(
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "No messages yet. Type something below to begin.",
-                theme.muted,
+                theme.style(ThemeRole::MutedText),
             )),
             content_area,
         );
@@ -58,7 +58,10 @@ pub(super) fn render(
         content_area
     } else {
         frame.render_widget(
-            Paragraph::new(Line::styled("↑ End to follow", theme.muted)),
+            Paragraph::new(Line::styled(
+                "↑ End to follow",
+                theme.style(ThemeRole::MutedText),
+            )),
             Rect::new(content_area.x, content_area.y, content_area.width, 1),
         );
         Rect::new(
@@ -111,56 +114,87 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
     match &entry.kind {
         EntryKind::User(message) => {
             let mut lines = vec![Line::from(vec![
-                Span::styled("┌─ you", theme.user),
-                Span::styled(" · click to open", theme.muted),
+                Span::styled(
+                    "┌─ you",
+                    theme
+                        .style(ThemeRole::User)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+                Span::styled(" · click to open", theme.style(ThemeRole::MutedText)),
             ])];
             lines.extend(
                 message
                     .content
-                    .lines(theme.input, theme.attachment_badge, theme.status)
+                    .lines(
+                        theme.style(ThemeRole::Text),
+                        theme.accent_badge(),
+                        theme.style(ThemeRole::Accent),
+                    )
                     .into_iter()
                     .map(|line| {
-                        let mut spans = vec![Span::styled("│ ", theme.muted)];
+                        let mut spans = vec![Span::styled("│ ", theme.style(ThemeRole::MutedText))];
                         spans.extend(line.spans);
                         Line::from(spans)
                     }),
             );
-            lines.push(Line::styled("└", theme.user));
+            lines.push(Line::styled(
+                "└",
+                theme
+                    .style(ThemeRole::User)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ));
             lines
         }
         EntryKind::Assistant(message) => {
-            let mut lines = vec![Line::styled("┌─ funcode", theme.agent)];
+            let mut lines = vec![Line::styled(
+                "┌─ funcode",
+                theme
+                    .style(ThemeRole::Agent)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )];
             match &message.status {
-                AssistantStatus::Queued => lines.push(Line::styled("│ queued…", theme.muted)),
-                AssistantStatus::Thinking => lines.push(Line::styled("│ thinking…", theme.status)),
+                AssistantStatus::Queued => {
+                    lines.push(Line::styled("│ queued…", theme.style(ThemeRole::Accent)))
+                }
+                AssistantStatus::Thinking => {
+                    lines.push(Line::styled("│ thinking…", theme.style(ThemeRole::Accent)))
+                }
                 AssistantStatus::Streaming | AssistantStatus::Completed => {
-                    lines.extend(message_lines(&message.text, theme.input));
+                    lines.extend(message_lines(&message.text, theme.style(ThemeRole::Text)));
                 }
                 AssistantStatus::Interrupted => {
-                    lines.extend(message_lines(&message.text, theme.input));
-                    lines.push(Line::styled("│ [interrupted]", theme.warning));
+                    lines.extend(message_lines(&message.text, theme.style(ThemeRole::Text)));
+                    lines.push(Line::styled(
+                        "│ [interrupted]",
+                        theme.style(ThemeRole::Warning),
+                    ));
                 }
                 AssistantStatus::Failed(message) => {
                     lines.push(Line::styled(
                         format!("│ [failed: {message}]"),
-                        theme.warning,
+                        theme.style(ThemeRole::Warning),
                     ));
                 }
             }
-            lines.push(Line::styled("└", theme.agent));
+            lines.push(Line::styled(
+                "└",
+                theme
+                    .style(ThemeRole::Agent)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ));
             lines
         }
         EntryKind::Reasoning(reasoning) => {
             let expanded = app.entry_is_expanded(entry.id);
             let status = status_label(&reasoning.status);
             let mut lines = vec![Line::from(vec![
-                Span::styled("┌─ thinking", theme.status),
+                Span::styled("┌─ thinking", theme.style(ThemeRole::Accent)),
                 Span::styled(
                     format!(
                         " · {status} · click to {}",
                         if expanded { "collapse" } else { "expand" }
                     ),
-                    theme.muted,
+                    theme.style(ThemeRole::MutedText),
                 ),
             ])];
             if expanded {
@@ -168,48 +202,66 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
                     let content = if reasoning.status == ActivityStatus::Running {
                         Line::styled(
                             format!("│ Working{}", spinner(app.animation_frame)),
-                            theme.status,
+                            theme.style(ThemeRole::Accent),
                         )
                     } else {
-                        Line::styled("│ No reasoning summary was provided", theme.muted)
+                        Line::styled(
+                            "│ No reasoning summary was provided",
+                            theme.style(ThemeRole::MutedText),
+                        )
                     };
                     lines.push(content);
                 } else {
-                    lines.extend(message_lines(&reasoning.summary, theme.muted));
+                    lines.extend(message_lines(
+                        &reasoning.summary,
+                        theme.style(ThemeRole::MutedText),
+                    ));
                 }
             } else if reasoning.status == ActivityStatus::Running {
                 lines.push(Line::styled(
                     format!("│ Thinking{}", spinner(app.animation_frame)),
-                    theme.status,
+                    theme.style(ThemeRole::Accent),
                 ));
             } else {
-                lines.push(Line::styled("│ Summary hidden", theme.muted));
+                lines.push(Line::styled(
+                    "│ Summary hidden",
+                    theme.style(ThemeRole::MutedText),
+                ));
             }
-            lines.push(Line::styled("└", theme.status));
+            lines.push(Line::styled("└", theme.style(ThemeRole::Accent)));
             lines
         }
         EntryKind::Tool(tool) => {
             let expanded = app.entry_is_expanded(entry.id);
             let mut lines = vec![Line::from(vec![
-                Span::styled(format!("┌─ tool · {}", tool.name), theme.status),
+                Span::styled(
+                    format!("┌─ tool · {}", tool.name),
+                    theme.style(ThemeRole::Accent),
+                ),
                 Span::styled(
                     format!(
                         " · {} · click to {}",
                         status_label(&tool.status),
                         if expanded { "collapse" } else { "expand" }
                     ),
-                    theme.muted,
+                    theme.style(ThemeRole::MutedText),
                 ),
             ])];
             if expanded {
-                lines.extend(message_lines(&tool.summary, theme.muted));
+                lines.extend(message_lines(
+                    &tool.summary,
+                    theme.style(ThemeRole::MutedText),
+                ));
                 for artifact in &tool.artifacts {
                     lines.extend(artifact_lines(artifact, theme));
                 }
             } else {
-                lines.push(Line::styled(format!("│ {}", tool.summary), theme.muted));
+                lines.push(Line::styled(
+                    format!("│ {}", tool.summary),
+                    theme.style(ThemeRole::MutedText),
+                ));
             }
-            lines.push(Line::styled("└", theme.status));
+            lines.push(Line::styled("└", theme.style(ThemeRole::Accent)));
             lines
         }
     }
@@ -235,21 +287,27 @@ fn artifact_lines(artifact: &ToolArtifact, theme: &Theme) -> Vec<Line<'static>> 
         } => {
             let mut lines = vec![Line::styled(
                 format!("│ Read {path}:{start_line}-{end_line}"),
-                theme.status,
+                theme.style(ThemeRole::Accent),
             )];
             if let Some(preview) = preview {
-                lines.extend(message_lines(preview, theme.muted));
+                lines.extend(message_lines(preview, theme.style(ThemeRole::MutedText)));
             }
             lines
         }
         ToolArtifact::Patch { path, diff } => {
-            let mut lines = vec![Line::styled(format!("│ Edited {path}"), theme.status)];
-            lines.extend(message_lines(diff, theme.muted));
+            let mut lines = vec![Line::styled(
+                format!("│ Edited {path}"),
+                theme.style(ThemeRole::Accent),
+            )];
+            lines.extend(message_lines(diff, theme.style(ThemeRole::MutedText)));
             lines
         }
-        ToolArtifact::TextDetail(text) => message_lines(text, theme.muted),
+        ToolArtifact::TextDetail(text) => message_lines(text, theme.style(ThemeRole::MutedText)),
         ToolArtifact::FileReference(path) => {
-            vec![Line::styled(format!("│ File {path}"), theme.status)]
+            vec![Line::styled(
+                format!("│ File {path}"),
+                theme.style(ThemeRole::Accent),
+            )]
         }
     }
 }

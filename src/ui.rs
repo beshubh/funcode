@@ -2,7 +2,8 @@ pub mod transcript;
 
 use crate::{
     app::{App, AuthProvider, ModelsDialogPhase, Screen, Suggestion, SuggestionKind},
-    theme::Theme,
+    composer::SessionMode,
+    theme::{Theme, ThemeId, ThemeRole},
     transcript::EntryId,
 };
 use ratatui::{
@@ -24,6 +25,8 @@ pub enum UiTarget {
     AuthProvider(usize),
     Suggestion(usize),
     MessageCopy,
+    Mode(SessionMode),
+    Theme(usize),
     Model(usize),
     ModelRefresh,
 }
@@ -40,6 +43,8 @@ pub struct UiRegions {
     pub auth_providers: Vec<Rect>,
     pub suggestions: Vec<Rect>,
     pub message_copy: Option<Rect>,
+    pub mode_tabs: Vec<Rect>,
+    pub theme_options: Vec<Rect>,
     pub models: Vec<ModelRegion>,
     pub model_refresh: Option<Rect>,
 }
@@ -77,6 +82,24 @@ impl UiRegions {
             .find(|(_, area)| area.contains(position))
         {
             Some(UiTarget::Suggestion(index))
+        } else if let Some((index, _)) = self
+            .theme_options
+            .iter()
+            .enumerate()
+            .find(|(_, area)| area.contains(position))
+        {
+            Some(UiTarget::Theme(index))
+        } else if let Some((index, _)) = self
+            .mode_tabs
+            .iter()
+            .enumerate()
+            .find(|(_, area)| area.contains(position))
+        {
+            Some(UiTarget::Mode(if index == 0 {
+                SessionMode::Plan
+            } else {
+                SessionMode::Build
+            }))
         } else {
             self.transcript_entries
                 .iter()
@@ -88,6 +111,10 @@ impl UiRegions {
 
 pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
     let area = frame.area();
+    frame.render_widget(
+        Block::default().style(theme.style(ThemeRole::Surface)),
+        area,
+    );
     let mut regions = match app.screen {
         Screen::Home if area.width < HOME_MIN_WIDTH || area.height < HOME_MIN_HEIGHT => {
             render_too_small(frame, area, HOME_MIN_WIDTH, HOME_MIN_HEIGHT, theme);
@@ -111,6 +138,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
         && area.height >= CHAT_MIN_HEIGHT
     {
         regions.message_copy = render_message_dialog(frame, area, app, theme);
+    } else if app.theme_dialog.is_some()
+        && area.width >= CHAT_MIN_WIDTH
+        && area.height >= CHAT_MIN_HEIGHT
+    {
+        regions.theme_options = render_theme_dialog(frame, area, app, theme);
     } else if app.models_dialog.is_some()
         && area.width >= CHAT_MIN_WIDTH
         && area.height >= CHAT_MIN_HEIGHT
@@ -118,6 +150,59 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
         (regions.models, regions.model_refresh) = render_models_dialog(frame, area, app, theme);
     }
     regions
+}
+
+fn render_theme_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Vec<Rect> {
+    let Some(dialog) = app.theme_dialog else {
+        return Vec::new();
+    };
+    let width = area.width.saturating_sub(6).min(54);
+    let height = 10.min(area.height.saturating_sub(4));
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, dialog_area);
+    let block = panel_block(" Choose theme ", theme).style(theme.style(ThemeRole::Surface));
+    let inner = block.inner(dialog_area).inner(Margin::new(1, 1));
+    frame.render_widget(block, dialog_area);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+    for (index, theme_id) in ThemeId::ALL.iter().enumerate() {
+        let candidate = Theme::resolve(*theme_id);
+        let selected = dialog.selected == index;
+        let style = if selected {
+            candidate
+                .style(ThemeRole::Accent)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            theme.style(ThemeRole::Text)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {} ", theme_id.display_name()), style),
+                Span::styled(
+                    format!("  {}", theme_id.as_str()),
+                    theme.style(ThemeRole::MutedText),
+                ),
+            ])),
+            rows[index],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("↑/↓ preview · Enter save · mouse preview · Esc cancel")
+            .style(theme.style(ThemeRole::MutedText)),
+        rows[4],
+    );
+    rows[..ThemeId::ALL.len()].to_vec()
 }
 
 fn render_models_dialog(
@@ -149,14 +234,20 @@ fn render_models_dialog(
     let mut refresh_enabled = false;
     let mut lines = match phase {
         ModelsDialogPhase::Loading => {
-            frame.render_widget(Paragraph::new("Esc close").style(theme.muted), footer_area);
-            vec![Line::styled("Loading provider catalogs…", theme.status)]
+            frame.render_widget(
+                Paragraph::new("Esc close").style(theme.style(ThemeRole::MutedText)),
+                footer_area,
+            );
+            vec![Line::styled(
+                "Loading provider catalogs…",
+                theme.style(ThemeRole::Accent),
+            )]
         }
         ModelsDialogPhase::Failed(message) => {
             refresh_enabled = true;
             vec![
-                Line::styled("Could not load models", theme.warning),
-                Line::styled(message.clone(), theme.muted),
+                Line::styled("Could not load models", theme.style(ThemeRole::Warning)),
+                Line::styled(message.clone(), theme.style(ThemeRole::MutedText)),
             ]
         }
         ModelsDialogPhase::Loaded(catalogs) => {
@@ -168,13 +259,19 @@ fn render_models_dialog(
                     lines.push(Line::from(""));
                 }
                 lines.push(Line::from(vec![
-                    Span::styled(catalog.provider.clone(), theme.heading),
-                    Span::styled(format!("  {}", catalog.source), theme.muted),
+                    Span::styled(
+                        catalog.provider.clone(),
+                        theme.style(ThemeRole::Text).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {}", catalog.source),
+                        theme.style(ThemeRole::MutedText),
+                    ),
                 ]));
                 if catalog.models.is_empty() {
                     lines.push(Line::styled(
                         "  No user-visible models returned",
-                        theme.muted,
+                        theme.style(ThemeRole::MutedText),
                     ));
                 }
                 for model in &catalog.models {
@@ -186,14 +283,22 @@ fn render_models_dialog(
                     };
                     let line_index = lines.len();
                     let selection_style = if selected {
-                        ratatui::style::Style::default().add_modifier(Modifier::REVERSED)
+                        theme
+                            .style(ThemeRole::Text)
+                            .add_modifier(Modifier::REVERSED)
                     } else {
-                        ratatui::style::Style::default()
+                        theme.style(ThemeRole::Text)
                     };
                     lines.push(
                         Line::from(vec![
-                            Span::styled(format!(" {marker} {}", model.display_name), theme.status),
-                            Span::styled(format!("  {}", model.id), theme.muted),
+                            Span::styled(
+                                format!(" {marker} {}", model.display_name),
+                                theme.style(ThemeRole::Accent),
+                            ),
+                            Span::styled(
+                                format!("  {}", model.id),
+                                theme.style(ThemeRole::MutedText),
+                            ),
                         ])
                         .style(selection_style),
                     );
@@ -205,7 +310,10 @@ fn render_models_dialog(
         }
     };
     if lines.is_empty() {
-        lines.push(Line::styled("No providers configured", theme.muted));
+        lines.push(Line::styled(
+            "No providers configured",
+            theme.style(ThemeRole::MutedText),
+        ));
     }
     let mut scroll = 0;
     if let Some((_, selected_line)) = model_lines
@@ -249,8 +357,13 @@ fn render_models_dialog(
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" Refresh ", theme.status.add_modifier(Modifier::REVERSED)),
-                Span::styled(help, theme.muted),
+                Span::styled(
+                    " Refresh ",
+                    theme
+                        .style(ThemeRole::Accent)
+                        .add_modifier(Modifier::REVERSED),
+                ),
+                Span::styled(help, theme.style(ThemeRole::MutedText)),
             ])),
             footer_area,
         );
@@ -289,7 +402,8 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
     match &dialog.phase {
         crate::app::AuthDialogPhase::Selecting => {
             frame.render_widget(
-                Paragraph::new("Choose how to authenticate").style(theme.heading),
+                Paragraph::new("Choose how to authenticate")
+                    .style(theme.style(ThemeRole::Text).add_modifier(Modifier::BOLD)),
                 rows[0],
             );
             let provider_rows = Layout::vertical(
@@ -302,19 +416,25 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
             for (index, provider) in AuthProvider::ALL.iter().enumerate() {
                 let selected = dialog.selected == index;
                 let label_style = if selected {
-                    theme.status.add_modifier(Modifier::REVERSED)
+                    theme
+                        .style(ThemeRole::Accent)
+                        .add_modifier(Modifier::REVERSED)
                 } else {
-                    theme.status
+                    theme.style(ThemeRole::Accent)
                 };
                 let option = Paragraph::new(Text::from(vec![
                     Line::styled(format!(" {} ", provider.label()), label_style),
-                    Line::styled(format!(" {}", provider.description()), theme.muted),
+                    Line::styled(
+                        format!(" {}", provider.description()),
+                        theme.style(ThemeRole::MutedText),
+                    ),
                 ]))
                 .block(panel_block(" OpenAI ", theme));
                 frame.render_widget(option, provider_rows[index]);
             }
             frame.render_widget(
-                Paragraph::new("↑/↓ select · Enter open · click · Esc close").style(theme.muted),
+                Paragraph::new("↑/↓ select · Enter open · click · Esc close")
+                    .style(theme.style(ThemeRole::MutedText)),
                 rows[2],
             );
             provider_rows.to_vec()
@@ -322,8 +442,8 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
         crate::app::AuthDialogPhase::Starting => {
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
-                    Line::styled("Preparing browser sign-in…", theme.status),
-                    Line::styled("Esc cancels", theme.muted),
+                    Line::styled("Preparing browser sign-in…", theme.style(ThemeRole::Accent)),
+                    Line::styled("Esc cancels", theme.style(ThemeRole::MutedText)),
                 ]))
                 .wrap(Wrap { trim: false }),
                 inner,
@@ -341,10 +461,13 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
             };
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
-                    Line::styled(heading, theme.status),
-                    Line::styled(authorization_url.clone(), theme.muted),
+                    Line::styled(heading, theme.style(ThemeRole::Accent)),
+                    Line::styled(authorization_url.clone(), theme.style(ThemeRole::MutedText)),
                     Line::from(""),
-                    Line::styled("Waiting for ChatGPT… · Esc cancel", theme.muted),
+                    Line::styled(
+                        "Waiting for ChatGPT… · Esc cancel",
+                        theme.style(ThemeRole::MutedText),
+                    ),
                 ]))
                 .wrap(Wrap { trim: false }),
                 inner,
@@ -358,10 +481,13 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
             );
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
-                    Line::styled("✓ Authenticated with ChatGPT", theme.status),
-                    Line::styled(detail, theme.muted),
+                    Line::styled(
+                        "✓ Authenticated with ChatGPT",
+                        theme.style(ThemeRole::Accent),
+                    ),
+                    Line::styled(detail, theme.style(ThemeRole::MutedText)),
                     Line::from(""),
-                    Line::styled("Enter close", theme.muted),
+                    Line::styled("Enter close", theme.style(ThemeRole::MutedText)),
                 ])),
                 inner,
             );
@@ -370,10 +496,13 @@ fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Them
         crate::app::AuthDialogPhase::Failed { message } => {
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
-                    Line::styled("ChatGPT sign-in failed", theme.warning),
-                    Line::styled(message.clone(), theme.muted),
+                    Line::styled("ChatGPT sign-in failed", theme.style(ThemeRole::Warning)),
+                    Line::styled(message.clone(), theme.style(ThemeRole::MutedText)),
                     Line::from(""),
-                    Line::styled("Enter choose provider · Esc close", theme.muted),
+                    Line::styled(
+                        "Enter choose provider · Esc close",
+                        theme.style(ThemeRole::MutedText),
+                    ),
                 ]))
                 .wrap(Wrap { trim: false }),
                 inner,
@@ -405,16 +534,26 @@ fn render_message_dialog(
     frame.render_widget(block, dialog_area);
 
     let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).split(inner);
-    let lines = message
-        .content
-        .lines(theme.input, theme.attachment_badge, theme.status);
+    let lines = message.content.lines(
+        theme.style(ThemeRole::Text),
+        theme.accent_badge(),
+        theme.style(ThemeRole::Accent),
+    );
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
         rows[0],
     );
     let action_line = Line::from(vec![
-        Span::styled(" Copy ", theme.status.add_modifier(Modifier::REVERSED)),
-        Span::styled("  Revert (coming soon)  ·  Esc close", theme.muted),
+        Span::styled(
+            " Copy ",
+            theme
+                .style(ThemeRole::Accent)
+                .add_modifier(Modifier::REVERSED),
+        ),
+        Span::styled(
+            "  Revert (coming soon)  ·  Esc close",
+            theme.style(ThemeRole::MutedText),
+        ),
     ]);
     let copy_width = 6.min(rows[1].width);
     frame.render_widget(Paragraph::new(action_line), rows[1]);
@@ -440,8 +579,8 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
 }
 
 fn fun_logo(theme: &Theme) -> Text<'static> {
-    let accent = theme.logo_accent;
-    let neutral = theme.logo_neutral;
+    let accent = theme.style(ThemeRole::Accent).add_modifier(Modifier::BOLD);
+    let neutral = theme.style(ThemeRole::Text).add_modifier(Modifier::BOLD);
     Text::from(vec![
         Line::from(vec![
             Span::styled("██████████", accent),
@@ -503,15 +642,24 @@ fn fun_logo(theme: &Theme) -> Text<'static> {
 }
 
 fn render_home_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let mut lines = vec![Line::styled("Available commands", theme.heading)];
+    let mut lines = vec![Line::styled(
+        "Available commands",
+        theme.style(ThemeRole::Text).add_modifier(Modifier::BOLD),
+    )];
     lines.extend(app.available_commands().into_iter().map(|command| {
         Line::from(vec![
-            Span::styled(format!("{:<10}", command.label), theme.status),
+            Span::styled(
+                format!("{:<10}", command.label),
+                theme.style(ThemeRole::Accent),
+            ),
             Span::raw(command.description),
         ])
     }));
     lines.push(Line::from(""));
-    lines.push(Line::styled("Enter start  ·  Ctrl+C quit", theme.muted));
+    lines.push(Line::styled(
+        "Enter start  ·  Ctrl+C quit",
+        theme.style(ThemeRole::MutedText),
+    ));
     let help = Text::from(lines);
     frame.render_widget(
         Paragraph::new(help)
@@ -548,7 +696,7 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
         suggestion_height,
     );
     regions.suggestions = render_suggestions(frame, suggestion_area, app, &suggestions, theme);
-    render_composer(frame, composer_area, app, theme);
+    regions.mode_tabs = render_composer(frame, composer_area, app, theme);
     regions
 }
 
@@ -576,13 +724,21 @@ fn render_suggestions(
     for (index, suggestion) in suggestions.iter().enumerate() {
         let row = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
         let line = Line::from(vec![
-            Span::styled(format!(" {}", suggestion.label), theme.status),
-            Span::styled(format!("  {}", suggestion.description), theme.muted),
+            Span::styled(
+                format!(" {}", suggestion.label),
+                theme.style(ThemeRole::Accent),
+            ),
+            Span::styled(
+                format!("  {}", suggestion.description),
+                theme.style(ThemeRole::MutedText),
+            ),
         ]);
         let style = if index == app.selected_suggestion() {
-            ratatui::style::Style::default().add_modifier(Modifier::REVERSED)
+            theme
+                .style(ThemeRole::Text)
+                .add_modifier(Modifier::REVERSED)
         } else {
-            ratatui::style::Style::default()
+            theme.style(ThemeRole::Text)
         };
         frame.render_widget(Paragraph::new(line).style(style), row);
         regions.push(row);
@@ -609,16 +765,51 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
     } else {
         String::new()
     };
-    frame.render_widget(Paragraph::new(text).style(theme.status), area);
+    frame.render_widget(
+        Paragraph::new(text).style(theme.style(ThemeRole::Accent)),
+        area,
+    );
 }
 
-fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let title = format!(
-        "Enter send · Shift+Enter new line · Mode: {} · Model: {}",
-        app.session_mode.label(),
-        app.current_model()
-    );
-    let block = panel_block(title.as_str(), theme);
+fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Vec<Rect> {
+    let active_mode = app.effective_mode();
+    let mode_role = match active_mode {
+        SessionMode::Plan => ThemeRole::PlanMode,
+        SessionMode::Build => ThemeRole::BuildMode,
+    };
+    let mode_style = theme.style(mode_role).add_modifier(Modifier::BOLD);
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "[ Plan ]",
+            if active_mode == SessionMode::Plan {
+                mode_style
+            } else {
+                theme.style(ThemeRole::MutedText)
+            },
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "[ Build ]",
+            if active_mode == SessionMode::Build {
+                mode_style
+            } else {
+                theme.style(ThemeRole::MutedText)
+            },
+        ),
+        Span::raw(" "),
+    ]);
+    let block = Block::bordered()
+        .title(title)
+        .title_bottom(Line::styled(
+            format!(
+                " Enter send · Shift+Enter new line · Model: {} ",
+                app.current_model()
+            ),
+            theme.style(ThemeRole::MutedText),
+        ))
+        .border_set(theme.border_set())
+        .border_style(theme.style(mode_role));
     let inner = block.inner(area);
     let input_area = inner;
     let (cursor_column, cursor_row) = composer_cursor(
@@ -628,12 +819,15 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
     );
     let vertical_scroll = cursor_row.saturating_sub(input_area.height.saturating_sub(1));
     let content = if app.composer.text().is_empty() {
-        Text::from(Line::styled("Type something…", theme.muted))
+        Text::from(Line::styled(
+            "Type something…",
+            theme.style(ThemeRole::MutedText),
+        ))
     } else {
         Text::from(app.composer.content().lines(
-            theme.input,
-            theme.attachment_badge,
-            theme.status.add_modifier(Modifier::REVERSED),
+            theme.style(ThemeRole::Text),
+            theme.accent_badge(),
+            theme.style(mode_role).add_modifier(Modifier::REVERSED),
         ))
     };
 
@@ -644,7 +838,11 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
             .scroll((vertical_scroll, 0)),
         input_area,
     );
-    if app.auth_dialog.is_none() && app.message_dialog.is_none() {
+    if app.auth_dialog.is_none()
+        && app.message_dialog.is_none()
+        && app.theme_dialog.is_none()
+        && app.models_dialog.is_none()
+    {
         frame.set_cursor_position((
             input_area.x.saturating_add(cursor_column),
             input_area
@@ -652,6 +850,10 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
                 .saturating_add(cursor_row.saturating_sub(vertical_scroll)),
         ));
     }
+    vec![
+        Rect::new(area.x.saturating_add(2), area.y, 8, 1),
+        Rect::new(area.x.saturating_add(11), area.y, 9, 1),
+    ]
 }
 
 fn composer_height(app: &App, width: u16, theme: &Theme) -> u16 {
@@ -681,8 +883,9 @@ fn composer_cursor(text: &str, cursor: usize, width: u16) -> (u16, u16) {
 fn panel_block<'a>(title: impl Into<Line<'a>>, theme: &Theme) -> Block<'a> {
     Block::bordered()
         .title(title)
-        .border_set(theme.border_set)
-        .border_style(theme.panel_border)
+        .border_set(theme.border_set())
+        .border_style(theme.style(ThemeRole::Border))
+        .style(theme.style(ThemeRole::Surface))
 }
 
 fn render_too_small(
@@ -705,7 +908,7 @@ fn render_too_small(
     frame.render_widget(
         Paragraph::new(message)
             .alignment(Alignment::Center)
-            .style(theme.warning),
+            .style(theme.style(ThemeRole::Warning)),
         vertical[1],
     );
 }
@@ -748,6 +951,23 @@ mod tests {
         )
     }
 
+    fn style_at_text(terminal: &Terminal<TestBackend>, needle: &str) -> ratatui::style::Style {
+        let screen = terminal.backend().to_string();
+        let (row, line) = screen
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains(needle))
+            .unwrap();
+        let byte = line.find(needle).unwrap();
+        let column = line[..byte].chars().count() as u16;
+        terminal
+            .backend()
+            .buffer()
+            .cell(Position::new(column, row as u16))
+            .unwrap()
+            .style()
+    }
+
     #[test]
     fn home_screen_has_no_app_border_and_one_compact_help_widget() {
         let (screen, cursor_visible, _, top_left) = render_to_string(&App::new(), 100, 30);
@@ -776,6 +996,113 @@ mod tests {
         assert!(regions.transcript_entries.is_empty());
         assert_eq!(top_left, " ");
         assert!(cursor_visible);
+    }
+
+    #[test]
+    fn custom_theme_paints_the_frame_and_exposes_colored_mode_tabs() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        let theme = Theme::resolve(crate::theme::ThemeId::FunDark);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut regions = UiRegions::default();
+
+        terminal
+            .draw(|frame| regions = render(frame, &app, &theme))
+            .unwrap();
+
+        assert!(
+            terminal.backend().buffer().content().iter().all(|cell| {
+                cell.style().bg == theme.style(crate::theme::ThemeRole::Surface).bg
+            })
+        );
+        assert_eq!(regions.mode_tabs.len(), 2);
+        let build = regions.mode_tabs[1];
+        assert_eq!(
+            regions.target_at(build.x, build.y),
+            Some(UiTarget::Mode(crate::composer::SessionMode::Build))
+        );
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell(Position::new(build.x + 2, build.y))
+                .unwrap()
+                .style()
+                .fg,
+            theme.style(crate::theme::ThemeRole::BuildMode).fg
+        );
+        let composer_border = terminal
+            .backend()
+            .buffer()
+            .cell(Position::new(build.x.saturating_sub(11), build.y))
+            .unwrap()
+            .style();
+        assert_eq!(
+            composer_border.fg,
+            theme.style(crate::theme::ThemeRole::BuildMode).fg
+        );
+    }
+
+    #[test]
+    fn accent_role_colors_commands_queued_thinking_tools_and_waiting() {
+        let theme = Theme::resolve(crate::theme::ThemeId::FunDark);
+        let accent = theme.style(crate::theme::ThemeRole::Accent).fg;
+
+        let backend = TestBackend::new(100, 30);
+        let mut home = Terminal::new(backend).unwrap();
+        home.draw(|frame| {
+            let _ = render(frame, &App::new(), &theme);
+        })
+        .unwrap();
+        assert_eq!(style_at_text(&home, "/theme").fg, accent);
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "first".into(), Vec::new());
+        app.transcript.submit(2, "second".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 2 });
+        app.handle_agent_event(AgentEvent::ReasoningDelta {
+            request_id: 2,
+            summary: "Checking".into(),
+        });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 2,
+            call_id: 1,
+            name: "read_file".into(),
+            summary: "Reading".into(),
+        });
+        let backend = TestBackend::new(100, 40);
+        let mut chat = Terminal::new(backend).unwrap();
+        chat.draw(|frame| {
+            let _ = render(frame, &app, &theme);
+        })
+        .unwrap();
+        for label in ["queued…", "thinking", "tool", "Waiting"] {
+            assert_eq!(style_at_text(&chat, label).fg, accent, "{label}");
+        }
+    }
+
+    #[test]
+    fn theme_picker_lists_bundled_themes_as_previewable_regions() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.open_theme_dialog();
+
+        let (screen, cursor_visible, regions, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("Choose theme"));
+        assert!(screen.contains("Terminal"));
+        assert!(screen.contains("Fun Dark"));
+        assert!(screen.contains("Midnight"));
+        assert!(screen.contains("Paper"));
+        assert_eq!(regions.theme_options.len(), 4);
+        let paper = regions.theme_options[3];
+        assert_eq!(
+            regions.target_at(paper.x, paper.y),
+            Some(UiTarget::Theme(3))
+        );
+        assert!(!cursor_visible);
     }
 
     #[test]
@@ -832,7 +1159,10 @@ mod tests {
             .iter()
             .find(|cell| cell.symbol() == "@")
             .unwrap();
-        assert_eq!(badge_cell.style().fg, theme.logo_accent.fg);
+        assert_eq!(
+            badge_cell.style().fg,
+            theme.style(crate::theme::ThemeRole::Accent).fg
+        );
         assert!(badge_cell.style().add_modifier.contains(Modifier::REVERSED));
     }
 
@@ -1259,12 +1589,12 @@ mod tests {
         assert!(
             cells
                 .iter()
-                .any(|cell| cell.style().fg == theme.logo_accent.fg)
+                .any(|cell| cell.style().fg == theme.style(crate::theme::ThemeRole::Accent).fg)
         );
         assert!(
             cells
                 .iter()
-                .any(|cell| cell.style().fg == theme.logo_neutral.fg)
+                .any(|cell| cell.style().fg == theme.style(crate::theme::ThemeRole::Text).fg)
         );
         assert!(
             cells

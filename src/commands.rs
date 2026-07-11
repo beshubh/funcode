@@ -73,6 +73,7 @@ impl Default for CommandRegistry {
         registry.register(PlanCommand);
         registry.register(BuildCommand);
         registry.register(ModelsCommand);
+        registry.register(ThemeCommand);
         registry
     }
 }
@@ -161,6 +162,24 @@ impl Command for ModelsCommand {
     fn execute(&self, app: &mut App) -> Option<AppAction> {
         app.open_models_dialog();
         Some(AppAction::ListModels)
+    }
+}
+
+#[derive(Debug)]
+struct ThemeCommand;
+
+impl Command for ThemeCommand {
+    fn name(&self) -> &'static str {
+        "theme"
+    }
+
+    fn description(&self) -> &'static str {
+        "Choose a color theme"
+    }
+
+    fn execute(&self, app: &mut App) -> Option<AppAction> {
+        app.open_theme_dialog();
+        None
     }
 }
 

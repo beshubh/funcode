@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`funcode` is a Rust 2024 terminal application built with Ratatui and Crossterm. Source lives in `src/`: `main.rs` is the binary entry point, `lib.rs` exposes the library, `runtime.rs` owns the terminal event loop, `app.rs` contains application state and input transitions, and `ui.rs` renders the TUI. Background agent coordination is in `agent.rs`; ChatGPT OAuth and credential persistence are in `auth.rs`; shared styling belongs in `theme.rs`.
+`funcode` is a Rust 2024 terminal application built with Ratatui and Crossterm. Source lives in `src/`: `main.rs` is the binary entry point, `lib.rs` exposes the library, `runtime.rs` owns the terminal event loop, `app.rs` contains application state and input transitions, and `ui.rs` renders the TUI. Background agent coordination is in `agent.rs`; ChatGPT OAuth and credential persistence are in `auth.rs`; semantic styling and theme selection persistence belong in `theme/`.
 
 Tests are colocated with their modules in `#[cfg(test)]` blocks. There is currently no separate `tests/` directory or asset pipeline. Build output under `target/` is generated and must not be committed.
 

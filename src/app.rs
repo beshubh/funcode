@@ -5,6 +5,7 @@ use crate::{
     composer::{ComposerDocument, SessionMode},
     llm::ProviderModels,
     model_catalog::ModelCatalogEvent,
+    theme::ThemeId,
     transcript::{Attachment, EntryId, EntryKind, Transcript, TranscriptEvent},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -63,6 +64,11 @@ pub struct AuthDialog {
     pub selected: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemeDialog {
+    pub selected: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ModelsDialogPhase {
     Loading,
@@ -100,6 +106,9 @@ pub enum AppAction {
         text: String,
     },
     ListModels,
+    SaveTheme {
+        theme_id: ThemeId,
+    },
     RefreshModels,
     SelectModel {
         model: String,
@@ -136,7 +145,9 @@ pub struct App {
     pub message_dialog: Option<EntryId>,
     pub notice: Option<String>,
     pub auth_dialog: Option<AuthDialog>,
+    pub theme_dialog: Option<ThemeDialog>,
     pub(crate) models_dialog: Option<ModelsDialogPhase>,
+    active_theme: ThemeId,
     commands: CommandRegistry,
     workspace_files: Vec<String>,
     suggestion_selected: usize,
@@ -196,6 +207,10 @@ impl App {
             return self.handle_message_dialog_key(key);
         }
 
+        if self.theme_dialog.is_some() {
+            return self.handle_theme_dialog_key(key);
+        }
+
         if self.models_dialog.is_some() {
             return self.handle_models_dialog_key(key);
         }
@@ -233,6 +248,10 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Tab => {
+                self.toggle_mode();
+                None
+            }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.composer.insert_text("\n");
                 None
@@ -319,6 +338,29 @@ impl App {
     pub fn scroll_transcript_down(&mut self) {
         self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(SCROLL_STEP);
         self.follow_output = self.scroll_from_bottom == 0;
+    }
+
+    pub fn effective_mode(&self) -> SessionMode {
+        self.composer
+            .content()
+            .requested_mode()
+            .unwrap_or(self.session_mode)
+    }
+
+    pub fn select_mode(&mut self, mode: SessionMode) {
+        if self.effective_mode() == mode {
+            return;
+        }
+        self.composer.set_mode(mode);
+        self.suggestion_selected = 0;
+    }
+
+    fn toggle_mode(&mut self) {
+        let mode = match self.effective_mode() {
+            SessionMode::Plan => SessionMode::Build,
+            SessionMode::Build => SessionMode::Plan,
+        };
+        self.select_mode(mode);
     }
 
     pub fn register_command(&mut self, command: impl Command + 'static) {
@@ -629,6 +671,53 @@ impl App {
         self.notice = Some(notice.into());
     }
 
+    pub fn set_active_theme(&mut self, theme_id: ThemeId) {
+        self.active_theme = theme_id;
+    }
+
+    pub fn effective_theme_id(&self) -> ThemeId {
+        self.theme_dialog
+            .and_then(|dialog| ThemeId::ALL.get(dialog.selected).copied())
+            .unwrap_or(self.active_theme)
+    }
+
+    pub fn open_theme_dialog(&mut self) {
+        let selected = ThemeId::ALL
+            .iter()
+            .position(|theme_id| *theme_id == self.active_theme)
+            .unwrap_or_default();
+        self.theme_dialog = Some(ThemeDialog { selected });
+        self.last_escape = None;
+    }
+
+    pub fn set_theme_selection(&mut self, index: usize) {
+        if index < ThemeId::ALL.len()
+            && let Some(dialog) = self.theme_dialog.as_mut()
+        {
+            dialog.selected = index;
+        }
+    }
+
+    pub fn move_theme_selection(&mut self, direction: i8) {
+        let Some(dialog) = self.theme_dialog.as_mut() else {
+            return;
+        };
+        let count = ThemeId::ALL.len();
+        dialog.selected = if direction < 0 {
+            dialog.selected.checked_sub(1).unwrap_or(count - 1)
+        } else {
+            (dialog.selected + 1) % count
+        };
+    }
+
+    pub fn commit_theme_selection(&mut self) -> Option<AppAction> {
+        self.theme_dialog?;
+        let theme_id = self.effective_theme_id();
+        self.active_theme = theme_id;
+        self.theme_dialog = None;
+        Some(AppAction::SaveTheme { theme_id })
+    }
+
     pub(crate) fn open_models_dialog(&mut self) {
         self.models_dialog = Some(ModelsDialogPhase::Loading);
         self.models_selected = 0;
@@ -831,6 +920,25 @@ impl App {
         }
     }
 
+    fn handle_theme_dialog_key(&mut self, key: KeyEvent) -> Option<AppAction> {
+        match key.code {
+            KeyCode::Esc => {
+                self.theme_dialog = None;
+                None
+            }
+            KeyCode::Up => {
+                self.move_theme_selection(-1);
+                None
+            }
+            KeyCode::Down => {
+                self.move_theme_selection(1);
+                None
+            }
+            KeyCode::Enter => self.commit_theme_selection(),
+            _ => None,
+        }
+    }
+
     fn handle_models_dialog_key(&mut self, key: KeyEvent) -> Option<AppAction> {
         match key.code {
             KeyCode::Esc => self.models_dialog = None,
@@ -927,6 +1035,7 @@ mod tests {
         auth::AuthEvent,
         commands::Command,
         composer::SessionMode,
+        theme::ThemeId,
         transcript::{AssistantStatus, EntryKind, ToolArtifact},
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -966,6 +1075,35 @@ mod tests {
             app.models_dialog,
             Some(super::ModelsDialogPhase::Loading)
         ));
+    }
+
+    #[test]
+    fn theme_picker_previews_rolls_back_and_commits_the_selected_theme() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.set_active_theme(ThemeId::FunDark);
+        app.composer.insert_text("/theme");
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
+        assert!(app.theme_dialog.is_some());
+        assert_eq!(app.effective_theme_id(), ThemeId::FunDark);
+
+        app.handle_key(key(KeyCode::Down), Instant::now());
+        assert_eq!(app.effective_theme_id(), ThemeId::Midnight);
+        app.handle_key(key(KeyCode::Esc), Instant::now());
+        assert_eq!(app.effective_theme_id(), ThemeId::FunDark);
+
+        app.open_theme_dialog();
+        app.set_theme_selection(3);
+        assert_eq!(app.effective_theme_id(), ThemeId::Paper);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::SaveTheme {
+                theme_id: ThemeId::Paper
+            })
+        );
+        assert_eq!(app.effective_theme_id(), ThemeId::Paper);
+        assert!(app.theme_dialog.is_none());
     }
 
     #[test]
@@ -1171,6 +1309,31 @@ mod tests {
             })
         ));
         assert_eq!(app.session_mode, SessionMode::Build);
+    }
+
+    #[test]
+    fn tab_switches_the_effective_mode_without_stealing_suggestion_completion() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+
+        assert_eq!(app.effective_mode(), SessionMode::Build);
+        app.select_mode(SessionMode::Build);
+        assert!(app.composer.text().is_empty());
+        assert_eq!(app.handle_key(key(KeyCode::Tab), Instant::now()), None);
+        assert_eq!(app.effective_mode(), SessionMode::Plan);
+        assert_eq!(
+            app.composer.content().requested_mode(),
+            Some(SessionMode::Plan)
+        );
+
+        assert_eq!(app.handle_key(key(KeyCode::Tab), Instant::now()), None);
+        assert_eq!(app.effective_mode(), SessionMode::Build);
+
+        app.composer.take_submission();
+        app.composer.insert_text("/plan");
+        assert_eq!(app.handle_key(key(KeyCode::Tab), Instant::now()), None);
+        assert_eq!(app.effective_mode(), SessionMode::Plan);
+        assert_eq!(app.composer.text(), "[Plan]");
     }
 
     #[test]
