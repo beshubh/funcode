@@ -84,3 +84,7 @@ and Escape restores the previous selection. The selected theme ID is stored atom
 Theme colors are resolved through semantic roles rather than widget-specific color values. Accent
 drives activity, commands, selections, attachments, and the Fun logo; Plan and Build keep distinct
 orange and GitHub-style green mode colors across themes.
+
+Provider catalogs are cached in `~/.funcode/models.json` for 24 hours. In the model picker, press
+`r` or click **Refresh** to bypass the cache, query authenticated providers, and replace the saved
+catalog.

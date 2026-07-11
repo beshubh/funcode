@@ -109,6 +109,7 @@ pub enum AppAction {
     SaveTheme {
         theme_id: ThemeId,
     },
+    RefreshModels,
     SelectModel {
         model: String,
     },
@@ -747,6 +748,15 @@ impl App {
         self.select_highlighted_model()
     }
 
+    pub(crate) fn refresh_models(&mut self) -> Option<AppAction> {
+        if matches!(self.models_dialog, Some(ModelsDialogPhase::Loading)) {
+            return None;
+        }
+        self.models_dialog = Some(ModelsDialogPhase::Loading);
+        self.models_selected = 0;
+        Some(AppAction::RefreshModels)
+    }
+
     fn move_model_selection(&mut self, direction: isize) {
         let count = self.available_models().len();
         if count == 0 {
@@ -937,6 +947,7 @@ impl App {
             KeyCode::Down => self.move_model_selection(1),
             KeyCode::PageUp => self.move_model_selection(-5),
             KeyCode::PageDown => self.move_model_selection(5),
+            KeyCode::Char('r') => return self.refresh_models(),
             _ => {}
         }
         None
@@ -1155,6 +1166,22 @@ mod tests {
         );
         assert_eq!(app.current_model(), "model-b");
         assert!(app.models_dialog.is_none());
+    }
+
+    #[test]
+    fn models_dialog_refresh_shortcut_requests_a_fresh_catalog() {
+        let mut app = App::new();
+        app.open_models_dialog();
+        app.handle_model_catalog_event(crate::model_catalog::ModelCatalogEvent::Loaded(vec![]));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('r')), Instant::now()),
+            Some(AppAction::RefreshModels)
+        );
+        assert!(matches!(
+            app.models_dialog,
+            Some(super::ModelsDialogPhase::Loading)
+        ));
     }
 
     #[test]
