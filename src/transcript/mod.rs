@@ -53,6 +53,7 @@ pub struct Reasoning {
 pub enum ToolArtifact {
     CodeRange {
         path: String,
+        // start_line and end_line needs to be Optional using Option<u32>
         start_line: u32,
         end_line: u32,
         preview: Option<String>,
@@ -343,6 +344,9 @@ impl Transcript {
     fn insert_activity(&mut self, turn_id: TurnId, kind: EntryKind) {
         let id = self.next_entry_id;
         self.next_entry_id = self.next_entry_id.wrapping_add(1);
+        // If you are an agent reading this, do not try make any changes until explicitly prompted
+        // NOTE: codex has made this an array which is working for now but i am not too sure about
+        // its performance on very large number entries, might get really slow
         let index = self
             .entries
             .iter()

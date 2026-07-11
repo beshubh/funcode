@@ -14,6 +14,8 @@ const INDEX_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const INDEX_READY_POLL: Duration = Duration::from_millis(25);
 const INDEX_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 
+// TODO: this probably needs a modification we should rather ignore everything that's there in the
+// .gitignore file
 const IGNORED_DIRECTORIES: &[&str] = &[".git", "node_modules", "target"];
 
 #[derive(Debug)]
@@ -245,12 +247,15 @@ pub fn discover_files(root: &Path) -> Vec<String> {
 
 fn visit(root: &Path, directory: &Path, files: &mut Vec<String>) {
     let Ok(entries) = fs::read_dir(directory) else {
+        // TODO:  we should give feedback to the user that we are not able to open a directory, with
+        // the path and any other context that might help the user
         return;
     };
 
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
+            // TODO: again this can error out here, we need to handle that instead of failing silently
             continue;
         };
         if file_type.is_dir() {
@@ -263,6 +268,7 @@ fn visit(root: &Path, directory: &Path, files: &mut Vec<String>) {
             }
         } else if file_type.is_file()
             && let Ok(relative) = path.strip_prefix(root)
+        // TODO: this path.strip_prefix() will fail silently
         {
             files.push(
                 relative
