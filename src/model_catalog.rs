@@ -28,6 +28,7 @@ impl fmt::Display for ModelCatalogUnavailable {
 impl std::error::Error for ModelCatalogUnavailable {}
 
 pub(crate) struct ModelCatalogTaskRunner {
+    client: LlmClient,
     commands: Sender<ModelCatalogCommand>,
     events: Receiver<ModelCatalogEvent>,
     thread: Option<JoinHandle<()>>,
@@ -37,6 +38,7 @@ impl ModelCatalogTaskRunner {
     pub(crate) fn spawn(client: LlmClient) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
+        let catalog_client = client.clone();
         let thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -45,7 +47,7 @@ impl ModelCatalogTaskRunner {
             while let Ok(command) = command_rx.recv() {
                 match command {
                     ModelCatalogCommand::Load => {
-                        let event = match runtime.block_on(client.list_models()) {
+                        let event = match runtime.block_on(catalog_client.list_models()) {
                             Ok(catalogs) => ModelCatalogEvent::Loaded(catalogs),
                             Err(error) => ModelCatalogEvent::Failed(error.to_string()),
                         };
@@ -58,6 +60,7 @@ impl ModelCatalogTaskRunner {
             }
         });
         Self {
+            client,
             commands: command_tx,
             events: event_rx,
             thread: Some(thread),
@@ -68,6 +71,10 @@ impl ModelCatalogTaskRunner {
         self.commands
             .send(ModelCatalogCommand::Load)
             .map_err(|_| ModelCatalogUnavailable)
+    }
+
+    pub(crate) fn select_model(&self, model: String) -> Result<(), crate::llm::LlmError> {
+        self.client.select_model(model)
     }
 
     pub(crate) fn try_event(&self) -> Option<ModelCatalogEvent> {

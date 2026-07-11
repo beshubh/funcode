@@ -1,6 +1,8 @@
 mod config;
 
-pub use config::{ThemeConfig, ThemeConfigLoad, ThemeConfigStore};
+pub(crate) use config::{
+    ThemeConfigEvent, ThemeConfigLoad, ThemeConfigStore, ThemeConfigTaskRunner,
+};
 
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -209,44 +211,60 @@ impl Default for Theme {
 mod tests {
     use super::{Theme, ThemeAppearance, ThemeId, ThemeRole};
     use ratatui::style::Color;
+    use std::collections::HashSet;
 
     #[test]
     fn bundled_themes_resolve_stable_principal_colors() {
-        assert_eq!(ThemeId::ALL.len(), 4);
-        assert_eq!(ThemeId::Terminal.as_str(), "terminal");
-        assert_eq!(
-            Theme::resolve(ThemeId::Terminal).appearance(),
-            ThemeAppearance::Terminal
-        );
-        assert_eq!(
-            Theme::resolve(ThemeId::Terminal)
-                .style(ThemeRole::Surface)
-                .bg,
-            Some(Color::Reset)
-        );
-        assert_eq!(
-            Theme::resolve(ThemeId::Terminal)
-                .style(ThemeRole::Accent)
-                .fg,
-            Some(Color::Cyan)
-        );
-        assert_eq!(
-            Theme::resolve(ThemeId::FunDark)
-                .style(ThemeRole::Surface)
-                .bg,
-            Some(Color::Rgb(13, 17, 23))
-        );
-        assert_eq!(
-            Theme::resolve(ThemeId::Midnight)
-                .style(ThemeRole::Accent)
-                .fg,
-            Some(Color::Rgb(96, 165, 250))
-        );
-        assert_eq!(
-            Theme::resolve(ThemeId::Paper)
-                .style(ThemeRole::BuildMode)
-                .fg,
-            Some(Color::Rgb(26, 127, 55))
-        );
+        let ids: HashSet<_> = ThemeId::ALL.iter().map(|id| id.as_str()).collect();
+        assert_eq!(ids.len(), ThemeId::ALL.len());
+
+        let cases = [
+            (
+                ThemeId::Terminal,
+                ThemeAppearance::Terminal,
+                Color::Reset,
+                Color::Reset,
+                Color::Cyan,
+                Color::Rgb(240, 136, 62),
+                Color::Rgb(63, 185, 80),
+            ),
+            (
+                ThemeId::FunDark,
+                ThemeAppearance::Dark,
+                Color::Rgb(13, 17, 23),
+                Color::Rgb(230, 237, 243),
+                Color::Rgb(181, 255, 0),
+                Color::Rgb(240, 136, 62),
+                Color::Rgb(63, 185, 80),
+            ),
+            (
+                ThemeId::Midnight,
+                ThemeAppearance::Dark,
+                Color::Rgb(11, 16, 32),
+                Color::Rgb(229, 231, 235),
+                Color::Rgb(96, 165, 250),
+                Color::Rgb(240, 136, 62),
+                Color::Rgb(63, 185, 80),
+            ),
+            (
+                ThemeId::Paper,
+                ThemeAppearance::Light,
+                Color::Rgb(250, 250, 249),
+                Color::Rgb(28, 25, 23),
+                Color::Rgb(124, 58, 237),
+                Color::Rgb(188, 76, 0),
+                Color::Rgb(26, 127, 55),
+            ),
+        ];
+        for (id, appearance, background, foreground, accent, plan, build) in cases {
+            let theme = Theme::resolve(id);
+            assert_eq!(theme.id(), id);
+            assert_eq!(theme.appearance(), appearance);
+            assert_eq!(theme.style(ThemeRole::Surface).bg, Some(background));
+            assert_eq!(theme.style(ThemeRole::Text).fg, Some(foreground));
+            assert_eq!(theme.style(ThemeRole::Accent).fg, Some(accent));
+            assert_eq!(theme.style(ThemeRole::PlanMode).fg, Some(plan));
+            assert_eq!(theme.style(ThemeRole::BuildMode).fg, Some(build));
+        }
     }
 }

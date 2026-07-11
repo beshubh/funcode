@@ -54,13 +54,12 @@ fn parse_models(body: &[u8]) -> Result<ProviderModels, LlmError> {
 }
 
 pub(in crate::llm) struct ChatGptProvider {
-    model: String,
     auth_store: AuthStore,
 }
 
 impl ChatGptProvider {
-    pub(in crate::llm) fn new(model: String, auth_store: AuthStore) -> Self {
-        Self { model, auth_store }
+    pub(in crate::llm) fn new(auth_store: AuthStore) -> Self {
+        Self { auth_store }
     }
 }
 
@@ -69,7 +68,6 @@ impl Provider for ChatGptProvider {
         &self,
         request: ProviderRequest,
     ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
-        let model = self.model.clone();
         let auth_store = self.auth_store.clone();
         Box::pin(async move {
             let credentials = auth_store.valid_credentials().await.map_err(|error| {
@@ -91,7 +89,11 @@ impl Provider for ChatGptProvider {
                 .map_err(|error| {
                     LlmError::Configuration(format!("could not configure ChatGPT: {error}"))
                 })?;
-            let ProviderRequest { prompt, history } = request;
+            let ProviderRequest {
+                model,
+                prompt,
+                history,
+            } = request;
             let stream = client
                 .agent(model)
                 .build()

@@ -51,11 +51,11 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - Drag across terminal text to select and automatically copy it to the clipboard
 - Click a sent message: open a modal and copy its text and attached paths
 - Click a Thinking or tool block: expand its persistent activity summary
-- Click the Plan or Build composer tab: switch the pending and persistent session mode
+- Click the Plan or Build composer tab: switch the pending mode; submission makes it persistent
 - `/auth`: open the authentication picker
 - `/plan`: enable persistent plan mode for this and later prompts
 - `/build`: return to normal build mode
-- `/models`: list user-visible models from every configured provider
+- `/models`: choose a model from every configured provider; use arrows or hover, then Enter/click
 - `/theme`: preview and select a bundled color theme
 - `/exit`: quit
 
@@ -71,6 +71,7 @@ the home screen and command popup both read from this registry, so they stay in 
 Model discovery runs outside the terminal event loop. Providers use their live model-catalog API
 when one is available; provider adapters can return a built-in catalog when no discovery endpoint
 exists. The current ChatGPT subscription provider reads its live Codex model catalog after sign-in.
+The active model is shown in the composer border and applies to subsequent model requests.
 
 ## Themes
 

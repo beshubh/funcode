@@ -154,7 +154,7 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
             )];
             match &message.status {
                 AssistantStatus::Queued => {
-                    lines.push(Line::styled("│ queued…", theme.style(ThemeRole::MutedText)))
+                    lines.push(Line::styled("│ queued…", theme.style(ThemeRole::Accent)))
                 }
                 AssistantStatus::Thinking => {
                     lines.push(Line::styled("│ thinking…", theme.style(ThemeRole::Accent)))
