@@ -1,7 +1,7 @@
 pub mod transcript;
 
 use crate::{
-    app::{App, AuthProvider, Screen, Suggestion, SuggestionKind},
+    app::{App, AuthProvider, ModelsDialogPhase, Screen, Suggestion, SuggestionKind},
     theme::Theme,
     transcript::EntryId,
 };
@@ -90,8 +90,82 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
         && area.height >= CHAT_MIN_HEIGHT
     {
         regions.message_copy = render_message_dialog(frame, area, app, theme);
+    } else if app.models_dialog.is_some()
+        && area.width >= CHAT_MIN_WIDTH
+        && area.height >= CHAT_MIN_HEIGHT
+    {
+        render_models_dialog(frame, area, app, theme);
     }
     regions
+}
+
+fn render_models_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let Some(phase) = app.models_dialog.as_ref() else {
+        return;
+    };
+    let width = area.width.saturating_sub(6).min(78);
+    let height = area.height.saturating_sub(4).min(24);
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, dialog_area);
+    let block = panel_block(" Available models ", theme);
+    let inner = block.inner(dialog_area).inner(Margin::new(1, 1));
+    frame.render_widget(block, dialog_area);
+
+    let mut lines = match phase {
+        ModelsDialogPhase::Loading => vec![
+            Line::styled("Loading provider catalogs…", theme.status),
+            Line::from(""),
+            Line::styled("Esc close", theme.muted),
+        ],
+        ModelsDialogPhase::Failed(message) => vec![
+            Line::styled("Could not load models", theme.warning),
+            Line::styled(message.clone(), theme.muted),
+            Line::from(""),
+            Line::styled("Run /auth if sign-in is required · Esc close", theme.muted),
+        ],
+        ModelsDialogPhase::Loaded(catalogs) => {
+            let mut lines = Vec::new();
+            for (provider_index, catalog) in catalogs.iter().enumerate() {
+                if provider_index > 0 {
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled(catalog.provider.clone(), theme.heading),
+                    Span::styled(format!("  {}", catalog.source), theme.muted),
+                ]));
+                if catalog.models.is_empty() {
+                    lines.push(Line::styled(
+                        "  No user-visible models returned",
+                        theme.muted,
+                    ));
+                }
+                for model in &catalog.models {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  • {}", model.display_name), theme.status),
+                        Span::styled(format!("  {}", model.id), theme.muted),
+                    ]));
+                    if let Some(description) = &model.description {
+                        lines.push(Line::styled(format!("    {description}"), theme.muted));
+                    }
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Enter or Esc close", theme.muted));
+            lines
+        }
+    };
+    if lines.is_empty() {
+        lines.push(Line::styled("No providers configured", theme.muted));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Vec<Rect> {
@@ -545,7 +619,8 @@ mod tests {
     use super::{UiRegions, UiTarget, render};
     use crate::{
         agent::AgentEvent,
-        app::{App, Screen},
+        app::{App, ModelsDialogPhase, Screen},
+        llm::{ModelInfo, ProviderModels},
         theme::Theme,
         transcript::ToolArtifact,
     };
@@ -586,7 +661,7 @@ mod tests {
         assert!(screen.contains("/exit"));
         assert!(!screen.contains("/sessions"));
         assert!(!screen.contains("/help"));
-        assert!(!screen.contains("/models"));
+        assert!(screen.contains("/models"));
         assert!(!screen.contains("Model: not connected"));
         assert_eq!(top_left, " ");
         assert!(!cursor_visible);
@@ -713,6 +788,29 @@ mod tests {
         assert!(screen.contains("@src/"));
         assert!(cursor_visible);
         assert_eq!(regions.suggestions.len(), 1);
+    }
+
+    #[test]
+    fn models_dialog_renders_provider_and_model_identifiers() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.models_dialog = Some(ModelsDialogPhase::Loaded(vec![ProviderModels {
+            provider: "ChatGPT".into(),
+            source: "live provider API".into(),
+            models: vec![ModelInfo {
+                id: "gpt-test".into(),
+                display_name: "GPT Test".into(),
+                description: Some("A model for tests".into()),
+            }],
+        }]));
+
+        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("Available models"));
+        assert!(screen.contains("ChatGPT"));
+        assert!(screen.contains("live provider API"));
+        assert!(screen.contains("GPT Test"));
+        assert!(screen.contains("gpt-test"));
     }
 
     #[test]

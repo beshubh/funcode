@@ -72,6 +72,7 @@ impl Default for CommandRegistry {
         registry.register(ExitCommand);
         registry.register(PlanCommand);
         registry.register(BuildCommand);
+        registry.register(ModelsCommand);
         registry
     }
 }
@@ -142,6 +143,24 @@ impl Command for BuildCommand {
 
     fn behavior(&self) -> CommandBehavior {
         CommandBehavior::Mode(SessionMode::Build)
+    }
+}
+
+#[derive(Debug)]
+struct ModelsCommand;
+
+impl Command for ModelsCommand {
+    fn name(&self) -> &'static str {
+        "models"
+    }
+
+    fn description(&self) -> &'static str {
+        "List models available from supported providers"
+    }
+
+    fn execute(&self, app: &mut App) -> Option<AppAction> {
+        app.open_models_dialog();
+        Some(AppAction::ListModels)
     }
 }
 

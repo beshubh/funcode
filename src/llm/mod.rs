@@ -42,6 +42,20 @@ pub(crate) enum LlmError {
     Internal(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelInfo {
+    pub(crate) id: String,
+    pub(crate) display_name: String,
+    pub(crate) description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderModels {
+    pub(crate) provider: String,
+    pub(crate) source: String,
+    pub(crate) models: Vec<ModelInfo>,
+}
+
 impl fmt::Display for LlmError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -98,6 +112,14 @@ pub(crate) trait Provider: Send + Sync {
         &self,
         request: ProviderRequest,
     ) -> BoxFuture<'static, Result<ProviderStream, LlmError>>;
+
+    fn list_models(&self) -> BoxFuture<'static, Result<ProviderModels, LlmError>> {
+        Box::pin(async {
+            Err(LlmError::Configuration(
+                "this provider does not expose a model catalog".into(),
+            ))
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -171,6 +193,13 @@ impl LlmClient {
             .map_err(|_| LlmError::Internal("the LLM conversation is unavailable".into()))? =
             commit.history;
         Ok(())
+    }
+
+    pub(crate) async fn list_models(&self) -> Result<Vec<ProviderModels>, LlmError> {
+        self.provider
+            .list_models()
+            .await
+            .map(|catalog| vec![catalog])
     }
 }
 

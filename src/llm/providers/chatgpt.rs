@@ -1,5 +1,6 @@
 use super::super::{
-    ConversationMessage, LlmError, Provider, ProviderEvent, ProviderRequest, ProviderStream,
+    ConversationMessage, LlmError, ModelInfo, Provider, ProviderEvent, ProviderModels,
+    ProviderRequest, ProviderStream,
 };
 use crate::auth::AuthStore;
 use futures::{Stream, StreamExt, future, future::BoxFuture};
@@ -13,6 +14,46 @@ use rig_core::{
 
 const SYSTEM_INSTRUCTIONS: &str =
     "You are Funcode, a helpful and fun coding assistant. Give clear, accurate, practical answers.";
+const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+// The backend uses this as a model-catalog schema capability version. Funcode's package is still
+// 0.x, which the backend treats as predating picker-visible catalog entries.
+const MODEL_CATALOG_CLIENT_VERSION: &str = "1.0.0";
+
+#[derive(serde::Deserialize)]
+struct ModelsResponse {
+    models: Vec<ChatGptModel>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatGptModel {
+    slug: String,
+    display_name: String,
+    description: Option<String>,
+    visibility: String,
+}
+
+fn parse_models(body: &[u8]) -> Result<ProviderModels, LlmError> {
+    let response: ModelsResponse = serde_json::from_slice(body).map_err(|error| {
+        LlmError::Provider(format!(
+            "ChatGPT returned an invalid model catalog: {error}"
+        ))
+    })?;
+    let models = response
+        .models
+        .into_iter()
+        .filter(|model| model.visibility == "list")
+        .map(|model| ModelInfo {
+            id: model.slug,
+            display_name: model.display_name,
+            description: model.description,
+        })
+        .collect();
+    Ok(ProviderModels {
+        provider: "ChatGPT".into(),
+        source: "live provider API".into(),
+        models,
+    })
+}
 
 pub(in crate::llm) struct ChatGptProvider {
     model: String,
@@ -75,6 +116,57 @@ impl Provider for ChatGptProvider {
                 ConversationAssembler::new(history, prompt),
             ))
         })
+    }
+
+    fn list_models(&self) -> BoxFuture<'static, Result<ProviderModels, LlmError>> {
+        let auth_store = self.auth_store.clone();
+        Box::pin(async move {
+            let credentials = auth_store.valid_credentials().await.map_err(auth_error)?;
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(|error| {
+                    LlmError::Configuration(format!(
+                        "could not configure ChatGPT model discovery: {error}"
+                    ))
+                })?;
+            let mut request = http
+                .get(MODELS_URL)
+                .query(&[("client_version", MODEL_CATALOG_CLIENT_VERSION)])
+                .bearer_auth(credentials.access_token)
+                .header("originator", "funcode")
+                .header(
+                    "user-agent",
+                    format!("funcode/{}", env!("CARGO_PKG_VERSION")),
+                );
+            if let Some(account_id) = credentials.account_id {
+                request = request.header("ChatGPT-Account-Id", account_id);
+            }
+            let response = request.send().await.map_err(|error| {
+                LlmError::Provider(format!("could not list ChatGPT models: {error}"))
+            })?;
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(LlmError::AuthenticationRequired);
+            }
+            if !status.is_success() {
+                return Err(LlmError::Provider(format!(
+                    "could not list ChatGPT models: server returned {status}"
+                )));
+            }
+            let body = response.bytes().await.map_err(|error| {
+                LlmError::Provider(format!("could not read the ChatGPT model catalog: {error}"))
+            })?;
+            parse_models(&body)
+        })
+    }
+}
+
+fn auth_error(error: anyhow::Error) -> LlmError {
+    if error.to_string().contains("ChatGPT sign-in required") {
+        LlmError::AuthenticationRequired
+    } else {
+        LlmError::Provider(format!("could not load ChatGPT credentials: {error}"))
     }
 }
 
@@ -181,7 +273,8 @@ fn chatgpt_stream_error(message: String) -> LlmError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatGptStreamEvent, ConversationAssembler, chatgpt_stream_error, rig_history, stream_events,
+        ChatGptStreamEvent, ConversationAssembler, chatgpt_stream_error, parse_models, rig_history,
+        stream_events,
     };
     use crate::llm::{ConversationMessage, LlmError, ProviderEvent};
     use futures::{StreamExt, stream};
@@ -345,5 +438,27 @@ mod tests {
                 ConversationMessage::Assistant(String::new()),
             ]
         ));
+    }
+
+    #[test]
+    fn model_catalog_keeps_only_models_visible_to_users() {
+        let catalog = parse_models(
+            br#"{
+                "models": [
+                    {"slug":"gpt-visible","display_name":"GPT Visible","description":"Recommended","visibility":"list"},
+                    {"slug":"gpt-hidden","display_name":"GPT Hidden","description":null,"visibility":"hide"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(catalog.provider, "ChatGPT");
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].id, "gpt-visible");
+        assert_eq!(catalog.models[0].display_name, "GPT Visible");
+        assert_eq!(
+            catalog.models[0].description.as_deref(),
+            Some("Recommended")
+        );
     }
 }

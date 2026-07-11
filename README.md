@@ -47,11 +47,13 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - Type `@` at the start of a token: insert a highlighted workspace-file reference in place
 - Unmatched `@text` stays plain text
 - Move the mouse over a suggestion to highlight it; click to activate it
+- Drag across terminal text to select and automatically copy it to the clipboard
 - Click a sent message: open a modal and copy its text and attached paths
 - Click a Thinking or tool block: expand its persistent activity summary
 - `/auth`: open the authentication picker
 - `/plan`: enable persistent plan mode for this and later prompts
 - `/build`: return to normal build mode
+- `/models`: list user-visible models from every configured provider
 - `/exit`: quit
 
 Prompts submitted while the runner is busy are shown immediately and processed in FIFO order. Only
@@ -62,3 +64,7 @@ the `Command` trait and are added through `App::register_command`; command actio
 state and optionally return an `AppAction` for the runtime to dispatch. Commands can also insert
 inline mode tokens that affect the submitted request and later prompts. The commands displayed on
 the home screen and command popup both read from this registry, so they stay in sync.
+
+Model discovery runs outside the terminal event loop. Providers use their live model-catalog API
+when one is available; provider adapters can return a built-in catalog when no discovery endpoint
+exists. The current ChatGPT subscription provider reads its live Codex model catalog after sign-in.

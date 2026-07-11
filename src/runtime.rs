@@ -4,6 +4,8 @@ use crate::{
     auth::{AuthEvent, AuthStore, AuthTaskRunner},
     clipboard::{ClipboardEvent, ClipboardTaskRunner},
     llm::{LlmClient, LlmConfig},
+    model_catalog::ModelCatalogTaskRunner,
+    terminal_selection::TerminalSelection,
     theme::Theme,
     ui, workspace,
 };
@@ -21,7 +23,7 @@ use crossterm::{
         supports_keyboard_enhancement,
     },
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, buffer::Buffer, layout::Position};
 use std::{
     io::{Stdout, stdout},
     panic,
@@ -83,21 +85,26 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         LaunchMode::AuthOnly => App::for_auth(),
     };
     let theme = Theme::default();
-    let mut runner = match launch_mode {
+    let (mut runner, mut model_runner) = match launch_mode {
         LaunchMode::Interactive => {
             let config = LlmConfig::from_env().context("failed to load LLM configuration")?;
             let auth_store =
                 AuthStore::standard().context("failed to locate ChatGPT credentials")?;
             let llm = LlmClient::new(config, auth_store).context("failed to configure the LLM")?;
-            Some(AgentTaskRunner::spawn(llm))
+            (
+                Some(AgentTaskRunner::spawn(llm.clone())),
+                Some(ModelCatalogTaskRunner::spawn(llm)),
+            )
         }
-        LaunchMode::AuthOnly => None,
+        LaunchMode::AuthOnly => (None, None),
     };
     let mut auth_runner = AuthTaskRunner::spawn();
     let mut clipboard = ClipboardTaskRunner::spawn();
     let mut next_tick = Instant::now() + TICK_RATE;
     let mut should_quit = false;
     let mut regions = ui::UiRegions::default();
+    let mut selection = TerminalSelection::default();
+    let mut rendered_buffer = Buffer::empty(ratatui::layout::Rect::default());
 
     while !should_quit {
         if let Some(files) = workspace_runner
@@ -114,12 +121,21 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         while let Some(auth_event) = auth_runner.try_event() {
             app.handle_auth_event(auth_event);
         }
+        if let Some(model_runner) = model_runner.as_ref() {
+            while let Some(event) = model_runner.try_event() {
+                app.handle_model_catalog_event(event);
+            }
+        }
         while let Some(clipboard_event) = clipboard.try_event() {
             handle_clipboard_event(&mut app, clipboard_event);
         }
 
         terminal
-            .draw(|frame| regions = ui::render(frame, &app, &theme))
+            .draw(|frame| {
+                regions = ui::render(frame, &app, &theme);
+                selection.highlight(frame.buffer_mut());
+                rendered_buffer = frame.buffer_mut().clone();
+            })
             .context("failed to draw the terminal UI")?;
 
         let timeout = next_tick.saturating_duration_since(Instant::now());
@@ -127,15 +143,37 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
             match event::read().context("failed to read terminal input")? {
                 Event::Key(key) if matches!(key.kind, KeyEventKind::Press) => {
                     if let Some(action) = app.handle_key(key, Instant::now()) {
-                        should_quit =
-                            dispatch(action, &mut app, runner.as_ref(), &auth_runner, &clipboard);
+                        should_quit = dispatch(
+                            action,
+                            &mut app,
+                            runner.as_ref(),
+                            model_runner.as_ref(),
+                            &auth_runner,
+                            &clipboard,
+                        );
                     }
                 }
                 Event::Paste(text) => app.handle_paste(&text),
                 Event::Mouse(mouse) => {
-                    if let Some(action) = handle_mouse_event(&mut app, &regions, mouse) {
-                        should_quit =
-                            dispatch(action, &mut app, runner.as_ref(), &auth_runner, &clipboard);
+                    match handle_selection_mouse_event(&mut selection, &rendered_buffer, mouse) {
+                        Some(SelectionMouseEvent::Copy(text)) => {
+                            if let Err(error) = clipboard.copy(text, "Selection copied") {
+                                app.set_notice(error.to_string());
+                            }
+                        }
+                        Some(SelectionMouseEvent::Click) | None => {
+                            if let Some(action) = handle_mouse_event(&mut app, &regions, mouse) {
+                                should_quit = dispatch(
+                                    action,
+                                    &mut app,
+                                    runner.as_ref(),
+                                    model_runner.as_ref(),
+                                    &auth_runner,
+                                    &clipboard,
+                                );
+                            }
+                        }
+                        Some(SelectionMouseEvent::Consumed) => {}
                     }
                 }
                 _ => {}
@@ -151,9 +189,47 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     if let Some(runner) = runner.as_mut() {
         runner.shutdown();
     }
+    if let Some(model_runner) = model_runner.as_mut() {
+        model_runner.shutdown();
+    }
     auth_runner.shutdown();
     clipboard.shutdown();
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelectionMouseEvent {
+    Consumed,
+    Click,
+    Copy(String),
+}
+
+fn handle_selection_mouse_event(
+    selection: &mut TerminalSelection,
+    buffer: &Buffer,
+    mouse: crossterm::event::MouseEvent,
+) -> Option<SelectionMouseEvent> {
+    let position = Position::new(mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            selection.start(position);
+            Some(SelectionMouseEvent::Consumed)
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            selection.extend(position);
+            Some(SelectionMouseEvent::Consumed)
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            selection.extend(position);
+            let dragged = selection.has_range();
+            Some(match selection.finish(buffer) {
+                Some(text) => SelectionMouseEvent::Copy(text),
+                None if dragged => SelectionMouseEvent::Consumed,
+                None => SelectionMouseEvent::Click,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn handle_mouse_event(
@@ -162,8 +238,7 @@ fn handle_mouse_event(
     mouse: crossterm::event::MouseEvent,
 ) -> Option<AppAction> {
     match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => match regions.target_at(mouse.column, mouse.row)
-        {
+        MouseEventKind::Up(MouseButton::Left) => match regions.target_at(mouse.column, mouse.row) {
             Some(ui::UiTarget::TranscriptEntry(entry_id)) => {
                 app.activate_transcript_entry(entry_id);
                 None
@@ -212,6 +287,7 @@ fn dispatch(
     action: AppAction,
     app: &mut App,
     runner: Option<&AgentTaskRunner>,
+    model_runner: Option<&ModelCatalogTaskRunner>,
     auth_runner: &AuthTaskRunner,
     clipboard: &ClipboardTaskRunner,
 ) -> bool {
@@ -279,8 +355,25 @@ fn dispatch(
             quit
         }
         AppAction::CopyToClipboard { text } => {
-            if let Err(error) = clipboard.copy(text) {
+            if let Err(error) = clipboard.copy(text, "Message copied") {
                 app.set_notice(error.to_string());
+            }
+            false
+        }
+        AppAction::ListModels => {
+            match model_runner {
+                Some(model_runner) => {
+                    if let Err(error) = model_runner.load() {
+                        app.handle_model_catalog_event(
+                            crate::model_catalog::ModelCatalogEvent::Failed(error.to_string()),
+                        );
+                    }
+                }
+                None => {
+                    app.handle_model_catalog_event(crate::model_catalog::ModelCatalogEvent::Failed(
+                        "model discovery is unavailable in authentication-only mode".into(),
+                    ))
+                }
             }
             false
         }
@@ -290,7 +383,7 @@ fn dispatch(
 
 fn handle_clipboard_event(app: &mut App, event: ClipboardEvent) {
     match event {
-        ClipboardEvent::Copied => app.set_notice("Message copied"),
+        ClipboardEvent::Copied(message) => app.set_notice(message),
         ClipboardEvent::Failed(error) => app.set_notice(error),
     }
 }
@@ -377,15 +470,19 @@ fn install_restoring_panic_hook(keyboard_enhancement: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchMode, dispatch, handle_clipboard_event, handle_mouse_event};
+    use super::{
+        LaunchMode, SelectionMouseEvent, dispatch, handle_clipboard_event, handle_mouse_event,
+        handle_selection_mouse_event,
+    };
     use crate::{
         app::{App, AppAction, Screen},
         auth::AuthTaskRunner,
         clipboard::{Clipboard, ClipboardTaskRunner},
+        terminal_selection::TerminalSelection,
         ui::UiRegions,
     };
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    use ratatui::layout::Rect;
+    use ratatui::{buffer::Buffer, layout::Rect, style::Style};
     use std::time::Duration;
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -437,7 +534,7 @@ mod tests {
             handle_mouse_event(
                 &mut app,
                 &regions,
-                mouse(MouseEventKind::Down(MouseButton::Left), 4, 5)
+                mouse(MouseEventKind::Up(MouseButton::Left), 4, 5)
             ),
             Some(AppAction::Quit)
         );
@@ -461,6 +558,38 @@ mod tests {
 
         handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
         assert_eq!(app.selected_suggestion(), 1);
+    }
+
+    #[test]
+    fn releasing_a_mouse_drag_copies_the_selected_screen_text() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        buffer.set_string(0, 0, "copy this", Style::default());
+        let mut selection = TerminalSelection::default();
+
+        assert_eq!(
+            handle_selection_mouse_event(
+                &mut selection,
+                &buffer,
+                mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            ),
+            Some(SelectionMouseEvent::Consumed)
+        );
+        assert_eq!(
+            handle_selection_mouse_event(
+                &mut selection,
+                &buffer,
+                mouse(MouseEventKind::Drag(MouseButton::Left), 3, 0),
+            ),
+            Some(SelectionMouseEvent::Consumed)
+        );
+        assert_eq!(
+            handle_selection_mouse_event(
+                &mut selection,
+                &buffer,
+                mouse(MouseEventKind::Up(MouseButton::Left), 3, 0),
+            ),
+            Some(SelectionMouseEvent::Copy("copy".into()))
+        );
     }
 
     #[test]
@@ -489,6 +618,7 @@ mod tests {
                 text: "copied message".into(),
             },
             &mut app,
+            None,
             None,
             &auth_runner,
             &clipboard,

@@ -23,12 +23,12 @@ impl Clipboard for SystemClipboard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardEvent {
-    Copied,
+    Copied(String),
     Failed(String),
 }
 
 enum ClipboardCommand {
-    Copy(String),
+    Copy { text: String, confirmation: String },
     Shutdown,
 }
 
@@ -54,9 +54,16 @@ impl ClipboardTaskRunner {
         Self::spawn_with_impl(SystemClipboard)
     }
 
-    pub fn copy(&self, text: String) -> Result<(), ClipboardUnavailable> {
+    pub fn copy(
+        &self,
+        text: String,
+        confirmation: impl Into<String>,
+    ) -> Result<(), ClipboardUnavailable> {
         self.commands
-            .send(ClipboardCommand::Copy(text))
+            .send(ClipboardCommand::Copy {
+                text,
+                confirmation: confirmation.into(),
+            })
             .map_err(|_| ClipboardUnavailable)
     }
 
@@ -114,9 +121,9 @@ where
 {
     while let Ok(command) = commands.recv() {
         match command {
-            ClipboardCommand::Copy(text) => {
+            ClipboardCommand::Copy { text, confirmation } => {
                 let event = match clipboard.copy(&text) {
-                    Ok(()) => ClipboardEvent::Copied,
+                    Ok(()) => ClipboardEvent::Copied(confirmation),
                     Err(error) => ClipboardEvent::Failed(error),
                 };
                 if events.send(event).is_err() {
@@ -149,11 +156,11 @@ mod tests {
     fn copying_is_performed_by_a_background_runner() {
         let mut runner = ClipboardTaskRunner::spawn_with(RecordingClipboard::default());
 
-        runner.copy("message".into()).unwrap();
+        runner.copy("message".into(), "Selection copied").unwrap();
 
         assert_eq!(
             runner.recv_timeout(Duration::from_secs(1)).unwrap(),
-            ClipboardEvent::Copied
+            ClipboardEvent::Copied("Selection copied".into())
         );
         runner.shutdown();
     }

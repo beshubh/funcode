@@ -3,6 +3,8 @@ use crate::{
     auth::AuthEvent,
     commands::{Command, CommandBehavior, CommandRegistry},
     composer::{ComposerDocument, SessionMode},
+    llm::ProviderModels,
+    model_catalog::ModelCatalogEvent,
     transcript::{Attachment, EntryId, EntryKind, Transcript, TranscriptEvent},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -61,6 +63,13 @@ pub struct AuthDialog {
     pub selected: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelsDialogPhase {
+    Loading,
+    Loaded(Vec<ProviderModels>),
+    Failed(String),
+}
+
 impl Default for AuthDialog {
     fn default() -> Self {
         Self {
@@ -90,6 +99,7 @@ pub enum AppAction {
     CopyToClipboard {
         text: String,
     },
+    ListModels,
     Quit,
 }
 
@@ -122,6 +132,7 @@ pub struct App {
     pub message_dialog: Option<EntryId>,
     pub notice: Option<String>,
     pub auth_dialog: Option<AuthDialog>,
+    pub(crate) models_dialog: Option<ModelsDialogPhase>,
     commands: CommandRegistry,
     workspace_files: Vec<String>,
     suggestion_selected: usize,
@@ -177,6 +188,10 @@ impl App {
 
         if self.message_dialog.is_some() {
             return self.handle_message_dialog_key(key);
+        }
+
+        if self.models_dialog.is_some() {
+            return self.handle_models_dialog_key(key);
         }
 
         if self.screen == Screen::Home {
@@ -608,6 +623,21 @@ impl App {
         self.notice = Some(notice.into());
     }
 
+    pub(crate) fn open_models_dialog(&mut self) {
+        self.models_dialog = Some(ModelsDialogPhase::Loading);
+        self.last_escape = None;
+    }
+
+    pub(crate) fn handle_model_catalog_event(&mut self, event: ModelCatalogEvent) {
+        if self.models_dialog.is_none() {
+            return;
+        }
+        self.models_dialog = Some(match event {
+            ModelCatalogEvent::Loaded(catalogs) => ModelsDialogPhase::Loaded(catalogs),
+            ModelCatalogEvent::Failed(message) => ModelsDialogPhase::Failed(message),
+        });
+    }
+
     pub fn open_auth_dialog(&mut self) {
         self.auth_dialog = Some(AuthDialog::default());
         self.last_escape = None;
@@ -708,6 +738,13 @@ impl App {
             KeyCode::Enter | KeyCode::Char('c') => self.copy_message_dialog(),
             _ => None,
         }
+    }
+
+    fn handle_models_dialog_key(&mut self, key: KeyEvent) -> Option<AppAction> {
+        if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
+            self.models_dialog = None;
+        }
+        None
     }
 
     fn handle_escape(&mut self, now: Instant) -> Option<AppAction> {
@@ -815,6 +852,22 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
         assert!(app.auth_dialog.is_some());
         assert!(app.composer.text().is_empty());
+    }
+
+    #[test]
+    fn models_command_starts_provider_catalog_loading() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("/models");
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::ListModels)
+        );
+        assert!(matches!(
+            app.models_dialog,
+            Some(super::ModelsDialogPhase::Loading)
+        ));
     }
 
     #[test]
