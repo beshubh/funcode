@@ -217,6 +217,8 @@ mod tests {
         time::Duration,
     };
 
+    static NEXT_CACHE_ID: AtomicUsize = AtomicUsize::new(0);
+
     struct CatalogProvider;
 
     impl Provider for CatalogProvider {
@@ -287,10 +289,7 @@ mod tests {
         std::env::temp_dir().join(format!(
             "funcode-model-cache-{}-{}.json",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed)
         ))
     }
 
