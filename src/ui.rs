@@ -149,9 +149,6 @@ fn render_models_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
                         Span::styled(format!("  • {}", model.display_name), theme.status),
                         Span::styled(format!("  {}", model.id), theme.muted),
                     ]));
-                    if let Some(description) = &model.description {
-                        lines.push(Line::styled(format!("    {description}"), theme.muted));
-                    }
                 }
             }
             lines.push(Line::from(""));
@@ -162,10 +159,9 @@ fn render_models_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
     if lines.is_empty() {
         lines.push(Line::styled("No providers configured", theme.muted));
     }
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
-        inner,
-    );
+    let max_scroll = lines.len().saturating_sub(inner.height as usize);
+    let scroll = app.models_scroll().min(max_scroll).min(u16::MAX as usize) as u16;
+    frame.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll, 0)), inner);
 }
 
 fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Vec<Rect> {
@@ -800,7 +796,6 @@ mod tests {
             models: vec![ModelInfo {
                 id: "gpt-test".into(),
                 display_name: "GPT Test".into(),
-                description: Some("A model for tests".into()),
             }],
         }]));
 
@@ -811,6 +806,31 @@ mod tests {
         assert!(screen.contains("live provider API"));
         assert!(screen.contains("GPT Test"));
         assert!(screen.contains("gpt-test"));
+    }
+
+    #[test]
+    fn long_model_catalogs_can_scroll_to_the_last_model() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.models_dialog = Some(ModelsDialogPhase::Loaded(vec![ProviderModels {
+            provider: "ChatGPT".into(),
+            source: "live provider API".into(),
+            models: (0..30)
+                .map(|index| ModelInfo {
+                    id: format!("model-{index}"),
+                    display_name: format!("Model {index}"),
+                })
+                .collect(),
+        }]));
+
+        let (first_screen, _, _, _) = render_to_string(&app, 100, 30);
+        assert!(!first_screen.contains("model-29"));
+
+        for _ in 0..40 {
+            app.scroll_models_down();
+        }
+        let (last_screen, _, _, _) = render_to_string(&app, 100, 30);
+        assert!(last_screen.contains("model-29"));
     }
 
     #[test]

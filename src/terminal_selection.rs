@@ -1,34 +1,34 @@
 use ratatui::{buffer::Buffer, layout::Position, style::Modifier};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TerminalSelection {
+pub(crate) struct TerminalSelection {
     anchor: Option<Position>,
     focus: Option<Position>,
 }
 
 impl TerminalSelection {
-    pub fn start(&mut self, position: Position) {
+    pub(crate) fn start(&mut self, position: Position) {
         self.anchor = Some(position);
         self.focus = Some(position);
     }
 
-    pub fn extend(&mut self, position: Position) {
+    pub(crate) fn extend(&mut self, position: Position) {
         if self.anchor.is_some() {
             self.focus = Some(position);
         }
     }
 
-    pub fn finish(&mut self, buffer: &Buffer) -> Option<String> {
+    pub(crate) fn finish(&mut self, buffer: &Buffer) -> Option<String> {
         let text = self.text(buffer);
         *self = Self::default();
         text
     }
 
-    pub fn has_range(&self) -> bool {
+    pub(crate) fn has_range(&self) -> bool {
         matches!((self.anchor, self.focus), (Some(anchor), Some(focus)) if anchor != focus)
     }
 
-    pub fn text(&self, buffer: &Buffer) -> Option<String> {
+    pub(crate) fn text(&self, buffer: &Buffer) -> Option<String> {
         let (start, end) = self.ordered_bounds()?;
         if start == end || !buffer.area.contains(start) || !buffer.area.contains(end) {
             return None;
@@ -58,7 +58,7 @@ impl TerminalSelection {
         (!text.is_empty()).then_some(text)
     }
 
-    pub fn highlight(&self, buffer: &mut Buffer) {
+    pub(crate) fn highlight(&self, buffer: &mut Buffer) {
         let Some((start, end)) = self.ordered_bounds() else {
             return;
         };

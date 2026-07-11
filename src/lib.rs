@@ -6,7 +6,7 @@ pub mod commands;
 pub mod composer;
 pub(crate) mod llm;
 pub(crate) mod model_catalog;
-pub mod terminal_selection;
+pub(crate) mod terminal_selection;
 pub mod theme;
 pub mod tools;
 pub mod transcript;

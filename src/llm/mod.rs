@@ -46,7 +46,6 @@ pub(crate) enum LlmError {
 pub(crate) struct ModelInfo {
     pub(crate) id: String,
     pub(crate) display_name: String,
-    pub(crate) description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

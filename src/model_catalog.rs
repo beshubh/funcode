@@ -123,10 +123,24 @@ mod tests {
                     models: vec![ModelInfo {
                         id: "test-model".into(),
                         display_name: "Test Model".into(),
-                        description: None,
                     }],
                 })
             })
+        }
+    }
+
+    struct FailingCatalogProvider;
+
+    impl Provider for FailingCatalogProvider {
+        fn stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+            Box::pin(async { Err(LlmError::Internal("not used".into())) })
+        }
+
+        fn list_models(&self) -> BoxFuture<'static, Result<ProviderModels, LlmError>> {
+            Box::pin(async { Err(LlmError::Provider("catalog unavailable".into())) })
         }
     }
 
@@ -142,6 +156,20 @@ mod tests {
             ModelCatalogEvent::Loaded(catalogs)
                 if catalogs[0].models[0].id == "test-model"
         ));
+        runner.shutdown();
+    }
+
+    #[test]
+    fn provider_failure_is_returned_to_the_terminal_thread() {
+        let client = LlmClient::with_provider(Arc::new(FailingCatalogProvider));
+        let mut runner = ModelCatalogTaskRunner::spawn(client);
+
+        runner.load().unwrap();
+
+        assert_eq!(
+            runner.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ModelCatalogEvent::Failed("catalog unavailable".into())
+        );
         runner.shutdown();
     }
 }

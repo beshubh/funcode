@@ -262,6 +262,8 @@ fn handle_mouse_event(
         MouseEventKind::ScrollUp => {
             if app.auth_dialog.is_some() {
                 app.move_auth_selection(-1);
+            } else if app.models_dialog.is_some() {
+                app.scroll_models_up();
             } else if !app.suggestions().is_empty() {
                 app.move_suggestion_selection(-1);
             } else if app.message_dialog.is_none() {
@@ -272,6 +274,8 @@ fn handle_mouse_event(
         MouseEventKind::ScrollDown => {
             if app.auth_dialog.is_some() {
                 app.move_auth_selection(1);
+            } else if app.models_dialog.is_some() {
+                app.scroll_models_down();
             } else if !app.suggestions().is_empty() {
                 app.move_suggestion_selection(1);
             } else if app.message_dialog.is_none() {
@@ -605,6 +609,19 @@ mod tests {
         handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
         assert_eq!(app.scroll_from_bottom, 0);
         assert!(app.follow_output);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_models_dialog_instead_of_the_hidden_transcript() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.open_models_dialog();
+        let regions = UiRegions::default();
+
+        handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
+
+        assert_eq!(app.models_scroll(), 1);
+        assert_eq!(app.scroll_from_bottom, 0);
     }
 
     #[test]

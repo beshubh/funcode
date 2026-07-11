@@ -28,7 +28,6 @@ struct ModelsResponse {
 struct ChatGptModel {
     slug: String,
     display_name: String,
-    description: Option<String>,
     visibility: String,
 }
 
@@ -45,7 +44,6 @@ fn parse_models(body: &[u8]) -> Result<ProviderModels, LlmError> {
         .map(|model| ModelInfo {
             id: model.slug,
             display_name: model.display_name,
-            description: model.description,
         })
         .collect();
     Ok(ProviderModels {
@@ -456,9 +454,5 @@ mod tests {
         assert_eq!(catalog.models.len(), 1);
         assert_eq!(catalog.models[0].id, "gpt-visible");
         assert_eq!(catalog.models[0].display_name, "GPT Visible");
-        assert_eq!(
-            catalog.models[0].description.as_deref(),
-            Some("Recommended")
-        );
     }
 }

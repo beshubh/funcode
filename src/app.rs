@@ -136,6 +136,7 @@ pub struct App {
     commands: CommandRegistry,
     workspace_files: Vec<String>,
     suggestion_selected: usize,
+    models_scroll: usize,
     next_request_id: RequestId,
     last_escape: Option<Instant>,
     cancellation_requested: bool,
@@ -625,7 +626,20 @@ impl App {
 
     pub(crate) fn open_models_dialog(&mut self) {
         self.models_dialog = Some(ModelsDialogPhase::Loading);
+        self.models_scroll = 0;
         self.last_escape = None;
+    }
+
+    pub(crate) fn models_scroll(&self) -> usize {
+        self.models_scroll
+    }
+
+    pub(crate) fn scroll_models_up(&mut self) {
+        self.models_scroll = self.models_scroll.saturating_sub(1);
+    }
+
+    pub(crate) fn scroll_models_down(&mut self) {
+        self.models_scroll = self.models_scroll.saturating_add(1);
     }
 
     pub(crate) fn handle_model_catalog_event(&mut self, event: ModelCatalogEvent) {
@@ -741,8 +755,21 @@ impl App {
     }
 
     fn handle_models_dialog_key(&mut self, key: KeyEvent) -> Option<AppAction> {
-        if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
-            self.models_dialog = None;
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => self.models_dialog = None,
+            KeyCode::Up => self.scroll_models_up(),
+            KeyCode::Down => self.scroll_models_down(),
+            KeyCode::PageUp => {
+                for _ in 0..5 {
+                    self.scroll_models_up();
+                }
+            }
+            KeyCode::PageDown => {
+                for _ in 0..5 {
+                    self.scroll_models_down();
+                }
+            }
+            _ => {}
         }
         None
     }
@@ -868,6 +895,33 @@ mod tests {
             app.models_dialog,
             Some(super::ModelsDialogPhase::Loading)
         ));
+    }
+
+    #[test]
+    fn model_catalog_failure_is_shown_in_the_open_dialog() {
+        let mut app = App::new();
+        app.open_models_dialog();
+
+        app.handle_model_catalog_event(crate::model_catalog::ModelCatalogEvent::Failed(
+            "catalog unavailable".into(),
+        ));
+
+        assert!(matches!(
+            app.models_dialog,
+            Some(super::ModelsDialogPhase::Failed(ref message))
+                if message == "catalog unavailable"
+        ));
+    }
+
+    #[test]
+    fn closing_models_dialog_ignores_a_late_catalog_result() {
+        let mut app = App::new();
+        app.open_models_dialog();
+        app.handle_key(key(KeyCode::Esc), Instant::now());
+
+        app.handle_model_catalog_event(crate::model_catalog::ModelCatalogEvent::Loaded(Vec::new()));
+
+        assert!(app.models_dialog.is_none());
     }
 
     #[test]
