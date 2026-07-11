@@ -6,7 +6,7 @@ use crate::{
     llm::ProviderModels,
     model_catalog::ModelCatalogEvent,
     theme::ThemeId,
-    transcript::{Attachment, EntryId, EntryKind, Transcript, TranscriptEvent},
+    transcript::{Attachment, EntryId, EntryKind, ToolArtifact, Transcript, TranscriptEvent},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::{Duration, Instant};
@@ -142,6 +142,7 @@ pub struct App {
     pub scroll_from_bottom: usize,
     pub follow_output: bool,
     pub expanded_entries: Vec<EntryId>,
+    pub collapsed_entries: Vec<EntryId>,
     pub message_dialog: Option<EntryId>,
     pub notice: Option<String>,
     pub auth_dialog: Option<AuthDialog>,
@@ -635,19 +636,47 @@ impl App {
     }
 
     pub fn toggle_entry(&mut self, entry_id: EntryId) {
-        if let Some(index) = self
-            .expanded_entries
-            .iter()
-            .position(|expanded| *expanded == entry_id)
-        {
-            self.expanded_entries.remove(index);
+        let default_expanded = self.entry_is_expanded_by_default(entry_id);
+        if self.entry_is_expanded(entry_id) {
+            self.expanded_entries
+                .retain(|expanded| *expanded != entry_id);
+            if default_expanded && !self.collapsed_entries.contains(&entry_id) {
+                self.collapsed_entries.push(entry_id);
+            }
         } else {
-            self.expanded_entries.push(entry_id);
+            self.collapsed_entries
+                .retain(|collapsed| *collapsed != entry_id);
+            if !default_expanded && !self.expanded_entries.contains(&entry_id) {
+                self.expanded_entries.push(entry_id);
+            }
         }
     }
 
     pub fn entry_is_expanded(&self, entry_id: EntryId) -> bool {
-        self.expanded_entries.contains(&entry_id)
+        if self.collapsed_entries.contains(&entry_id) {
+            false
+        } else {
+            self.expanded_entries.contains(&entry_id) || self.entry_is_expanded_by_default(entry_id)
+        }
+    }
+
+    fn entry_is_expanded_by_default(&self, entry_id: EntryId) -> bool {
+        self.transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .is_some_and(|entry| match &entry.kind {
+                EntryKind::Tool(tool) => {
+                    tool.name == "terminal"
+                        || tool.artifacts.iter().any(|artifact| {
+                            matches!(
+                                artifact,
+                                ToolArtifact::Patch { .. } | ToolArtifact::Terminal { .. }
+                            )
+                        })
+                }
+                _ => false,
+            })
     }
 
     pub fn open_message_dialog(&mut self, entry_id: EntryId) {
@@ -1518,7 +1547,7 @@ mod tests {
         app.handle_agent_event(AgentEvent::Completed { request_id: 1 });
 
         assert!(matches!(
-            &app.transcript.entries()[1].kind,
+            &app.transcript.entries()[2].kind,
             EntryKind::Assistant(message)
                 if message.text == "streamed" && message.status == AssistantStatus::Completed
         ));
@@ -1609,7 +1638,7 @@ mod tests {
         });
 
         assert!(matches!(
-            &app.transcript.entries()[1].kind,
+            &app.transcript.entries()[2].kind,
             EntryKind::Assistant(message)
                 if message.text.is_empty() && message.status == AssistantStatus::Completed
         ));
@@ -1625,7 +1654,7 @@ mod tests {
 
         assert!(app.active_request.is_none());
         assert!(matches!(
-            &app.transcript.entries()[1].kind,
+            &app.transcript.entries()[2].kind,
             EntryKind::Assistant(message) if message.status == AssistantStatus::Completed
         ));
     }
@@ -1674,7 +1703,7 @@ mod tests {
             artifacts: Vec::new(),
         });
 
-        let tool_id = app.transcript.entries()[3].id;
+        let tool_id = app.transcript.entries()[2].id;
         app.activate_transcript_entry(tool_id);
         assert!(app.entry_is_expanded(tool_id));
 
@@ -1685,9 +1714,67 @@ mod tests {
             artifacts: vec![ToolArtifact::FileReference("Cargo.toml".into())],
         });
         assert!(matches!(
-            &app.transcript.entries()[3].kind,
+            &app.transcript.entries()[2].kind,
             EntryKind::Tool(tool) if tool.artifacts.len() == 1
         ));
+    }
+
+    #[test]
+    fn terminal_and_diff_tools_are_expanded_by_default_but_other_tools_are_not() {
+        let mut app = App::new();
+        app.transcript
+            .submit(14, "change and verify".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 14 });
+
+        for (call_id, name) in [(1, "read_file"), (2, "edit_file"), (3, "terminal")] {
+            app.handle_agent_event(AgentEvent::ToolStarted {
+                request_id: 14,
+                call_id,
+                name: name.into(),
+                summary: name.into(),
+                artifacts: Vec::new(),
+            });
+        }
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            request_id: 14,
+            call_id: 1,
+            summary: None,
+            artifacts: vec![ToolArtifact::FileReference("src/app.rs".into())],
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            request_id: 14,
+            call_id: 2,
+            summary: None,
+            artifacts: vec![ToolArtifact::Patch {
+                path: "src/app.rs".into(),
+                diff: "-old\n+new".into(),
+            }],
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            request_id: 14,
+            call_id: 3,
+            summary: None,
+            artifacts: vec![ToolArtifact::Terminal {
+                description: "Run tests".into(),
+                command: "cargo test".into(),
+                output: "ok".into(),
+                exit_code: Some(0),
+            }],
+        });
+
+        let tool_ids = app
+            .transcript
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.kind, EntryKind::Tool(_)))
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert!(!app.entry_is_expanded(tool_ids[0]));
+        assert!(app.entry_is_expanded(tool_ids[1]));
+        assert!(app.entry_is_expanded(tool_ids[2]));
+
+        app.activate_transcript_entry(tool_ids[1]);
+        assert!(!app.entry_is_expanded(tool_ids[1]));
     }
 
     #[test]

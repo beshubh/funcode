@@ -1504,8 +1504,6 @@ mod tests {
             chunk: "test result: ok".into(),
         });
 
-        let tool_id = app.transcript.entries()[3].id;
-        app.activate_transcript_entry(tool_id);
         let (live, _, _, _) = render_to_string(&app, 100, 30);
         assert!(live.contains("$ cargo test"));
         assert!(live.contains("test result: ok"));
@@ -1553,8 +1551,6 @@ mod tests {
                 diff: "--- value.txt\n+++ value.txt\n-old\n+new".into(),
             }],
         });
-        let edit_id = app.transcript.entries()[3].id;
-        app.activate_transcript_entry(edit_id);
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = Theme::default();
@@ -1590,7 +1586,7 @@ mod tests {
                 matches: "src/main.rs:1:marker".into(),
             }],
         });
-        let search_id = app.transcript.entries()[4].id;
+        let search_id = app.transcript.entries()[3].id;
         app.activate_transcript_entry(search_id);
         let (screen, _, _, _) = render_to_string(&app, 100, 30);
         assert!(screen.contains("Search /marker/"));
@@ -1621,7 +1617,7 @@ mod tests {
                     .join("\n"),
             )],
         });
-        let tool_id = app.transcript.entries()[3].id;
+        let tool_id = app.transcript.entries()[2].id;
         app.activate_transcript_entry(tool_id);
         let (bottom, _, _, _) = render_to_string(&app, 60, 20);
 

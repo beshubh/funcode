@@ -241,7 +241,7 @@ impl Transcript {
                 artifacts,
             } => {
                 if self.is_active(turn_id) && self.tool_mut(turn_id, call_id).is_none() {
-                    self.push(
+                    self.insert_activity(
                         turn_id,
                         EntryKind::Tool(ToolCall {
                             call_id,
@@ -340,6 +340,19 @@ impl Transcript {
         self.entries.push(Entry { id, turn_id, kind });
     }
 
+    fn insert_activity(&mut self, turn_id: TurnId, kind: EntryKind) {
+        let id = self.next_entry_id;
+        self.next_entry_id = self.next_entry_id.wrapping_add(1);
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.turn_id == turn_id && matches!(entry.kind, EntryKind::Assistant(_))
+            })
+            .unwrap_or(self.entries.len());
+        self.entries.insert(index, Entry { id, turn_id, kind });
+    }
+
     fn assistant_mut(&mut self, turn_id: TurnId) -> Option<&mut AssistantMessage> {
         self.entries.iter_mut().find_map(|entry| {
             (entry.turn_id == turn_id).then_some(match &mut entry.kind {
@@ -360,7 +373,7 @@ impl Transcript {
 
     fn ensure_reasoning(&mut self, turn_id: TurnId) -> &mut Reasoning {
         if self.reasoning_mut(turn_id).is_none() {
-            self.push(
+            self.insert_activity(
                 turn_id,
                 EntryKind::Reasoning(Reasoning {
                     summary: String::new(),
@@ -491,21 +504,84 @@ mod tests {
         transcript.apply(TranscriptEvent::Completed { turn_id: 4 });
 
         assert!(matches!(
-            &transcript.entries()[2].kind,
+            &transcript.entries()[1].kind,
             EntryKind::Reasoning(reasoning)
                 if reasoning.summary == "Finding the relevant file."
                     && reasoning.status == ActivityStatus::Completed
         ));
         assert!(matches!(
-            &transcript.entries()[3].kind,
+            &transcript.entries()[2].kind,
             EntryKind::Tool(tool)
                 if tool.status == ActivityStatus::Completed && tool.artifacts.len() == 1
         ));
         assert!(matches!(
-            &transcript.entries()[1].kind,
+            &transcript.entries()[3].kind,
             EntryKind::Assistant(message)
                 if message.text == "Done" && message.status == AssistantStatus::Completed
         ));
+    }
+
+    #[test]
+    fn assistant_response_follows_all_activity_for_its_turn() {
+        let mut transcript = Transcript::default();
+        transcript.submit(4, "inspect it".into(), Vec::new());
+        transcript.apply(TranscriptEvent::Started { turn_id: 4 });
+        transcript.apply(TranscriptEvent::TextDelta {
+            turn_id: 4,
+            text: "I will inspect it. ".into(),
+        });
+        transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 4,
+            call_id: 9,
+            name: "read_file".into(),
+            summary: "Reading src/app.rs".into(),
+            artifacts: Vec::new(),
+        });
+        transcript.apply(TranscriptEvent::TextDelta {
+            turn_id: 4,
+            text: "Done".into(),
+        });
+        transcript.apply(TranscriptEvent::Completed { turn_id: 4 });
+
+        assert!(matches!(transcript.entries()[0].kind, EntryKind::User(_)));
+        assert!(matches!(
+            transcript.entries()[1].kind,
+            EntryKind::Reasoning(_)
+        ));
+        assert!(matches!(transcript.entries()[2].kind, EntryKind::Tool(_)));
+        assert!(matches!(
+            &transcript.entries()[3].kind,
+            EntryKind::Assistant(message) if message.text == "I will inspect it. Done"
+        ));
+    }
+
+    #[test]
+    fn activity_stays_inside_its_turn_when_a_later_turn_is_queued() {
+        let mut transcript = Transcript::default();
+        transcript.submit(1, "first".into(), Vec::new());
+        transcript.submit(2, "second".into(), Vec::new());
+        transcript.apply(TranscriptEvent::Started { turn_id: 1 });
+        transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 7,
+            name: "read_file".into(),
+            summary: "Reading".into(),
+            artifacts: Vec::new(),
+        });
+
+        assert_eq!(
+            transcript
+                .entries()
+                .iter()
+                .map(|entry| entry.turn_id)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1, 1, 2, 2]
+        );
+        assert!(matches!(
+            transcript.entries()[3].kind,
+            EntryKind::Assistant(_)
+        ));
+        assert!(matches!(transcript.entries()[4].kind, EntryKind::User(_)));
     }
 
     #[test]
@@ -532,7 +608,7 @@ mod tests {
         });
 
         assert!(matches!(
-            &transcript.entries()[3].kind,
+            &transcript.entries()[2].kind,
             EntryKind::Tool(tool)
                 if matches!(
                     tool.artifacts.first(),
@@ -547,7 +623,7 @@ mod tests {
             chunk: "late".into(),
         });
         assert!(matches!(
-            &transcript.entries()[3].kind,
+            &transcript.entries()[2].kind,
             EntryKind::Tool(tool)
                 if matches!(
                     tool.artifacts.first(),
@@ -576,7 +652,7 @@ mod tests {
 
         assert_eq!(transcript.entries().len(), 3);
         assert!(matches!(
-            &transcript.entries()[1].kind,
+            &transcript.entries()[2].kind,
             EntryKind::Assistant(message)
                 if message.text.is_empty() && message.status == AssistantStatus::Completed
         ));
