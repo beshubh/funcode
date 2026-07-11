@@ -336,6 +336,33 @@ mod tests {
     }
 
     #[test]
+    fn cache_write_failure_is_returned_to_the_terminal_thread() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = LlmClient::with_provider(Arc::new(CountingCatalogProvider {
+            calls: Arc::clone(&calls),
+        }));
+        let blocked_parent = cache_path();
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+        let cache_path = blocked_parent.join("models.json");
+        let mut runner = ModelCatalogTaskRunner::spawn_with_cache(
+            client,
+            cache_path,
+            Duration::from_secs(24 * 60 * 60),
+        );
+
+        runner.load().unwrap();
+
+        assert!(matches!(
+            runner.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ModelCatalogEvent::Failed(message)
+                if message.contains("could not save the model catalog")
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        runner.shutdown();
+        let _ = std::fs::remove_file(blocked_parent);
+    }
+
+    #[test]
     fn fresh_cache_avoids_a_second_provider_request() {
         let calls = Arc::new(AtomicUsize::new(0));
         let client = LlmClient::with_provider(Arc::new(CountingCatalogProvider {
