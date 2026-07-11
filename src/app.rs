@@ -159,6 +159,7 @@ pub struct App {
     suggestion_selected: usize,
     models_selected: usize,
     current_model: String,
+    composer_width: u16,
     next_request_id: RequestId,
     last_escape: Option<Instant>,
     cancellation_requested: bool,
@@ -169,6 +170,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             follow_output: true,
+            composer_width: u16::MAX,
             next_request_id: 1,
             commands: CommandRegistry::with_builtins(),
             ..Self::default()
@@ -364,11 +366,11 @@ impl App {
                 None
             }
             KeyCode::Up => {
-                self.composer.move_up();
+                self.composer.move_up(self.composer_width);
                 None
             }
             KeyCode::Down => {
-                self.composer.move_down();
+                self.composer.move_down(self.composer_width);
                 None
             }
             KeyCode::Home => {
@@ -430,6 +432,10 @@ impl App {
 
     pub fn effective_mode(&self) -> SessionMode {
         self.session_mode
+    }
+
+    pub(crate) fn set_composer_width(&mut self, width: u16) {
+        self.composer_width = width.max(1);
     }
 
     pub fn select_mode(&mut self, mode: SessionMode) {
@@ -1762,6 +1768,22 @@ mod tests {
         app.handle_key(key(KeyCode::Backspace), Instant::now());
 
         assert_eq!(app.composer.text(), "ab");
+    }
+
+    #[test]
+    fn up_and_down_follow_soft_wrapped_visual_rows() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.set_composer_width(10);
+        app.composer.insert_text("abcdefghij-END");
+
+        app.handle_key(key(KeyCode::Up), Instant::now());
+        app.handle_key(key(KeyCode::Char('X')), Instant::now());
+        assert_eq!(app.composer.text(), "abcdXefghij-END");
+
+        app.handle_key(key(KeyCode::Down), Instant::now());
+        app.handle_key(key(KeyCode::Char('Y')), Instant::now());
+        assert_eq!(app.composer.text(), "abcdXefghij-ENDY");
     }
 
     #[test]

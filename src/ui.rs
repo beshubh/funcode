@@ -2,7 +2,7 @@ pub mod transcript;
 
 use crate::{
     app::{App, AuthProvider, ModelsDialogPhase, Screen, Suggestion, SuggestionKind},
-    composer::SessionMode,
+    composer::{SessionMode, layout_composer},
     theme::{Theme, ThemeId, ThemeRole},
     transcript::EntryId,
 };
@@ -28,7 +28,6 @@ pub enum UiTarget {
     AuthProvider(usize),
     Suggestion(usize),
     MessageCopy,
-    Mode(SessionMode),
     Theme(usize),
     Model(usize),
     ModelRefresh,
@@ -46,7 +45,7 @@ pub struct UiRegions {
     pub auth_providers: Vec<Rect>,
     pub suggestions: Vec<Rect>,
     pub message_copy: Option<Rect>,
-    pub mode_tabs: Vec<Rect>,
+    pub composer_input: Option<Rect>,
     pub theme_options: Vec<Rect>,
     pub models: Vec<ModelRegion>,
     pub model_refresh: Option<Rect>,
@@ -92,17 +91,6 @@ impl UiRegions {
             .find(|(_, area)| area.contains(position))
         {
             Some(UiTarget::Theme(index))
-        } else if let Some((index, _)) = self
-            .mode_tabs
-            .iter()
-            .enumerate()
-            .find(|(_, area)| area.contains(position))
-        {
-            Some(UiTarget::Mode(if index == 0 {
-                SessionMode::Plan
-            } else {
-                SessionMode::Build
-            }))
         } else {
             self.transcript_entries
                 .iter()
@@ -673,11 +661,13 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme)
 fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> UiRegions {
     let inner = area.inner(Margin::new(1, 1));
     let suggestions = app.suggestions();
-    let composer_height = composer_height(app, inner.width);
+    let activity_height = u16::from(!activity_text(app).is_empty());
+    let composer_height =
+        composer_height(app, inner.width).min(inner.height.saturating_sub(activity_height));
 
     let rows = Layout::vertical([
-        Constraint::Min(5),
-        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(activity_height),
         Constraint::Length(composer_height),
     ])
     .split(inner);
@@ -697,7 +687,7 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
         suggestion_height,
     );
     regions.suggestions = render_suggestions(frame, suggestion_area, app, &suggestions, theme);
-    regions.mode_tabs = render_composer(frame, composer_area, app, theme);
+    regions.composer_input = Some(render_composer(frame, composer_area, app, theme));
     regions
 }
 
@@ -748,7 +738,14 @@ fn render_suggestions(
 }
 
 fn render_activity(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let text = if app.active_request.is_some() {
+    frame.render_widget(
+        Paragraph::new(activity_text(app)).style(theme.style(ThemeRole::Accent)),
+        area,
+    );
+}
+
+fn activity_text(app: &App) -> String {
+    if app.active_request.is_some() {
         let dots = ".".repeat((app.animation_frame / 5) % 4);
         format!(" Waiting{dots}")
     } else if app.transcript.entries().iter().any(|entry| {
@@ -765,14 +762,10 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
         format!(" {notice}")
     } else {
         String::new()
-    };
-    frame.render_widget(
-        Paragraph::new(text).style(theme.style(ThemeRole::Accent)),
-        area,
-    );
+    }
 }
 
-fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Vec<Rect> {
+fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Rect {
     let active_mode = app.effective_mode();
     let mode_role = match active_mode {
         SessionMode::Plan => ThemeRole::PlanMode,
@@ -816,7 +809,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
         COMPOSER_HORIZONTAL_PADDING,
         COMPOSER_VERTICAL_PADDING,
     ));
-    let layout = composer_layout(
+    let layout = layout_composer(
         app.composer.text(),
         app.composer.cursor(),
         app.composer
@@ -852,10 +845,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
                 .saturating_add(cursor_row.saturating_sub(vertical_scroll)),
         ));
     }
-    vec![
-        Rect::new(area.x.saturating_add(2), area.y, 8, 1),
-        Rect::new(area.x.saturating_add(11), area.y, 9, 1),
-    ]
+    input_area
 }
 
 fn composer_height(app: &App, width: u16) -> u16 {
@@ -864,7 +854,7 @@ fn composer_height(app: &App, width: u16) -> u16 {
         .composer
         .content()
         .lines(Style::default(), Style::default());
-    let line_count = composer_layout(
+    let line_count = layout_composer(
         app.composer.text(),
         app.composer.text().len(),
         lines,
@@ -877,115 +867,6 @@ fn composer_height(app: &App, width: u16) -> u16 {
         .saturating_add(COMPOSER_BORDER_HEIGHT)
         .saturating_add(COMPOSER_VERTICAL_PADDING.saturating_mul(2))
         .max(5)
-}
-
-struct ComposerLayout {
-    lines: Vec<Line<'static>>,
-    cursor: (u16, u16),
-}
-
-struct ComposerGrapheme {
-    symbol: String,
-    style: Style,
-    byte_start: usize,
-    width: usize,
-    whitespace: bool,
-}
-
-fn composer_layout(
-    text: &str,
-    cursor: usize,
-    lines: Vec<Line<'static>>,
-    width: u16,
-) -> ComposerLayout {
-    let width = width.max(1) as usize;
-    let mut wrapped: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut cursor_position = None;
-    let mut byte_offset = 0;
-    let line_count = lines.len();
-
-    for (line_index, line) in lines.into_iter().enumerate() {
-        if line_index > 0 {
-            wrapped.push(Vec::new());
-        }
-        let mut column: usize = 0;
-        let mut graphemes = Vec::new();
-        for span in line.spans {
-            for grapheme in span.styled_graphemes(Style::default()) {
-                let symbol = grapheme.symbol.to_owned();
-                let symbol_len = symbol.len();
-                graphemes.push(ComposerGrapheme {
-                    width: Line::from(symbol.as_str()).width(),
-                    whitespace: symbol.chars().all(char::is_whitespace),
-                    symbol,
-                    style: grapheme.style,
-                    byte_start: byte_offset,
-                });
-                byte_offset = byte_offset.saturating_add(symbol_len);
-            }
-        }
-
-        let mut segment_start = 0;
-        while segment_start < graphemes.len() {
-            let mut segment_end = segment_start;
-            while segment_end < graphemes.len() && graphemes[segment_end].whitespace {
-                segment_end += 1;
-            }
-            while segment_end < graphemes.len() && !graphemes[segment_end].whitespace {
-                segment_end += 1;
-            }
-            let segment_width = graphemes[segment_start..segment_end]
-                .iter()
-                .map(|grapheme| grapheme.width)
-                .sum::<usize>();
-            if column > 0 && column.saturating_add(segment_width) > width {
-                wrapped.push(Vec::new());
-                column = 0;
-            }
-
-            for grapheme in &graphemes[segment_start..segment_end] {
-                if column > 0 && column.saturating_add(grapheme.width) > width {
-                    wrapped.push(Vec::new());
-                    column = 0;
-                }
-                let grapheme_end = grapheme.byte_start.saturating_add(grapheme.symbol.len());
-                if cursor_position.is_none()
-                    && cursor >= grapheme.byte_start
-                    && cursor < grapheme_end
-                {
-                    cursor_position = Some(normalize_cursor(column, wrapped.len() - 1, width));
-                }
-                wrapped
-                    .last_mut()
-                    .unwrap()
-                    .push(Span::styled(grapheme.symbol.clone(), grapheme.style));
-                column = column.saturating_add(grapheme.width);
-            }
-            segment_start = segment_end;
-        }
-
-        if cursor_position.is_none() && cursor == byte_offset {
-            cursor_position = Some(normalize_cursor(column, wrapped.len() - 1, width));
-        }
-        if line_index + 1 < line_count {
-            byte_offset = byte_offset.saturating_add(1);
-        }
-    }
-
-    let cursor = cursor_position.unwrap_or((0, 0));
-    while wrapped.len() <= cursor.1 as usize {
-        wrapped.push(Vec::new());
-    }
-    let lines = wrapped.into_iter().map(Line::from).collect();
-    debug_assert_eq!(byte_offset, text.len());
-    ComposerLayout { lines, cursor }
-}
-
-fn normalize_cursor(column: usize, row: usize, width: usize) -> (u16, u16) {
-    (
-        (column % width).min(u16::MAX as usize) as u16,
-        row.saturating_add(column / width).min(u16::MAX as usize) as u16,
-    )
 }
 
 fn composer_content_width(width: u16) -> u16 {
@@ -1134,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_theme_paints_the_frame_and_exposes_colored_mode_tabs() {
+    fn custom_theme_paints_the_frame_and_exposes_colored_mode_labels() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         let theme = Theme::resolve(crate::theme::ThemeId::FunDark);
@@ -1151,12 +1032,8 @@ mod tests {
                 cell.style().bg == theme.style(crate::theme::ThemeRole::Surface).bg
             })
         );
-        assert_eq!(regions.mode_tabs.len(), 2);
-        let build = regions.mode_tabs[1];
-        assert_eq!(
-            regions.target_at(build.x, build.y),
-            Some(UiTarget::Mode(crate::composer::SessionMode::Build))
-        );
+        let build = position_of(&terminal, "[ Build ]");
+        assert!(regions.composer_input.is_some());
         assert_eq!(
             terminal
                 .backend()
@@ -1319,8 +1196,16 @@ mod tests {
     fn composer_grows_to_show_all_lines_with_padding() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.composer.insert_text("first\nsecond\nthird\nfourth");
-        let backend = TestBackend::new(60, 20);
+        app.transcript
+            .submit(1, "earlier prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 1 });
+        let text = (1..=18)
+            .map(|line| format!("LINE{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.composer.insert_text(&text);
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut regions = UiRegions::default();
 
@@ -1328,13 +1213,32 @@ mod tests {
             .draw(|frame| regions = render(frame, &app, &Theme::default()))
             .unwrap();
 
-        let first = position_of(&terminal, "first");
-        let fourth = position_of(&terminal, "fourth");
-        let composer_top = regions.mode_tabs[0].y;
+        let first = position_of(&terminal, "LINE01");
+        let last = position_of(&terminal, "LINE18");
+        let composer_top = position_of(&terminal, "[ Plan ]").y;
         assert!(first.x >= 4, "text should have left padding");
         assert!(first.y >= composer_top + 2, "text should have top padding");
-        assert_eq!(fourth.y, first.y + 3);
-        assert!(composer_height(&app, 58) >= 8);
+        assert_eq!(last.y, first.y + 17);
+        assert!(composer_height(&app, 78) >= 22);
+        assert!(regions.transcript_entries.is_empty());
+    }
+
+    #[test]
+    fn mode_labels_are_not_clickable() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut regions = UiRegions::default();
+        terminal
+            .draw(|frame| regions = render(frame, &app, &Theme::default()))
+            .unwrap();
+
+        let plan = position_of(&terminal, "[ Plan ]");
+        let build = position_of(&terminal, "[ Build ]");
+        assert_eq!(regions.target_at(plan.x + 2, plan.y), None);
+        assert_eq!(regions.target_at(build.x + 2, build.y), None);
     }
 
     #[test]

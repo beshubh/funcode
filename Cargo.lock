@@ -1006,6 +1006,7 @@ dependencies = [
  "similar",
  "tempfile",
  "tokio",
+ "unicode-segmentation",
  "url",
 ]
 

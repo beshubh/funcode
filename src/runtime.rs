@@ -223,6 +223,9 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                 rendered_buffer = frame.buffer_mut().clone();
             })
             .context("failed to draw the terminal UI")?;
+        if let Some(area) = regions.composer_input {
+            app.set_composer_width(area.width);
+        }
 
         let timeout = next_tick.saturating_duration_since(Instant::now());
         if event::poll(timeout).context("failed to poll terminal input")? {
@@ -340,10 +343,6 @@ fn handle_mouse_event(
                 app.select_auth_provider()
             }
             Some(ui::UiTarget::Suggestion(index)) => app.activate_suggestion(index),
-            Some(ui::UiTarget::Mode(mode)) => {
-                app.select_mode(mode);
-                None
-            }
             Some(ui::UiTarget::Theme(index)) => {
                 app.set_theme_selection(index);
                 app.commit_theme_selection()
@@ -632,7 +631,6 @@ mod tests {
         app::{App, AppAction, Screen},
         auth::AuthTaskRunner,
         clipboard::{Clipboard, ClipboardTaskRunner},
-        composer::SessionMode,
         llm::{ModelInfo, ProviderModels},
         model_catalog::ModelCatalogEvent,
         terminal_selection::TerminalSelection,
@@ -724,21 +722,9 @@ mod tests {
     }
 
     #[test]
-    fn mouse_switches_modes_and_previews_then_commits_themes() {
+    fn mouse_previews_then_commits_themes() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        let mode_regions = UiRegions {
-            mode_tabs: vec![Rect::new(2, 2, 8, 1), Rect::new(11, 2, 9, 1)],
-            ..UiRegions::default()
-        };
-
-        handle_mouse_event(
-            &mut app,
-            &mode_regions,
-            mouse(MouseEventKind::Up(MouseButton::Left), 2, 2),
-        );
-        assert_eq!(app.effective_mode(), SessionMode::Plan);
-
         app.open_theme_dialog();
         let theme_regions = UiRegions {
             theme_options: (0..4).map(|index| Rect::new(4, 5 + index, 20, 1)).collect(),

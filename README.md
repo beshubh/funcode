@@ -52,7 +52,6 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - Drag across terminal text to select and automatically copy it to the clipboard
 - Click a sent message: open a modal and copy its text and attached paths
 - Click a Thinking or tool block: expand its persistent activity summary
-- Click the Plan or Build composer tab: switch the persistent session mode
 - `/auth`: open the authentication picker
 - `/models`: choose a model from every configured provider; use arrows or hover, then Enter/click
 - `/theme`: preview and select a bundled color theme

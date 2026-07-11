@@ -3,6 +3,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use std::{collections::HashSet, ops::Range};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionMode {
@@ -133,6 +134,140 @@ fn push_text_lines(lines: &mut Vec<Vec<Span<'static>>>, text: &str, style: Style
     }
 }
 
+pub(crate) struct ComposerLayout {
+    pub lines: Vec<Line<'static>>,
+    pub cursor: (u16, u16),
+    stops: Vec<VisualStop>,
+}
+
+struct ComposerGrapheme {
+    symbol: String,
+    style: Style,
+    byte_start: usize,
+    width: usize,
+    whitespace: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VisualStop {
+    byte: usize,
+    column: u16,
+    row: u16,
+}
+
+pub(crate) fn layout_composer(
+    text: &str,
+    cursor: usize,
+    lines: Vec<Line<'static>>,
+    width: u16,
+) -> ComposerLayout {
+    let width = width.max(1) as usize;
+    let mut wrapped: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut cursor_position = None;
+    let mut stops = Vec::new();
+    let mut byte_offset = 0;
+    let line_count = lines.len();
+
+    for (line_index, line) in lines.into_iter().enumerate() {
+        if line_index > 0 {
+            wrapped.push(Vec::new());
+        }
+        let mut column: usize = 0;
+        let mut graphemes = Vec::new();
+        for span in line.spans {
+            for grapheme in span.styled_graphemes(Style::default()) {
+                let symbol = grapheme.symbol.to_owned();
+                let symbol_len = symbol.len();
+                graphemes.push(ComposerGrapheme {
+                    width: Line::from(symbol.as_str()).width(),
+                    whitespace: symbol.chars().all(char::is_whitespace),
+                    symbol,
+                    style: grapheme.style,
+                    byte_start: byte_offset,
+                });
+                byte_offset = byte_offset.saturating_add(symbol_len);
+            }
+        }
+
+        let mut segment_start = 0;
+        while segment_start < graphemes.len() {
+            let mut segment_end = segment_start;
+            while segment_end < graphemes.len() && graphemes[segment_end].whitespace {
+                segment_end += 1;
+            }
+            while segment_end < graphemes.len() && !graphemes[segment_end].whitespace {
+                segment_end += 1;
+            }
+            let segment_width = graphemes[segment_start..segment_end]
+                .iter()
+                .map(|grapheme| grapheme.width)
+                .sum::<usize>();
+            if column > 0 && column.saturating_add(segment_width) > width {
+                wrapped.push(Vec::new());
+                column = 0;
+            }
+
+            for grapheme in &graphemes[segment_start..segment_end] {
+                if column > 0 && column.saturating_add(grapheme.width) > width {
+                    wrapped.push(Vec::new());
+                    column = 0;
+                }
+                let position = normalize_cursor(column, wrapped.len() - 1, width);
+                stops.push(VisualStop {
+                    byte: grapheme.byte_start,
+                    column: position.0,
+                    row: position.1,
+                });
+                let grapheme_end = grapheme.byte_start.saturating_add(grapheme.symbol.len());
+                if cursor_position.is_none()
+                    && cursor >= grapheme.byte_start
+                    && cursor < grapheme_end
+                {
+                    cursor_position = Some(position);
+                }
+                wrapped
+                    .last_mut()
+                    .unwrap()
+                    .push(Span::styled(grapheme.symbol.clone(), grapheme.style));
+                column = column.saturating_add(grapheme.width);
+            }
+            segment_start = segment_end;
+        }
+
+        let line_end = normalize_cursor(column, wrapped.len() - 1, width);
+        stops.push(VisualStop {
+            byte: byte_offset,
+            column: line_end.0,
+            row: line_end.1,
+        });
+        if cursor_position.is_none() && cursor == byte_offset {
+            cursor_position = Some(line_end);
+        }
+        if line_index + 1 < line_count {
+            byte_offset = byte_offset.saturating_add(1);
+        }
+    }
+
+    let cursor = cursor_position.unwrap_or((0, 0));
+    while wrapped.len() <= cursor.1 as usize {
+        wrapped.push(Vec::new());
+    }
+    let lines = wrapped.into_iter().map(Line::from).collect();
+    debug_assert_eq!(byte_offset, text.len());
+    ComposerLayout {
+        lines,
+        cursor,
+        stops,
+    }
+}
+
+fn normalize_cursor(column: usize, row: usize, width: usize) -> (u16, u16) {
+    (
+        (column % width).min(u16::MAX as usize) as u16,
+        row.saturating_add(column / width).min(u16::MAX as usize) as u16,
+    )
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ComposerDocument {
     content: ComposerContent,
@@ -165,7 +300,9 @@ impl ComposerDocument {
     pub fn move_left(&mut self) {
         if let Some(token) = self.token_ending_at(self.cursor) {
             self.cursor = token.range.start;
-        } else if let Some((index, _)) = self.content.text[..self.cursor].char_indices().next_back()
+        } else if let Some((index, _)) = self.content.text[..self.cursor]
+            .grapheme_indices(true)
+            .next_back()
         {
             self.cursor = index;
         }
@@ -174,8 +311,8 @@ impl ComposerDocument {
     pub fn move_right(&mut self) {
         if let Some(token) = self.token_starting_at(self.cursor) {
             self.cursor = token.range.end;
-        } else if let Some(character) = self.content.text[self.cursor..].chars().next() {
-            self.cursor += character.len_utf8();
+        } else if let Some(grapheme) = self.content.text[self.cursor..].graphemes(true).next() {
+            self.cursor += grapheme.len();
         }
     }
 
@@ -191,42 +328,12 @@ impl ComposerDocument {
             .map_or(self.content.text.len(), |index| self.cursor + index);
     }
 
-    pub fn move_up(&mut self) {
-        let current_start = self.content.text[..self.cursor]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        if current_start == 0 {
-            return;
-        }
-        let column = self.content.text[current_start..self.cursor]
-            .chars()
-            .count();
-        let previous_end = current_start - 1;
-        let previous_start = self.content.text[..previous_end]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        self.cursor = previous_start
-            + byte_index_at_character(&self.content.text[previous_start..previous_end], column);
-        self.snap_cursor_left();
+    pub fn move_up(&mut self, width: u16) {
+        self.move_vertical(width, -1);
     }
 
-    pub fn move_down(&mut self) {
-        let current_start = self.content.text[..self.cursor]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        let column = self.content.text[current_start..self.cursor]
-            .chars()
-            .count();
-        let Some(end_offset) = self.content.text[self.cursor..].find('\n') else {
-            return;
-        };
-        let next_start = self.cursor + end_offset + 1;
-        let next_end = self.content.text[next_start..]
-            .find('\n')
-            .map_or(self.content.text.len(), |index| next_start + index);
-        self.cursor =
-            next_start + byte_index_at_character(&self.content.text[next_start..next_end], column);
-        self.snap_cursor_left();
+    pub fn move_down(&mut self, width: u16) {
+        self.move_vertical(width, 1);
     }
 
     pub fn backspace(&mut self) {
@@ -247,8 +354,8 @@ impl ComposerDocument {
             self.remove_token(token);
             return;
         }
-        if let Some(character) = self.content.text[self.cursor..].chars().next() {
-            let end = self.cursor + character.len_utf8();
+        if let Some(grapheme) = self.content.text[self.cursor..].graphemes(true).next() {
+            let end = self.cursor + grapheme.len();
             self.content.text.drain(self.cursor..end);
             self.shift_tokens_at_or_after(end, -((end - self.cursor) as isize));
         }
@@ -369,12 +476,29 @@ impl ComposerDocument {
     fn sort_tokens(&mut self) {
         self.content.tokens.sort_by_key(|token| token.range.start);
     }
-}
 
-fn byte_index_at_character(text: &str, character_index: usize) -> usize {
-    text.char_indices()
-        .nth(character_index)
-        .map_or(text.len(), |(index, _)| index)
+    fn move_vertical(&mut self, width: u16, direction: i8) {
+        let lines = self.content.lines(Style::default(), Style::default());
+        let layout = layout_composer(&self.content.text, self.cursor, lines, width);
+        let target_row = if direction < 0 {
+            layout.cursor.1.checked_sub(1)
+        } else {
+            layout.cursor.1.checked_add(1)
+        };
+        let Some(target_row) = target_row else {
+            return;
+        };
+        let target_column = layout.cursor.0;
+        if let Some(stop) = layout
+            .stops
+            .iter()
+            .filter(|stop| stop.row == target_row)
+            .min_by_key(|stop| stop.column.abs_diff(target_column))
+        {
+            self.cursor = stop.byte;
+            self.snap_cursor_left();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +531,50 @@ mod tests {
 
         assert!(document.text().is_empty());
         assert!(document.content().attachments().is_empty());
+    }
+
+    #[test]
+    fn backspace_removes_a_combining_grapheme_atomically() {
+        let mut document = ComposerDocument::default();
+        document.insert_text("e\u{301}X");
+        document.move_left();
+        document.backspace();
+
+        assert_eq!(document.text(), "X");
+        assert_eq!(document.cursor(), 0);
+    }
+
+    #[test]
+    fn backspace_removes_a_zwj_emoji_atomically() {
+        let mut document = ComposerDocument::default();
+        document.insert_text("👨‍👩‍👧X");
+        document.move_left();
+        document.backspace();
+
+        assert_eq!(document.text(), "X");
+        assert_eq!(document.cursor(), 0);
+    }
+
+    #[test]
+    fn delete_removes_a_combining_grapheme_atomically() {
+        let mut document = ComposerDocument::default();
+        document.insert_text("e\u{301}X");
+        document.move_home();
+        document.delete();
+
+        assert_eq!(document.text(), "X");
+        assert_eq!(document.cursor(), 0);
+    }
+
+    #[test]
+    fn right_skips_a_zwj_emoji_as_one_grapheme() {
+        let mut document = ComposerDocument::default();
+        let emoji = "👨‍👩‍👧";
+        document.insert_text(&format!("{emoji}X"));
+        document.move_home();
+        document.move_right();
+
+        assert_eq!(document.cursor(), emoji.len());
     }
 
     #[test]
