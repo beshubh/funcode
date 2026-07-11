@@ -2,7 +2,10 @@ use super::super::{
     ConversationMessage, LlmError, ModelInfo, Provider, ProviderEvent, ProviderModels,
     ProviderRequest, ProviderStream,
 };
-use crate::auth::AuthStore;
+use crate::{
+    auth::AuthStore,
+    tools::{AgentTool, ToolSession},
+};
 use futures::{Stream, StreamExt, future, future::BoxFuture};
 use rig_core::{
     agent::MultiTurnStreamItem,
@@ -10,10 +13,12 @@ use rig_core::{
     completion::Message,
     providers::chatgpt::{self, ChatGPTAuth},
     streaming::{StreamedAssistantContent, StreamingPrompt},
+    tool::{ToolDyn, ToolError},
+    wasm_compat::WasmBoxedFuture,
 };
+use std::sync::Arc;
 
-const SYSTEM_INSTRUCTIONS: &str =
-    "You are Funcode, a helpful and fun coding assistant. Give clear, accurate, practical answers.";
+const SYSTEM_INSTRUCTIONS: &str = "You are Funcode, a helpful and fun coding assistant. Give clear, accurate, practical answers. Build mode provides read_file, search_files, edit_file, and terminal. Inspect before editing, keep changes scoped to the request, and verify changes with relevant commands before answering. Plan mode omits edit_file and permits terminal only for non-mutating inspection.";
 const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 // The backend uses this as a model-catalog schema capability version. Funcode's package is still
 // 0.x, which the backend treats as predating picker-visible catalog entries.
@@ -93,13 +98,36 @@ impl Provider for ChatGptProvider {
                 model,
                 prompt,
                 history,
+                tools,
             } = request;
-            let stream = client
-                .agent(model)
-                .build()
-                .stream_prompt(prompt.clone())
-                .with_history(rig_history(&history))
-                .await;
+            let rig_history = rig_history(&history);
+            let stream = if let Some(session) = tools {
+                let tools = session
+                    .tools()
+                    .into_iter()
+                    .map(|tool| {
+                        Box::new(RigToolAdapter {
+                            tool,
+                            session: session.clone(),
+                        }) as Box<dyn ToolDyn>
+                    })
+                    .collect();
+                client
+                    .agent(model)
+                    .tools(tools)
+                    .build()
+                    .stream_prompt(prompt.clone())
+                    .with_history(&rig_history)
+                    .multi_turn(16)
+                    .await
+            } else {
+                client
+                    .agent(model)
+                    .build()
+                    .stream_prompt(prompt.clone())
+                    .with_history(&rig_history)
+                    .await
+            };
             let events = stream.map(|item| match item {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
                     text,
@@ -158,6 +186,40 @@ impl Provider for ChatGptProvider {
                 LlmError::Provider(format!("could not read the ChatGPT model catalog: {error}"))
             })?;
             parse_models(&body)
+        })
+    }
+}
+
+struct RigToolAdapter {
+    tool: Arc<dyn AgentTool>,
+    session: ToolSession,
+}
+
+impl ToolDyn for RigToolAdapter {
+    fn name(&self) -> String {
+        self.session.spec(self.tool.as_ref()).name.to_owned()
+    }
+
+    fn definition<'a>(
+        &'a self,
+        _prompt: String,
+    ) -> WasmBoxedFuture<'a, rig_core::completion::ToolDefinition> {
+        Box::pin(async move {
+            let spec = self.session.spec(self.tool.as_ref());
+            rig_core::completion::ToolDefinition {
+                name: spec.name.to_owned(),
+                description: spec.description,
+                parameters: spec.parameters,
+            }
+        })
+    }
+
+    fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
+        Box::pin(async move {
+            self.session
+                .execute(Arc::clone(&self.tool), args)
+                .await
+                .map_err(|error| ToolError::ToolCallError(Box::new(error)))
         })
     }
 }
@@ -273,12 +335,17 @@ fn chatgpt_stream_error(message: String) -> LlmError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatGptStreamEvent, ConversationAssembler, chatgpt_stream_error, parse_models, rig_history,
-        stream_events,
+        ChatGptStreamEvent, ConversationAssembler, RigToolAdapter, chatgpt_stream_error,
+        parse_models, rig_history, stream_events,
     };
+    use crate::composer::SessionMode;
     use crate::llm::{ConversationMessage, LlmError, ProviderEvent};
+    use crate::tools::ToolSession;
     use futures::{StreamExt, stream};
     use rig_core::completion::Message;
+    use rig_core::tool::ToolDyn;
+    use std::{fs, sync::Arc};
+    use tokio::sync::mpsc;
 
     #[test]
     fn translates_portable_history_only_inside_the_chatgpt_adapter() {
@@ -291,6 +358,33 @@ mod tests {
             rig_history(&history),
             vec![Message::user("first"), Message::assistant("first response")]
         );
+    }
+
+    #[tokio::test]
+    async fn rig_adapter_exposes_portable_tools_and_plain_text_results() {
+        let root = tempfile::tempdir().expect("temporary workspace should be created");
+        fs::write(root.path().join("value.txt"), "hello\n").expect("fixture should be written");
+        let (events, _event_rx) = mpsc::unbounded_channel();
+        let session = ToolSession::new(root.path().to_owned(), SessionMode::Plan, events, 4)
+            .expect("tool session should be created");
+        let tool = session
+            .tools()
+            .into_iter()
+            .find(|tool| session.spec(tool.as_ref()).name == "read_file")
+            .expect("read tool should be registered");
+        let adapter = RigToolAdapter {
+            tool: Arc::clone(&tool),
+            session,
+        };
+
+        let definition = adapter.definition(String::new()).await;
+        let output = adapter
+            .call(r#"{"path":"value.txt"}"#.into())
+            .await
+            .expect("tool result should be returned to Rig");
+
+        assert_eq!(definition.name, "read_file");
+        assert_eq!(output, "     1\thello");
     }
 
     #[tokio::test]

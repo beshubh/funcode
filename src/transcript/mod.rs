@@ -61,6 +61,16 @@ pub enum ToolArtifact {
         path: String,
         diff: String,
     },
+    SearchResults {
+        query: String,
+        matches: String,
+    },
+    Terminal {
+        description: String,
+        command: String,
+        output: String,
+        exit_code: Option<i32>,
+    },
     TextDetail(String),
     FileReference(String),
 }
@@ -107,6 +117,12 @@ pub enum TranscriptEvent {
         call_id: ToolCallId,
         name: String,
         summary: String,
+        artifacts: Vec<ToolArtifact>,
+    },
+    ToolOutputDelta {
+        turn_id: TurnId,
+        call_id: ToolCallId,
+        chunk: String,
     },
     ToolFinished {
         turn_id: TurnId,
@@ -222,8 +238,9 @@ impl Transcript {
                 call_id,
                 name,
                 summary,
+                artifacts,
             } => {
-                if self.is_active(turn_id) && self.tool_mut(call_id).is_none() {
+                if self.is_active(turn_id) && self.tool_mut(turn_id, call_id).is_none() {
                     self.push(
                         turn_id,
                         EntryKind::Tool(ToolCall {
@@ -231,9 +248,21 @@ impl Transcript {
                             name,
                             summary,
                             status: ActivityStatus::Running,
-                            artifacts: Vec::new(),
+                            artifacts,
                         }),
                     );
+                }
+            }
+            TranscriptEvent::ToolOutputDelta {
+                turn_id,
+                call_id,
+                chunk,
+            } => {
+                if self.is_active(turn_id)
+                    && let Some(tool) = self.tool_mut(turn_id, call_id)
+                    && let Some(ToolArtifact::Terminal { output, .. }) = tool.artifacts.first_mut()
+                {
+                    output.push_str(&chunk);
                 }
             }
             TranscriptEvent::ToolFinished {
@@ -243,7 +272,7 @@ impl Transcript {
                 artifacts,
             } => {
                 if self.is_active(turn_id)
-                    && let Some(tool) = self.tool_mut(call_id)
+                    && let Some(tool) = self.tool_mut(turn_id, call_id)
                 {
                     if let Some(summary) = summary {
                         tool.summary = summary;
@@ -258,7 +287,7 @@ impl Transcript {
                 message,
             } => {
                 if self.is_active(turn_id)
-                    && let Some(tool) = self.tool_mut(call_id)
+                    && let Some(tool) = self.tool_mut(turn_id, call_id)
                 {
                     tool.status = ActivityStatus::Failed(message);
                 }
@@ -343,11 +372,13 @@ impl Transcript {
             .expect("reasoning entry was just inserted")
     }
 
-    fn tool_mut(&mut self, call_id: ToolCallId) -> Option<&mut ToolCall> {
+    fn tool_mut(&mut self, turn_id: TurnId, call_id: ToolCallId) -> Option<&mut ToolCall> {
         self.entries
             .iter_mut()
             .find_map(|entry| match &mut entry.kind {
-                EntryKind::Tool(tool) if tool.call_id == call_id => Some(tool),
+                EntryKind::Tool(tool) if entry.turn_id == turn_id && tool.call_id == call_id => {
+                    Some(tool)
+                }
                 _ => None,
             })
     }
@@ -440,6 +471,7 @@ mod tests {
             call_id: 9,
             name: "read_file".into(),
             summary: "Reading src/app.rs".into(),
+            artifacts: Vec::new(),
         });
         transcript.apply(TranscriptEvent::ToolFinished {
             turn_id: 4,
@@ -477,6 +509,54 @@ mod tests {
     }
 
     #[test]
+    fn terminal_output_deltas_update_only_the_matching_active_turn() {
+        let mut transcript = Transcript::default();
+        transcript.submit(1, "run it".into(), Vec::new());
+        transcript.apply(TranscriptEvent::Started { turn_id: 1 });
+        transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 99,
+            name: "terminal".into(),
+            summary: "Running tests".into(),
+            artifacts: vec![ToolArtifact::Terminal {
+                description: "Running tests".into(),
+                command: "cargo test".into(),
+                output: String::new(),
+                exit_code: None,
+            }],
+        });
+        transcript.apply(TranscriptEvent::ToolOutputDelta {
+            turn_id: 1,
+            call_id: 99,
+            chunk: "test result: ok".into(),
+        });
+
+        assert!(matches!(
+            &transcript.entries()[3].kind,
+            EntryKind::Tool(tool)
+                if matches!(
+                    tool.artifacts.first(),
+                    Some(ToolArtifact::Terminal { output, .. }) if output == "test result: ok"
+                )
+        ));
+
+        transcript.apply(TranscriptEvent::Completed { turn_id: 1 });
+        transcript.apply(TranscriptEvent::ToolOutputDelta {
+            turn_id: 1,
+            call_id: 99,
+            chunk: "late".into(),
+        });
+        assert!(matches!(
+            &transcript.entries()[3].kind,
+            EntryKind::Tool(tool)
+                if matches!(
+                    tool.artifacts.first(),
+                    Some(ToolArtifact::Terminal { output, .. }) if output == "test result: ok"
+                )
+        ));
+    }
+
+    #[test]
     fn late_activity_is_ignored_after_a_turn_finishes() {
         let mut transcript = Transcript::default();
         transcript.submit(8, "hello".into(), Vec::new());
@@ -491,6 +571,7 @@ mod tests {
             call_id: 2,
             name: "late".into(),
             summary: "late".into(),
+            artifacts: Vec::new(),
         });
 
         assert_eq!(transcript.entries().len(), 3);

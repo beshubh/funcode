@@ -1,7 +1,7 @@
 use crate::{
     composer::SessionMode,
     llm::{ConversationCommit, LlmClient, LlmEvent},
-    tools::{ReadFile, WorkspaceFileReader},
+    tools::{ReadFile, ToolDisplay, ToolEvent, ToolSession, WorkspaceFileReader},
     transcript::{Attachment, ToolArtifact, ToolCallId},
 };
 use futures::StreamExt as _;
@@ -33,6 +33,12 @@ pub enum AgentEvent {
         call_id: ToolCallId,
         name: String,
         summary: String,
+        artifacts: Vec<ToolArtifact>,
+    },
+    ToolOutputDelta {
+        request_id: RequestId,
+        call_id: ToolCallId,
+        chunk: String,
     },
     ToolFinished {
         request_id: RequestId,
@@ -199,10 +205,17 @@ enum RequestUpdate {
         call_id: ToolCallId,
         name: String,
         summary: String,
+        artifacts: Vec<ToolArtifact>,
+    },
+    ToolOutputDelta {
+        request_id: RequestId,
+        call_id: ToolCallId,
+        chunk: String,
     },
     ToolFinished {
         request_id: RequestId,
         call_id: ToolCallId,
+        summary: Option<String>,
         artifacts: Vec<ToolArtifact>,
     },
     ToolFailed {
@@ -301,6 +314,7 @@ async fn run_coordinator_with_updates(
                     RequestUpdate::TextDelta { request_id, .. }
                     | RequestUpdate::ReasoningDelta { request_id, .. }
                     | RequestUpdate::ToolStarted { request_id, .. }
+                    | RequestUpdate::ToolOutputDelta { request_id, .. }
                     | RequestUpdate::ToolFinished { request_id, .. }
                     | RequestUpdate::ToolFailed { request_id, .. }
                     | RequestUpdate::Completed { request_id, .. }
@@ -316,14 +330,17 @@ async fn run_coordinator_with_updates(
                     RequestUpdate::ReasoningDelta { request_id, summary } => {
                         AgentEvent::ReasoningDelta { request_id, summary }
                     }
-                    RequestUpdate::ToolStarted { request_id, call_id, name, summary } => {
-                        AgentEvent::ToolStarted { request_id, call_id, name, summary }
+                    RequestUpdate::ToolStarted { request_id, call_id, name, summary, artifacts } => {
+                        AgentEvent::ToolStarted { request_id, call_id, name, summary, artifacts }
                     }
-                    RequestUpdate::ToolFinished { request_id, call_id, artifacts } => {
+                    RequestUpdate::ToolOutputDelta { request_id, call_id, chunk } => {
+                        AgentEvent::ToolOutputDelta { request_id, call_id, chunk }
+                    }
+                    RequestUpdate::ToolFinished { request_id, call_id, summary, artifacts } => {
                         AgentEvent::ToolFinished {
                             request_id,
                             call_id,
-                            summary: None,
+                            summary,
                             artifacts,
                         }
                     }
@@ -376,8 +393,24 @@ async fn run_request(
         }
     };
     let prompt = prompt_with_attachments(request.prompt.clone(), &files);
+    let (tool_events_tx, mut tool_events_rx) = async_mpsc::unbounded_channel();
+    let tools = match ToolSession::new(
+        workspace_reader.root(),
+        request.mode,
+        tool_events_tx,
+        request_id,
+    ) {
+        Ok(tools) => tools,
+        Err(error) => {
+            let _ = updates.send(RequestUpdate::Failed {
+                request_id,
+                message: error.to_string(),
+            });
+            return;
+        }
+    };
     let mut stream = match llm
-        .stream_with_mode(prompt, request.prompt, request.mode)
+        .stream_with_tools(prompt, request.prompt, request.mode, Some(tools))
         .await
     {
         Ok(stream) => stream,
@@ -390,7 +423,20 @@ async fn run_request(
         }
     };
 
-    while let Some(event) = stream.next().await {
+    loop {
+        let event = tokio::select! {
+            biased;
+            Some(tool_event) = tool_events_rx.recv() => {
+                if forward_tool_event(request_id, tool_event, &updates).is_err() {
+                    return;
+                }
+                continue;
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
         match event {
             Ok(LlmEvent::TextDelta(text)) => {
                 if updates
@@ -431,6 +477,79 @@ async fn run_request(
     });
 }
 
+fn forward_tool_event(
+    request_id: RequestId,
+    event: ToolEvent,
+    updates: &async_mpsc::UnboundedSender<RequestUpdate>,
+) -> Result<(), ()> {
+    let update = match event {
+        ToolEvent::Started {
+            call_id,
+            name,
+            summary,
+            display,
+        } => RequestUpdate::ToolStarted {
+            request_id,
+            call_id,
+            name,
+            summary,
+            artifacts: display.into_iter().map(display_to_artifact).collect(),
+        },
+        ToolEvent::OutputDelta { call_id, chunk } => RequestUpdate::ToolOutputDelta {
+            request_id,
+            call_id,
+            chunk,
+        },
+        ToolEvent::Finished {
+            call_id,
+            summary,
+            display,
+        } => RequestUpdate::ToolFinished {
+            request_id,
+            call_id,
+            summary,
+            artifacts: vec![display_to_artifact(display)],
+        },
+        ToolEvent::Failed { call_id, message } => RequestUpdate::ToolFailed {
+            request_id,
+            call_id,
+            message,
+        },
+    };
+    updates.send(update).map_err(|_| ())
+}
+
+fn display_to_artifact(display: ToolDisplay) -> ToolArtifact {
+    match display {
+        ToolDisplay::CodeRange {
+            path,
+            start_line,
+            end_line,
+            content,
+        } => ToolArtifact::CodeRange {
+            path,
+            start_line,
+            end_line,
+            preview: Some(content),
+        },
+        ToolDisplay::SearchResults { query, matches } => {
+            ToolArtifact::SearchResults { query, matches }
+        }
+        ToolDisplay::Patch { path, diff } => ToolArtifact::Patch { path, diff },
+        ToolDisplay::Terminal {
+            description,
+            command,
+            output,
+            exit_code,
+        } => ToolArtifact::Terminal {
+            description,
+            command,
+            output,
+            exit_code,
+        },
+    }
+}
+
 fn read_attachments(
     request_id: RequestId,
     attachments: &[Attachment],
@@ -450,6 +569,7 @@ fn read_attachments(
                     call_id,
                     name: "read_workspace_file".into(),
                     summary: format!("Reading {}", attachment.path),
+                    artifacts: Vec::new(),
                 })
                 .map_err(|_| "the agent updates channel is unavailable".to_owned())?;
             match reader.read(&attachment.path) {
@@ -458,6 +578,7 @@ fn read_attachments(
                         .send(RequestUpdate::ToolFinished {
                             request_id,
                             call_id,
+                            summary: None,
                             artifacts: vec![ToolArtifact::CodeRange {
                                 path: file.path.clone(),
                                 start_line: 1,
@@ -517,7 +638,7 @@ mod tests {
     };
     use crate::tools::{ReadFile, WorkspaceFileReader};
     use crate::transcript::ToolArtifact;
-    use futures::{future::BoxFuture, stream};
+    use futures::{StreamExt as _, future::BoxFuture, stream};
     use std::{
         sync::{Arc, mpsc},
         thread,
@@ -661,6 +782,59 @@ mod tests {
         }
     }
 
+    struct MultiRoundToolProvider;
+
+    impl Provider for MultiRoundToolProvider {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+        ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+            Box::pin(async move {
+                let session = request
+                    .tools
+                    .expect("request-scoped tools should be present");
+                let read_tool = session
+                    .tools()
+                    .into_iter()
+                    .find(|tool| session.spec(tool.as_ref()).name == "read_file")
+                    .expect("read_file should be registered");
+                let failed_session = session.clone();
+                let failed_tool = Arc::clone(&read_tool);
+                let failed = stream::once(async move {
+                    let output = failed_session
+                        .execute(failed_tool, r#"{"path":"missing-for-tool-retry"}"#.into())
+                        .await
+                        .expect("domain failures should remain model-visible");
+                    assert!(output.starts_with("Error:"));
+                    Ok(ProviderEvent::TextDelta(String::new()))
+                });
+                let successful_session = session.clone();
+                let successful = stream::once(async move {
+                    let output = successful_session
+                        .execute(
+                            read_tool,
+                            r#"{"path":"Cargo.toml","start_line":1,"end_line":1}"#.into(),
+                        )
+                        .await
+                        .expect("retry should complete");
+                    assert!(output.contains("[package]"));
+                    Ok(ProviderEvent::TextDelta(String::new()))
+                });
+                let mut history = request.history;
+                history.push(ConversationMessage::User(request.prompt));
+                history.push(ConversationMessage::Assistant("before after".into()));
+                let events = stream::iter([Ok(ProviderEvent::TextDelta("before ".into()))])
+                    .chain(failed)
+                    .chain(successful)
+                    .chain(stream::iter([
+                        Ok(ProviderEvent::TextDelta("after".into())),
+                        Ok(ProviderEvent::Completed(history)),
+                    ]));
+                Ok(Box::pin(events) as ProviderStream)
+            })
+        }
+    }
+
     #[test]
     fn queued_requests_stream_to_completion_in_fifo_order() {
         let client = LlmClient::with_provider(Arc::new(EchoProvider));
@@ -689,6 +863,46 @@ mod tests {
                 text
             } if text == "response to first"
         )));
+
+        runner.shutdown();
+    }
+
+    #[test]
+    fn tool_failure_can_retry_across_rounds_with_text_before_and_after() {
+        let client = LlmClient::with_provider(Arc::new(MultiRoundToolProvider));
+        let mut runner = AgentTaskRunner::spawn(client);
+        runner.submit(21, "inspect".into()).unwrap();
+
+        let mut events = Vec::new();
+        while !events.contains(&AgentEvent::Completed { request_id: 21 }) {
+            events.push(runner.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+                .count(),
+            2
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolFailed { request_id: 21, .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolFinished { request_id: 21, .. }))
+        );
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "before after");
 
         runner.shutdown();
     }

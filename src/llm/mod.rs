@@ -1,4 +1,4 @@
-use crate::composer::SessionMode;
+use crate::{composer::SessionMode, tools::ToolSession};
 use futures::{
     StreamExt,
     future::BoxFuture,
@@ -97,6 +97,7 @@ pub(crate) struct ProviderRequest {
     pub(crate) model: String,
     pub(crate) prompt: String,
     pub(crate) history: Vec<ConversationMessage>,
+    pub(crate) tools: Option<ToolSession>,
 }
 
 pub(crate) enum ProviderEvent {
@@ -180,11 +181,23 @@ impl LlmClient {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn stream_with_mode(
         &self,
         prompt: String,
         history_prompt: String,
         mode: SessionMode,
+    ) -> Result<LlmStream, LlmError> {
+        self.stream_with_tools(prompt, history_prompt, mode, None)
+            .await
+    }
+
+    pub(crate) async fn stream_with_tools(
+        &self,
+        prompt: String,
+        history_prompt: String,
+        mode: SessionMode,
+        tools: Option<ToolSession>,
     ) -> Result<LlmStream, LlmError> {
         let history = self
             .history
@@ -199,6 +212,7 @@ impl LlmClient {
                 model,
                 prompt: model_prompt,
                 history,
+                tools,
             })
             .await?;
         Ok(Box::pin(stream.map(move |event| match event? {
@@ -238,7 +252,7 @@ fn prompt_with_mode(prompt: String, mode: SessionMode) -> String {
     match mode {
         SessionMode::Build => prompt,
         SessionMode::Plan => format!(
-            "Plan mode is active. Produce a decision-complete implementation plan and do not modify files or execute tools.\n\n{prompt}"
+            "Plan mode is active. Produce a decision-complete implementation plan and do not modify files. You may use read_file and search_files, plus terminal only for non-mutating inspection commands.\n\n{prompt}"
         ),
     }
 }

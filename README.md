@@ -2,8 +2,9 @@
 
 `funcode` is an early terminal coding-agent prototype built with Rust and Ratatui. It connects to
 ChatGPT through the saved subscription login, streams model responses in the background, and keeps
-successfully completed turns as conversation context for the current session. Tool execution is not
-implemented yet. Composer suggestions are available for registered commands and workspace files.
+successfully completed turns as conversation context for the current session. The agent can inspect,
+search, edit, create, and verify files through workspace-scoped tools. Composer suggestions are
+available for registered commands and workspace files.
 
 ## Run
 
@@ -61,12 +62,24 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 
 Prompts submitted while the runner is busy are shown immediately and processed in FIFO order. Only
 completed turns are included in later model context; failed or interrupted turns remain visible but
-are not sent again. Thinking is shown until the first response text arrives. Tools is only shown
-during an active tool call; the current agent does not call tools. New composer commands implement
+are not sent again. Thinking is shown until the first response text arrives. Tool calls remain as
+expandable transcript blocks after completion. New composer commands implement
 the `Command` trait and are added through `App::register_command`; command actions can update app
 state and optionally return an `AppAction` for the runtime to dispatch. Commands can also insert
 inline mode tokens that affect the submitted request and later prompts. The commands displayed on
 the home screen and command popup both read from this registry, so they stay in sync.
+
+## Agent tools
+
+Build mode exposes `read_file`, `search_files`, `edit_file`, and `terminal`. File tools reject paths
+that escape the directory where Funcode was launched. Edits use exact text replacements or create a
+new file, write atomically, and display a unified diff. Terminal commands run through non-interactive
+Bash from the opened project; stdout and stderr stream into a terminal-style block with the command
+and exit status.
+
+Plan mode omits `edit_file` but allows reads, searches, and terminal inspection. The terminal's
+read-only Plan behavior is instruction-enforced rather than an operating-system sandbox, so arbitrary
+Bash still has the permissions of the Funcode process.
 
 Model discovery runs outside the terminal event loop. Providers use their live model-catalog API
 when one is available; provider adapters can return a built-in catalog when no discovery endpoint

@@ -61,6 +61,8 @@ pub enum ThemeRole {
     Agent,
     PlanMode,
     BuildMode,
+    DiffAdded,
+    DiffRemoved,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +79,8 @@ struct ThemeDefinition {
     agent: Color,
     plan: Color,
     build: Color,
+    diff_added: Color,
+    diff_removed: Color,
 }
 
 const TERMINAL: ThemeDefinition = ThemeDefinition {
@@ -92,6 +96,8 @@ const TERMINAL: ThemeDefinition = ThemeDefinition {
     agent: Color::Cyan,
     plan: Color::Rgb(240, 136, 62),
     build: Color::Rgb(63, 185, 80),
+    diff_added: Color::Green,
+    diff_removed: Color::Red,
 };
 
 const FUN_DARK: ThemeDefinition = ThemeDefinition {
@@ -107,6 +113,8 @@ const FUN_DARK: ThemeDefinition = ThemeDefinition {
     agent: Color::Rgb(181, 255, 0),
     plan: Color::Rgb(240, 136, 62),
     build: Color::Rgb(63, 185, 80),
+    diff_added: Color::Rgb(63, 185, 80),
+    diff_removed: Color::Rgb(248, 81, 73),
 };
 
 const MIDNIGHT: ThemeDefinition = ThemeDefinition {
@@ -122,6 +130,8 @@ const MIDNIGHT: ThemeDefinition = ThemeDefinition {
     agent: Color::Rgb(96, 165, 250),
     plan: Color::Rgb(240, 136, 62),
     build: Color::Rgb(63, 185, 80),
+    diff_added: Color::Rgb(74, 222, 128),
+    diff_removed: Color::Rgb(248, 113, 113),
 };
 
 const PAPER: ThemeDefinition = ThemeDefinition {
@@ -137,13 +147,15 @@ const PAPER: ThemeDefinition = ThemeDefinition {
     agent: Color::Rgb(109, 40, 217),
     plan: Color::Rgb(188, 76, 0),
     build: Color::Rgb(26, 127, 55),
+    diff_added: Color::Rgb(26, 127, 55),
+    diff_removed: Color::Rgb(185, 28, 28),
 };
 
 #[derive(Debug, Clone)]
 pub struct Theme {
     id: ThemeId,
     appearance: ThemeAppearance,
-    styles: [Style; 10],
+    styles: [Style; 12],
     border_set: border::Set<'static>,
 }
 
@@ -170,6 +182,8 @@ impl Theme {
             foreground(definition.agent),
             foreground(definition.plan),
             foreground(definition.build),
+            foreground(definition.diff_added),
+            foreground(definition.diff_removed),
         ];
         Self {
             id,

@@ -515,6 +515,7 @@ impl App {
                 call_id,
                 name,
                 summary,
+                artifacts,
             } => (
                 request_id,
                 TranscriptEvent::ToolStarted {
@@ -522,6 +523,20 @@ impl App {
                     call_id,
                     name,
                     summary,
+                    artifacts,
+                },
+                false,
+            ),
+            AgentEvent::ToolOutputDelta {
+                request_id,
+                call_id,
+                chunk,
+            } => (
+                request_id,
+                TranscriptEvent::ToolOutputDelta {
+                    turn_id: request_id,
+                    call_id,
+                    chunk,
                 },
                 false,
             ),
@@ -1656,6 +1671,7 @@ mod tests {
             call_id: 4,
             name: "read_file".into(),
             summary: "Reading Cargo.toml".into(),
+            artifacts: Vec::new(),
         });
 
         let tool_id = app.transcript.entries()[3].id;

@@ -233,11 +233,13 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
         }
         EntryKind::Tool(tool) => {
             let expanded = app.entry_is_expanded(entry.id);
+            let title = if tool.name == "terminal" {
+                "┌─ terminal".to_owned()
+            } else {
+                format!("┌─ tool · {}", tool.name)
+            };
             let mut lines = vec![Line::from(vec![
-                Span::styled(
-                    format!("┌─ tool · {}", tool.name),
-                    theme.style(ThemeRole::Accent),
-                ),
+                Span::styled(title, theme.style(ThemeRole::Accent)),
                 Span::styled(
                     format!(
                         " · {} · click to {}",
@@ -299,7 +301,52 @@ fn artifact_lines(artifact: &ToolArtifact, theme: &Theme) -> Vec<Line<'static>> 
                 format!("│ Edited {path}"),
                 theme.style(ThemeRole::Accent),
             )];
-            lines.extend(message_lines(diff, theme.style(ThemeRole::MutedText)));
+            lines.extend(diff.lines().map(|line| {
+                let role = if line.starts_with('+') && !line.starts_with("+++") {
+                    ThemeRole::DiffAdded
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    ThemeRole::DiffRemoved
+                } else {
+                    ThemeRole::MutedText
+                };
+                Line::styled(format!("│ {line}"), theme.style(role))
+            }));
+            lines
+        }
+        ToolArtifact::SearchResults { query, matches } => {
+            let mut lines = vec![Line::styled(
+                format!("│ Search /{query}/"),
+                theme.style(ThemeRole::Accent),
+            )];
+            lines.extend(message_lines(matches, theme.style(ThemeRole::MutedText)));
+            lines
+        }
+        ToolArtifact::Terminal {
+            description,
+            command,
+            output,
+            exit_code,
+        } => {
+            let mut lines = vec![
+                Line::styled(
+                    format!("│ {description}"),
+                    theme.style(ThemeRole::MutedText),
+                ),
+                Line::styled(format!("│ $ {command}"), theme.style(ThemeRole::Text)),
+            ];
+            if !output.is_empty() {
+                lines.extend(message_lines(output, theme.style(ThemeRole::Text)));
+            }
+            if let Some(exit_code) = exit_code {
+                lines.push(Line::styled(
+                    format!("│ exit {exit_code}"),
+                    if *exit_code == 0 {
+                        theme.style(ThemeRole::DiffAdded)
+                    } else {
+                        theme.style(ThemeRole::Warning)
+                    },
+                ));
+            }
             lines
         }
         ToolArtifact::TextDetail(text) => message_lines(text, theme.style(ThemeRole::MutedText)),

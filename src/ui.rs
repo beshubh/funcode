@@ -920,7 +920,7 @@ mod tests {
         agent::AgentEvent,
         app::{App, ModelsDialogPhase, Screen},
         llm::{ModelInfo, ProviderModels},
-        theme::Theme,
+        theme::{Theme, ThemeRole},
         transcript::ToolArtifact,
     };
     use ratatui::{
@@ -1071,6 +1071,7 @@ mod tests {
             call_id: 1,
             name: "read_file".into(),
             summary: "Reading".into(),
+            artifacts: Vec::new(),
         });
         let backend = TestBackend::new(100, 40);
         let mut chat = Terminal::new(backend).unwrap();
@@ -1205,6 +1206,7 @@ mod tests {
             call_id: 1,
             name: "read_file".into(),
             summary: "Reading".into(),
+            artifacts: Vec::new(),
         });
         app.composer.insert_text("@src/");
 
@@ -1461,6 +1463,7 @@ mod tests {
             call_id: 3,
             name: "read_file".into(),
             summary: "Reading src/main.rs".into(),
+            artifacts: Vec::new(),
         });
 
         let (collapsed, _, regions, _) = render_to_string(&app, 100, 30);
@@ -1478,6 +1481,123 @@ mod tests {
     }
 
     #[test]
+    fn terminal_tools_render_description_command_live_output_and_exit_status() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(3, "run it".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 3 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 3,
+            call_id: 8,
+            name: "terminal".into(),
+            summary: "Checking the project".into(),
+            artifacts: vec![ToolArtifact::Terminal {
+                description: "Checking the project".into(),
+                command: "cargo test".into(),
+                output: String::new(),
+                exit_code: None,
+            }],
+        });
+        app.handle_agent_event(AgentEvent::ToolOutputDelta {
+            request_id: 3,
+            call_id: 8,
+            chunk: "test result: ok".into(),
+        });
+
+        let tool_id = app.transcript.entries()[3].id;
+        app.activate_transcript_entry(tool_id);
+        let (live, _, _, _) = render_to_string(&app, 100, 30);
+        assert!(live.contains("$ cargo test"));
+        assert!(live.contains("test result: ok"));
+        assert!(!live.contains("exit 0"));
+
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            request_id: 3,
+            call_id: 8,
+            summary: Some("Exited with 0".into()),
+            artifacts: vec![ToolArtifact::Terminal {
+                description: "Checking the project".into(),
+                command: "cargo test".into(),
+                output: "test result: ok".into(),
+                exit_code: Some(0),
+            }],
+        });
+        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("terminal"));
+        assert!(screen.contains("Checking the project"));
+        assert!(screen.contains("$ cargo test"));
+        assert!(screen.contains("test result: ok"));
+        assert!(screen.contains("exit 0"));
+    }
+
+    #[test]
+    fn search_and_diff_tools_use_specialized_content_and_diff_colors() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(3, "change it".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 3 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 3,
+            call_id: 11,
+            name: "edit_file".into(),
+            summary: "Editing value.txt".into(),
+            artifacts: Vec::new(),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            request_id: 3,
+            call_id: 11,
+            summary: None,
+            artifacts: vec![ToolArtifact::Patch {
+                path: "value.txt".into(),
+                diff: "--- value.txt\n+++ value.txt\n-old\n+new".into(),
+            }],
+        });
+        let edit_id = app.transcript.entries()[3].id;
+        app.activate_transcript_entry(edit_id);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &app, &theme);
+            })
+            .unwrap();
+
+        assert!(terminal.backend().to_string().contains("Edited value.txt"));
+        assert_eq!(
+            style_at_text(&terminal, "+new").fg,
+            theme.style(ThemeRole::DiffAdded).fg
+        );
+        assert_eq!(
+            style_at_text(&terminal, "-old").fg,
+            theme.style(ThemeRole::DiffRemoved).fg
+        );
+
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 3,
+            call_id: 12,
+            name: "search_files".into(),
+            summary: "Searching for marker".into(),
+            artifacts: Vec::new(),
+        });
+        app.handle_agent_event(AgentEvent::ToolFinished {
+            request_id: 3,
+            call_id: 12,
+            summary: None,
+            artifacts: vec![ToolArtifact::SearchResults {
+                query: "marker".into(),
+                matches: "src/main.rs:1:marker".into(),
+            }],
+        });
+        let search_id = app.transcript.entries()[4].id;
+        app.activate_transcript_entry(search_id);
+        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+        assert!(screen.contains("Search /marker/"));
+        assert!(screen.contains("src/main.rs:1:marker"));
+    }
+
+    #[test]
     fn expanded_tool_output_can_scroll_through_content_larger_than_the_terminal() {
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -1488,6 +1608,7 @@ mod tests {
             call_id: 3,
             name: "read_file".into(),
             summary: "Reading src/main.rs".into(),
+            artifacts: Vec::new(),
         });
         app.handle_agent_event(AgentEvent::ToolFinished {
             request_id: 3,
