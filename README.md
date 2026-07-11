@@ -45,7 +45,7 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - Esc twice within 500 ms: interrupt the active response and continue with the next queued prompt
 - Click Thinking or Tools: expand or collapse the widget while that activity is running
 - Type `/` at the start of the composer: browse registered commands
-- Type `@` anywhere in the composer: search workspace files
+- Type `@` anywhere in the composer: search matching workspace files; unmatched `@text` stays plain text
 - Move the mouse over a suggestion to highlight it; click to activate it
 - `/auth`: open the authentication picker
 - `/exit` or Ctrl+C: quit
@@ -55,5 +55,5 @@ completed turns are included in later model context; failed or interrupted turns
 are not sent again. Thinking is shown until the first response text arrives. Tools is only shown
 during an active tool call; the current agent does not call tools. New composer commands implement
 the `Command` trait and are added through `App::register_command`; command actions can update app
-state and optionally return an `AppAction` for the runtime to dispatch. The commands displayed on
-the home screen are placeholders.
+return an `AppAction` for the runtime to dispatch. The home screen and command popup both read from
+this registry, so they stay in sync.
