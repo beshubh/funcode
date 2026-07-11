@@ -155,6 +155,7 @@ pub struct App {
     indexed_workspace_search: bool,
     indexed_suggestion_query: Option<String>,
     indexed_file_suggestions: Vec<String>,
+    pending_indexed_file_selection: Option<String>,
     suggestion_selected: usize,
     models_selected: usize,
     current_model: String,
@@ -194,6 +195,7 @@ impl App {
         self.indexed_workspace_search = false;
         self.indexed_suggestion_query = None;
         self.indexed_file_suggestions.clear();
+        self.pending_indexed_file_selection = None;
         self.suggestion_selected = 0;
     }
 
@@ -201,6 +203,7 @@ impl App {
         self.indexed_workspace_search = true;
         self.indexed_suggestion_query = None;
         self.indexed_file_suggestions.clear();
+        self.pending_indexed_file_selection = None;
         self.suggestion_selected = 0;
     }
 
@@ -212,9 +215,14 @@ impl App {
 
     pub(crate) fn set_indexed_file_suggestions(&mut self, query: String, paths: Vec<String>) {
         if self.workspace_file_query().as_deref() != Some(query.as_str()) {
+            if self.pending_indexed_file_selection.as_deref() == Some(query.as_str()) {
+                self.pending_indexed_file_selection = None;
+            }
             return;
         }
         let same_query = self.indexed_suggestion_query.as_deref() == Some(query.as_str());
+        let complete_pending_selection =
+            self.pending_indexed_file_selection.as_deref() == Some(query.as_str());
         if same_query && self.indexed_file_suggestions == paths {
             return;
         }
@@ -241,6 +249,14 @@ impl App {
         } else {
             0
         };
+        if complete_pending_selection {
+            self.pending_indexed_file_selection = None;
+            if let Some(path) = self.indexed_file_suggestions.first().cloned()
+                && let Some((range, _)) = self.composer.active_file_query()
+            {
+                self.composer.insert_file_reference(range, path);
+            }
+        }
     }
 
     pub fn for_auth() -> Self {
@@ -284,6 +300,13 @@ impl App {
         }
         self.last_escape = None;
 
+        if matches!(key.code, KeyCode::Enter | KeyCode::Tab)
+            && let Some(query) = self.pending_indexed_file_query()
+        {
+            self.pending_indexed_file_selection = Some(query);
+            return None;
+        }
+
         if !self.suggestions().is_empty() {
             match key.code {
                 KeyCode::Enter | KeyCode::Tab => {
@@ -321,6 +344,7 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.composer.insert_text(&character.to_string());
+                self.pending_indexed_file_selection = None;
                 self.suggestion_selected = 0;
                 None
             }
@@ -355,11 +379,13 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.composer.backspace();
+                self.pending_indexed_file_selection = None;
                 self.suggestion_selected = 0;
                 None
             }
             KeyCode::Delete => {
                 self.composer.delete();
+                self.pending_indexed_file_selection = None;
                 self.suggestion_selected = 0;
                 None
             }
@@ -379,6 +405,7 @@ impl App {
         if self.screen == Screen::Chat && self.auth_dialog.is_none() {
             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
             self.composer.insert_text(&normalized);
+            self.pending_indexed_file_selection = None;
             self.suggestion_selected = 0;
             self.last_escape = None;
         }
@@ -419,6 +446,14 @@ impl App {
 
     pub fn register_command(&mut self, command: impl Command + 'static) {
         self.commands.register(command);
+    }
+
+    fn pending_indexed_file_query(&self) -> Option<String> {
+        if !self.indexed_workspace_search {
+            return None;
+        }
+        let query = self.workspace_file_query()?;
+        (self.indexed_suggestion_query.as_deref() != Some(query.as_str())).then_some(query)
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
@@ -1336,6 +1371,24 @@ mod tests {
 
         assert_eq!(app.suggestions()[0].label, "src/main.rs");
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
+        assert_eq!(app.composer.text(), "please inspect @src/main.rs");
+        assert_eq!(app.composer.attachments()[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn enter_before_indexed_results_arrive_attaches_the_ranked_file_when_ready() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.use_indexed_workspace_search();
+        app.composer.insert_text("please inspect @src/maim");
+        assert!(app.suggestions().is_empty());
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
+        assert_eq!(app.composer.text(), "please inspect @src/maim");
+        assert!(app.composer.attachments().is_empty());
+
+        app.set_indexed_file_suggestions("src/maim".into(), vec!["src/main.rs".into()]);
+
         assert_eq!(app.composer.text(), "please inspect @src/main.rs");
         assert_eq!(app.composer.attachments()[0].path, "src/main.rs");
     }
