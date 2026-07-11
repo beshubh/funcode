@@ -287,6 +287,12 @@ impl App {
         app
     }
 
+    pub fn replace_files(&mut self, files: Vec<String>) {
+        self.workspace_files = files;
+        self.workspace_files.sort();
+        self.suggestion_selected = 0;
+    }
+
     pub fn for_auth() -> Self {
         let mut app = Self {
             auth_only: true,
@@ -428,15 +434,7 @@ impl App {
             && text.starts_with('/')
             && !text.chars().any(char::is_whitespace)
         {
-            let commands: Vec<_> = self
-                .commands
-                .matching(&text[1..])
-                .map(|command| Suggestion {
-                    label: format!("/{}", command.name()),
-                    description: command.description().to_owned(),
-                    kind: SuggestionKind::Command,
-                })
-                .collect();
+            let commands = self.command_suggestions(&text[1..]);
             if !commands.is_empty() {
                 return commands;
             }
@@ -454,6 +452,21 @@ impl App {
                 label: path.clone(),
                 description: "File".to_owned(),
                 kind: SuggestionKind::File,
+            })
+            .collect()
+    }
+
+    pub fn available_commands(&self) -> Vec<Suggestion> {
+        self.command_suggestions("")
+    }
+
+    fn command_suggestions(&self, query: &str) -> Vec<Suggestion> {
+        self.commands
+            .matching(query)
+            .map(|command| Suggestion {
+                label: format!("/{}", command.name()),
+                description: command.description().to_owned(),
+                kind: SuggestionKind::Command,
             })
             .collect()
     }
@@ -840,6 +853,19 @@ mod tests {
 
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
         assert_eq!(app.composer.text(), "please inspect @src/main.rs ");
+    }
+
+    #[test]
+    fn unmatched_at_text_is_submitted_as_plain_text() {
+        let mut app = App::with_files(["src/main.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("please inspect @somebf here");
+
+        assert!(app.suggestions().is_empty());
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::Submit { prompt, .. }) if prompt == "please inspect @somebf here"
+        ));
     }
 
     #[test]

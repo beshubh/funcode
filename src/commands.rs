@@ -94,3 +94,22 @@ impl Command for ExitCommand {
         Some(AppAction::Quit)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CommandRegistry;
+
+    #[test]
+    fn builtins_can_be_matched_by_prefix_and_found_by_exact_name() {
+        let registry = CommandRegistry::with_builtins();
+
+        let matches: Vec<_> = registry
+            .matching("a")
+            .map(|command| command.name())
+            .collect();
+
+        assert_eq!(matches, ["auth"]);
+        assert_eq!(registry.find("exit").unwrap().description(), "Exit funcode");
+        assert!(registry.find("missing").is_none());
+    }
+}

@@ -11,7 +11,7 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+        Event, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
@@ -71,13 +71,14 @@ pub fn run() -> Result<()> {
 }
 
 fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result<()> {
+    let workspace_runner = match launch_mode {
+        LaunchMode::Interactive => std::env::current_dir()
+            .ok()
+            .map(workspace::WorkspaceTaskRunner::spawn),
+        LaunchMode::AuthOnly => None,
+    };
     let mut app = match launch_mode {
-        LaunchMode::Interactive => {
-            let files = std::env::current_dir()
-                .map(|root| workspace::discover_files(&root))
-                .unwrap_or_default();
-            App::with_files(files)
-        }
+        LaunchMode::Interactive => App::new(),
         LaunchMode::AuthOnly => App::for_auth(),
     };
     let theme = Theme::default();
@@ -97,6 +98,12 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     let mut regions = ui::UiRegions::default();
 
     while !should_quit {
+        if let Some(files) = workspace_runner
+            .as_ref()
+            .and_then(workspace::WorkspaceTaskRunner::try_files)
+        {
+            app.replace_files(files);
+        }
         if let Some(runner) = runner.as_ref() {
             while let Some(agent_event) = runner.try_event() {
                 app.handle_agent_event(agent_event);
@@ -119,49 +126,11 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                     }
                 }
                 Event::Paste(text) => app.handle_paste(&text),
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        match regions.target_at(mouse.column, mouse.row) {
-                            Some(ui::UiTarget::Thinking) => app.toggle_thinking(),
-                            Some(ui::UiTarget::Tools) => app.toggle_tools(),
-                            Some(ui::UiTarget::AuthProvider) => {
-                                if let Some(action) = app.select_auth_provider() {
-                                    should_quit =
-                                        dispatch(action, &mut app, runner.as_ref(), &auth_runner);
-                                }
-                            }
-                            Some(ui::UiTarget::Suggestion(index)) => {
-                                if let Some(action) = app.activate_suggestion(index) {
-                                    should_quit =
-                                        dispatch(action, &mut app, runner.as_ref(), &auth_runner);
-                                }
-                            }
-                            None => {}
-                        }
+                Event::Mouse(mouse) => {
+                    if let Some(action) = handle_mouse(&mut app, &regions, mouse) {
+                        should_quit = dispatch(action, &mut app, runner.as_ref(), &auth_runner);
                     }
-                    MouseEventKind::Moved => {
-                        if let Some(ui::UiTarget::Suggestion(index)) =
-                            regions.target_at(mouse.column, mouse.row)
-                        {
-                            app.set_suggestion_selection(index);
-                        }
-                    }
-                    MouseEventKind::ScrollUp => {
-                        if app.suggestions().is_empty() {
-                            app.move_auth_selection(-1);
-                        } else {
-                            app.move_suggestion_selection(-1);
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if app.suggestions().is_empty() {
-                            app.move_auth_selection(1);
-                        } else {
-                            app.move_suggestion_selection(1);
-                        }
-                    }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
         }
@@ -177,6 +146,45 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     }
     auth_runner.shutdown();
     Ok(())
+}
+
+fn handle_mouse(app: &mut App, regions: &ui::UiRegions, mouse: MouseEvent) -> Option<AppAction> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            match regions.target_at(mouse.column, mouse.row) {
+                Some(ui::UiTarget::Thinking) => app.toggle_thinking(),
+                Some(ui::UiTarget::Tools) => app.toggle_tools(),
+                Some(ui::UiTarget::AuthProvider) => return app.select_auth_provider(),
+                Some(ui::UiTarget::Suggestion(index)) => {
+                    return app.activate_suggestion(index);
+                }
+                None => {}
+            }
+        }
+        MouseEventKind::Moved => {
+            if let Some(ui::UiTarget::Suggestion(index)) =
+                regions.target_at(mouse.column, mouse.row)
+            {
+                app.set_suggestion_selection(index);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if app.suggestions().is_empty() {
+                app.move_auth_selection(-1);
+            } else {
+                app.move_suggestion_selection(-1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.suggestions().is_empty() {
+                app.move_auth_selection(1);
+            } else {
+                app.move_suggestion_selection(1);
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 fn dispatch(
@@ -324,7 +332,22 @@ fn install_restoring_panic_hook(keyboard_enhancement: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::LaunchMode;
+    use super::{LaunchMode, handle_mouse};
+    use crate::{
+        app::{App, AppAction, Screen},
+        ui::UiRegions,
+    };
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
 
     #[test]
     fn auth_is_the_supported_cli_subcommand() {
@@ -340,5 +363,38 @@ mod tests {
                 .contains("auth")
         );
         assert!(LaunchMode::parse(["auth", "extra"]).is_err());
+    }
+
+    #[test]
+    fn mouse_hover_wheel_and_click_control_suggestions() {
+        let mut app = App::with_files(["src/app.rs", "src/main.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("@src/");
+        let regions = UiRegions {
+            suggestions: vec![Rect::new(0, 0, 20, 1), Rect::new(0, 1, 20, 1)],
+            ..UiRegions::default()
+        };
+
+        assert_eq!(
+            handle_mouse(&mut app, &regions, mouse(MouseEventKind::Moved, 1, 1)),
+            None
+        );
+        assert_eq!(app.selected_suggestion(), 1);
+        handle_mouse(&mut app, &regions, mouse(MouseEventKind::ScrollUp, 1, 1));
+        assert_eq!(app.selected_suggestion(), 0);
+        handle_mouse(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 1, 1));
+        assert_eq!(app.selected_suggestion(), 1);
+
+        let mut commands = App::new();
+        commands.screen = Screen::Chat;
+        commands.composer.insert_text("/");
+        assert_eq!(
+            handle_mouse(
+                &mut commands,
+                &regions,
+                mouse(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            ),
+            Some(AppAction::Quit)
+        );
     }
 }
