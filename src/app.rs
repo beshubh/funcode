@@ -1,7 +1,8 @@
 use crate::{
     agent::{AgentEvent, RequestId},
     auth::AuthEvent,
-    commands::{Command, CommandRegistry},
+    commands::{Command, CommandBehavior, CommandRegistry},
+    composer::{ComposerDocument, SessionMode},
     transcript::{Attachment, EntryId, EntryKind, Transcript, TranscriptEvent},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -75,6 +76,7 @@ pub enum AppAction {
         request_id: RequestId,
         prompt: String,
         attachments: Vec<Attachment>,
+        mode: SessionMode,
     },
     Cancel {
         request_id: RequestId,
@@ -104,138 +106,13 @@ pub struct Suggestion {
     pub kind: SuggestionKind,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Composer {
-    text: String,
-    cursor: usize,
-    attachments: Vec<Attachment>,
-}
-
-impl Composer {
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    pub fn attachments(&self) -> &[Attachment] {
-        &self.attachments
-    }
-
-    pub fn insert_text(&mut self, text: &str) {
-        self.text.insert_str(self.cursor, text);
-        self.cursor += text.len();
-    }
-
-    fn take(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.text)
-    }
-
-    fn take_submission(&mut self) -> (String, Vec<Attachment>) {
-        (self.take(), std::mem::take(&mut self.attachments))
-    }
-
-    fn attach_file(&mut self, path: String) {
-        if !self
-            .attachments
-            .iter()
-            .any(|attachment| attachment.path == path)
-        {
-            self.attachments.push(Attachment::workspace_file(path));
-        }
-    }
-
-    fn move_left(&mut self) {
-        if let Some((index, _)) = self.text[..self.cursor].char_indices().next_back() {
-            self.cursor = index;
-        }
-    }
-
-    fn move_right(&mut self) {
-        if let Some(character) = self.text[self.cursor..].chars().next() {
-            self.cursor += character.len_utf8();
-        }
-    }
-
-    fn move_home(&mut self) {
-        self.cursor = self.text[..self.cursor]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.text[self.cursor..]
-            .find('\n')
-            .map_or(self.text.len(), |index| self.cursor + index);
-    }
-
-    fn move_up(&mut self) {
-        let current_start = self.text[..self.cursor]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        if current_start == 0 {
-            return;
-        }
-
-        let column = self.text[current_start..self.cursor].chars().count();
-        let previous_end = current_start - 1;
-        let previous_start = self.text[..previous_end]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        self.cursor = previous_start
-            + byte_index_at_character(&self.text[previous_start..previous_end], column);
-    }
-
-    fn move_down(&mut self) {
-        let current_start = self.text[..self.cursor]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        let column = self.text[current_start..self.cursor].chars().count();
-        let Some(end_offset) = self.text[self.cursor..].find('\n') else {
-            return;
-        };
-        let next_start = self.cursor + end_offset + 1;
-        let next_end = self.text[next_start..]
-            .find('\n')
-            .map_or(self.text.len(), |index| next_start + index);
-        self.cursor =
-            next_start + byte_index_at_character(&self.text[next_start..next_end], column);
-    }
-
-    fn backspace(&mut self) {
-        let old_cursor = self.cursor;
-        self.move_left();
-        if self.cursor != old_cursor {
-            self.text.drain(self.cursor..old_cursor);
-        }
-    }
-
-    fn delete(&mut self) {
-        if let Some(character) = self.text[self.cursor..].chars().next() {
-            self.text
-                .drain(self.cursor..self.cursor + character.len_utf8());
-        }
-    }
-
-    fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) {
-        self.text.replace_range(range.clone(), replacement);
-        self.cursor = range.start + replacement.len();
-    }
-}
-
-fn byte_index_at_character(text: &str, character_index: usize) -> usize {
-    text.char_indices()
-        .nth(character_index)
-        .map_or(text.len(), |(index, _)| index)
-}
+pub type Composer = ComposerDocument;
 
 #[derive(Debug, Default)]
 pub struct App {
     pub screen: Screen,
     pub composer: Composer,
+    pub session_mode: SessionMode,
     pub transcript: Transcript,
     pub active_request: Option<RequestId>,
     pub animation_frame: usize,
@@ -293,10 +170,6 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, now: Instant) -> Option<AppAction> {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Some(AppAction::Quit);
-        }
-
         if self.auth_dialog.is_some() {
             return self.handle_auth_key(key);
         }
@@ -431,14 +304,15 @@ impl App {
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
-        let text = self.composer.text();
-        if self.composer.cursor() == text.len()
-            && text.starts_with('/')
-            && !text.chars().any(char::is_whitespace)
-        {
+        if let Some((range, query)) = self.composer.active_command_query() {
+            let standalone =
+                range.start == 0 && self.composer.cursor() == self.composer.text().len();
             let commands: Vec<_> = self
                 .commands
-                .matching(&text[1..])
+                .matching(query)
+                .filter(|command| {
+                    standalone || matches!(command.behavior(), CommandBehavior::Mode(_))
+                })
                 .map(|command| Suggestion {
                     label: format!("/{}", command.name()),
                     description: command.description().to_owned(),
@@ -450,7 +324,7 @@ impl App {
             }
         }
 
-        let Some((_, query)) = active_file_query(text, self.composer.cursor()) else {
+        let Some((_, query)) = self.composer.active_file_query() else {
             return Vec::new();
         };
         let query = query.to_lowercase();
@@ -470,15 +344,29 @@ impl App {
         let suggestion = self.suggestions().get(index)?.clone();
         match suggestion.kind {
             SuggestionKind::Command => {
-                self.composer.take();
-                self.commands
-                    .find(suggestion.label.trim_start_matches('/'))?
-                    .execute(self)
+                let command = self
+                    .commands
+                    .find(suggestion.label.trim_start_matches('/'))?;
+                let (range, _) = self.composer.active_command_query()?;
+                match command.behavior() {
+                    CommandBehavior::Immediate => {
+                        if range.start != 0 || self.composer.cursor() != self.composer.text().len()
+                        {
+                            return None;
+                        }
+                        self.composer.take_submission();
+                        command.execute(self)
+                    }
+                    CommandBehavior::Mode(mode) => {
+                        self.composer.insert_mode(range, mode);
+                        self.suggestion_selected = 0;
+                        None
+                    }
+                }
             }
             SuggestionKind::File => {
-                let (range, _) = active_file_query(self.composer.text(), self.composer.cursor())?;
-                self.composer.replace_range(range, "");
-                self.composer.attach_file(suggestion.label);
+                let (range, _) = self.composer.active_file_query()?;
+                self.composer.insert_file_reference(range, suggestion.label);
                 self.suggestion_selected = 0;
                 None
             }
@@ -835,24 +723,30 @@ impl App {
     }
 
     fn submit_composer(&mut self) -> Option<AppAction> {
-        let command = self
-            .composer
-            .text()
-            .strip_prefix('/')
-            .and_then(|name| self.commands.find(name));
-        if let Some(command) = command {
-            self.composer.take();
+        if self.composer.content().tokens().is_empty()
+            && let Some(command) = self
+                .composer
+                .text()
+                .strip_prefix('/')
+                .and_then(|name| self.commands.find(name))
+            && command.behavior() == CommandBehavior::Immediate
+        {
+            self.composer.take_submission();
             return command.execute(self);
         }
-        if self.composer.text().trim().is_empty() {
+        let content = self.composer.content();
+        if content.prompt_text().trim().is_empty() {
             return None;
         }
 
-        let (prompt, attachments) = self.composer.take_submission();
+        let content = self.composer.take_submission();
+        let mode = content.requested_mode().unwrap_or(self.session_mode);
+        self.session_mode = mode;
+        let prompt = content.prompt_text();
+        let attachments = content.attachments();
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
-        self.transcript
-            .submit(request_id, prompt.clone(), attachments.clone());
+        self.transcript.submit_content(request_id, content);
         if self.follow_output {
             self.scroll_from_bottom = 0;
         }
@@ -861,6 +755,7 @@ impl App {
             request_id,
             prompt,
             attachments,
+            mode,
         })
     }
 
@@ -873,20 +768,6 @@ impl App {
     }
 }
 
-fn active_file_query(text: &str, cursor: usize) -> Option<(std::ops::Range<usize>, &str)> {
-    let start = text[..cursor].rfind('@')?;
-    let is_token_start = start == 0
-        || text[..start]
-            .chars()
-            .next_back()
-            .is_some_and(char::is_whitespace);
-    if !is_token_start {
-        return None;
-    }
-    let query = &text[start + 1..cursor];
-    (!query.chars().any(char::is_whitespace)).then_some((start..cursor, query))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{App, AppAction, AuthDialogPhase, AuthProvider, Screen, SuggestionKind};
@@ -894,6 +775,7 @@ mod tests {
         agent::AgentEvent,
         auth::AuthEvent,
         commands::Command,
+        composer::SessionMode,
         transcript::{AssistantStatus, EntryKind, ToolArtifact},
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -920,6 +802,21 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_does_not_exit_the_chat() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+
+        assert_eq!(
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Instant::now(),
+            ),
+            None
+        );
+        assert_eq!(app.screen, Screen::Chat);
+    }
+
+    #[test]
     fn at_query_at_a_token_boundary_attaches_the_selected_file() {
         let mut app = App::with_files(["Cargo.toml", "src/main.rs", "src/runtime.rs"]);
         app.screen = Screen::Chat;
@@ -931,7 +828,7 @@ mod tests {
         assert_eq!(suggestions[0].kind, SuggestionKind::File);
 
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
-        assert_eq!(app.composer.text(), "please inspect ");
+        assert_eq!(app.composer.text(), "please inspect @src/main.rs");
         assert_eq!(app.composer.attachments()[0].path, "src/main.rs");
     }
 
@@ -952,7 +849,7 @@ mod tests {
         app.composer.insert_text("@src/ma");
         assert_eq!(app.suggestions()[0].label, "src/main.rs");
 
-        app.composer.take();
+        app.composer.take_submission();
         app.composer.insert_text("inspect @src/ma");
         assert_eq!(app.suggestions()[0].label, "src/main.rs");
     }
@@ -976,6 +873,67 @@ mod tests {
             app.handle_key(key(KeyCode::Enter), Instant::now()),
             Some(AppAction::Submit { prompt, .. }) if prompt == "/auth later"
         ));
+    }
+
+    #[test]
+    fn plan_and_build_tokens_snapshot_the_session_mode_for_each_submission() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("review this /plan");
+        assert_eq!(app.suggestions()[0].label, "/plan");
+        app.activate_suggestion(0);
+        app.composer.insert_text(" carefully");
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::Submit {
+                mode: SessionMode::Plan,
+                ..
+            })
+        ));
+        assert_eq!(app.session_mode, SessionMode::Plan);
+
+        app.composer.insert_text("follow up");
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::Submit {
+                mode: SessionMode::Plan,
+                ..
+            })
+        ));
+
+        app.composer.insert_text("/build");
+        app.activate_suggestion(0);
+        app.composer.insert_text(" make it now");
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::Submit {
+                mode: SessionMode::Build,
+                ..
+            })
+        ));
+        assert_eq!(app.session_mode, SessionMode::Build);
+    }
+
+    #[test]
+    fn selecting_plan_twice_keeps_one_inline_mode_token() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("/plan");
+        app.activate_suggestion(0);
+        app.composer.insert_text(" /plan");
+        app.activate_suggestion(0);
+
+        assert_eq!(app.composer.text(), "[Plan] ");
+        assert_eq!(
+            app.composer
+                .content()
+                .tokens()
+                .iter()
+                .filter(|token| matches!(token.kind, crate::composer::InlineTokenKind::Mode(_)))
+                .count(),
+            1
+        );
     }
 
     #[derive(Debug)]
@@ -1108,6 +1066,7 @@ mod tests {
                 request_id: 1,
                 prompt: "hello".into(),
                 attachments: Vec::new(),
+                mode: SessionMode::Build,
             })
         );
         assert!(matches!(
@@ -1308,7 +1267,7 @@ mod tests {
         assert_eq!(
             app.handle_key(key(KeyCode::Char('c')), Instant::now()),
             Some(AppAction::CopyToClipboard {
-                text: "Review \n\nAttached files:\n- src/lib.rs".into(),
+                text: "Review @src/lib.rs".into(),
             })
         );
 

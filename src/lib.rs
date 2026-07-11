@@ -3,6 +3,7 @@ pub mod app;
 pub mod auth;
 pub mod clipboard;
 pub mod commands;
+pub mod composer;
 pub(crate) mod llm;
 pub mod theme;
 pub mod tools;

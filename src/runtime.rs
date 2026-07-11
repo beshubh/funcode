@@ -233,12 +233,16 @@ fn dispatch(
             request_id,
             prompt,
             attachments,
+            mode,
         } => {
             match runner {
                 Some(runner) => {
-                    if let Err(error) =
-                        runner.submit_with_attachments(request_id, prompt, attachments)
-                    {
+                    if let Err(error) = runner.submit_with_attachments_and_mode(
+                        request_id,
+                        prompt,
+                        attachments,
+                        mode,
+                    ) {
                         app.handle_agent_event(AgentEvent::Failed {
                             request_id,
                             message: error.to_string(),

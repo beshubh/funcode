@@ -1,3 +1,5 @@
+pub use crate::composer::Attachment;
+use crate::composer::ComposerContent;
 use std::fmt;
 
 pub type EntryId = u64;
@@ -5,35 +7,15 @@ pub type TurnId = u64;
 pub type ToolCallId = u64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Attachment {
-    pub path: String,
-}
-
-impl Attachment {
-    pub fn workspace_file(path: impl Into<String>) -> Self {
-        Self { path: path.into() }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserMessage {
     pub text: String,
     pub attachments: Vec<Attachment>,
+    pub content: ComposerContent,
 }
 
 impl UserMessage {
     pub fn copy_text(&self) -> String {
-        if self.attachments.is_empty() {
-            return self.text.clone();
-        }
-
-        let attachments = self
-            .attachments
-            .iter()
-            .map(|attachment| format!("- {}", attachment.path))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("{}\n\nAttached files:\n{attachments}", self.text)
+        self.content.text().to_owned()
     }
 }
 
@@ -174,7 +156,30 @@ impl Transcript {
     }
 
     pub fn submit(&mut self, turn_id: TurnId, text: String, attachments: Vec<Attachment>) {
-        self.push(turn_id, EntryKind::User(UserMessage { text, attachments }));
+        let content = ComposerContent::with_attachments(text, &attachments);
+        self.push_submission(turn_id, content, attachments);
+    }
+
+    pub fn submit_content(&mut self, turn_id: TurnId, content: ComposerContent) {
+        let attachments = content.attachments();
+        self.push_submission(turn_id, content, attachments);
+    }
+
+    fn push_submission(
+        &mut self,
+        turn_id: TurnId,
+        content: ComposerContent,
+        attachments: Vec<Attachment>,
+    ) {
+        let text = content.prompt_text();
+        self.push(
+            turn_id,
+            EntryKind::User(UserMessage {
+                text,
+                attachments,
+                content,
+            }),
+        );
         self.push(
             turn_id,
             EntryKind::Assistant(AssistantMessage {
@@ -497,15 +502,13 @@ mod tests {
     }
 
     #[test]
-    fn copied_user_message_includes_attachment_paths() {
+    fn copied_user_message_preserves_inline_content() {
         let message = super::UserMessage {
             text: "Please inspect this".into(),
             attachments: vec![Attachment::workspace_file("src/lib.rs")],
+            content: crate::composer::ComposerContent::plain("Please inspect this"),
         };
 
-        assert_eq!(
-            message.copy_text(),
-            "Please inspect this\n\nAttached files:\n- src/lib.rs"
-        );
+        assert_eq!(message.copy_text(), "Please inspect this");
     }
 }

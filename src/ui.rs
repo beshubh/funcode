@@ -236,21 +236,9 @@ fn render_message_dialog(
     frame.render_widget(block, dialog_area);
 
     let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).split(inner);
-    let mut lines = message
-        .text
-        .split('\n')
-        .map(|line| Line::from(line.to_owned()))
-        .collect::<Vec<_>>();
-    if !message.attachments.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::styled("Attached files", theme.muted));
-        lines.extend(message.attachments.iter().map(|attachment| {
-            Line::styled(
-                format!(" [file] {} ", attachment.path),
-                theme.attachment_badge,
-            )
-        }));
-    }
+    let lines = message
+        .content
+        .lines(theme.input, theme.attachment_badge, theme.status);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
         rows[0],
@@ -356,7 +344,7 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
             Span::styled("/exit", theme.status),
             Span::raw("      quit funcode"),
         ]),
-        Line::styled("Enter start  ·  Ctrl+C quit", theme.muted),
+        Line::styled("Enter start  ·  /exit quit", theme.muted),
     ]);
     frame.render_widget(
         Paragraph::new(help)
@@ -458,12 +446,13 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let block = panel_block("Enter send · Shift+Enter new line", theme);
+    let title = format!(
+        "Enter send · Shift+Enter new line · Mode: {}",
+        app.session_mode.label()
+    );
+    let block = panel_block(title.as_str(), theme);
     let inner = block.inner(area);
-    let attachment_height = attachment_badge_height(app, inner.width, theme);
-    let rows =
-        Layout::vertical([Constraint::Length(attachment_height), Constraint::Min(1)]).split(inner);
-    let input_area = rows[1];
+    let input_area = inner;
     let (cursor_column, cursor_row) = composer_cursor(
         app.composer.text(),
         app.composer.cursor(),
@@ -473,16 +462,14 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
     let content = if app.composer.text().is_empty() {
         Text::from(Line::styled("Type something…", theme.muted))
     } else {
-        Text::styled(app.composer.text().to_owned(), theme.input)
+        Text::from(app.composer.content().lines(
+            theme.input,
+            theme.attachment_badge,
+            theme.status.add_modifier(Modifier::REVERSED),
+        ))
     };
 
     frame.render_widget(block, area);
-    if attachment_height > 0 {
-        frame.render_widget(
-            Paragraph::new(attachment_badges(app, theme)).wrap(Wrap { trim: false }),
-            rows[0],
-        );
-    }
     frame.render_widget(
         Paragraph::new(content)
             .wrap(Wrap { trim: false })
@@ -500,34 +487,8 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
 }
 
 fn composer_height(app: &App, width: u16, theme: &Theme) -> u16 {
-    let inner_width = width.saturating_sub(2).max(1);
-    5u16.saturating_add(attachment_badge_height(app, inner_width, theme))
-}
-
-fn attachment_badge_height(app: &App, width: u16, theme: &Theme) -> u16 {
-    if app.composer.attachments().is_empty() {
-        return 0;
-    }
-    let width = width.max(1) as usize;
-    attachment_badges(app, theme)
-        .width()
-        .div_ceil(width)
-        .max(1)
-        .min(u16::MAX as usize) as u16
-}
-
-fn attachment_badges(app: &App, theme: &Theme) -> Line<'static> {
-    let mut spans = Vec::new();
-    for attachment in app.composer.attachments() {
-        if !spans.is_empty() {
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::styled(
-            format!(" [file] {} ", attachment.path),
-            theme.attachment_badge,
-        ));
-    }
-    Line::from(spans)
+    let _ = (app, width, theme);
+    5
 }
 
 fn composer_cursor(text: &str, cursor: usize, width: u16) -> (u16, u16) {
@@ -667,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn attached_files_render_as_badges_in_the_composer_before_send() {
+    fn attached_files_render_inline_in_the_composer_before_send() {
         let mut app = App::with_files(["src/app.rs"]);
         app.screen = Screen::Chat;
         app.composer.insert_text("Review @src/app.rs");
@@ -675,11 +636,11 @@ mod tests {
 
         let (screen, _, _, _) = render_to_string(&app, 100, 30);
 
-        assert!(screen.contains("[file] src/app.rs"));
+        assert!(screen.contains("Review @src/app.rs"));
     }
 
     #[test]
-    fn attachment_badges_use_the_theme_accent_color() {
+    fn inline_file_references_use_the_theme_accent_color() {
         let mut app = App::with_files(["src/app.rs"]);
         app.screen = Screen::Chat;
         app.composer.insert_text("@src/app.rs");
@@ -699,7 +660,7 @@ mod tests {
             .buffer()
             .content()
             .iter()
-            .find(|cell| cell.symbol() == "[")
+            .find(|cell| cell.symbol() == "@")
             .unwrap();
         assert_eq!(badge_cell.style().fg, theme.logo_accent.fg);
         assert!(badge_cell.style().add_modifier.contains(Modifier::REVERSED));
@@ -934,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn user_message_modal_exposes_copy_and_a_deferred_revert_control() {
+    fn user_message_modal_exposes_inline_files_and_a_deferred_revert_control() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.transcript.submit(
@@ -949,13 +910,13 @@ mod tests {
         assert!(screen.contains("Message"));
         assert!(screen.contains("Copy"));
         assert!(screen.contains("Revert (coming soon)"));
-        assert!(screen.contains("[file] src/app.rs"));
+        assert!(screen.contains("@src/app.rs"));
         assert!(regions.message_copy.is_some());
         assert!(!cursor_visible);
     }
 
     #[test]
-    fn submitted_user_messages_render_attached_file_badges_in_the_transcript() {
+    fn submitted_user_messages_render_file_references_in_the_transcript() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.transcript.submit(
@@ -967,7 +928,7 @@ mod tests {
         let (screen, _, regions, _) = render_to_string(&app, 100, 30);
 
         assert!(screen.contains("┌─ you"));
-        assert!(screen.contains("[file] src/app.rs"));
+        assert!(screen.contains("@src/app.rs"));
         assert_eq!(
             regions.target_at(
                 regions.transcript_entries[0].area.x,

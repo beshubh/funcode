@@ -114,19 +114,17 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
                 Span::styled("┌─ you", theme.user),
                 Span::styled(" · click to open", theme.muted),
             ])];
-            lines.extend(message_lines(&message.text, theme.input));
-            if !message.attachments.is_empty() {
-                lines.push(Line::styled("│ Attached files", theme.muted));
-                lines.extend(message.attachments.iter().map(|attachment| {
-                    Line::from(vec![
-                        Span::styled("│ ", theme.muted),
-                        Span::styled(
-                            format!(" [file] {} ", attachment.path),
-                            theme.attachment_badge,
-                        ),
-                    ])
-                }));
-            }
+            lines.extend(
+                message
+                    .content
+                    .lines(theme.input, theme.attachment_badge, theme.status)
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = vec![Span::styled("│ ", theme.muted)];
+                        spans.extend(line.spans);
+                        Line::from(spans)
+                    }),
+            );
             lines.push(Line::styled("└", theme.user));
             lines
         }

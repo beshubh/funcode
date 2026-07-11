@@ -1,3 +1,4 @@
+use crate::composer::SessionMode;
 use futures::{
     StreamExt,
     future::BoxFuture,
@@ -122,20 +123,42 @@ impl LlmClient {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn stream(&self, prompt: String) -> Result<LlmStream, LlmError> {
+        self.stream_with_mode(prompt.clone(), prompt, SessionMode::Build)
+            .await
+    }
+
+    pub(crate) async fn stream_with_mode(
+        &self,
+        prompt: String,
+        history_prompt: String,
+        mode: SessionMode,
+    ) -> Result<LlmStream, LlmError> {
         let history = self
             .history
             .lock()
             .map_err(|_| LlmError::Internal("the LLM conversation is unavailable".into()))?
             .clone();
+        let model_prompt = prompt_with_mode(prompt, mode);
         let stream = self
             .provider
-            .stream(ProviderRequest { prompt, history })
+            .stream(ProviderRequest {
+                prompt: model_prompt,
+                history,
+            })
             .await?;
         Ok(Box::pin(stream.map(move |event| match event? {
             ProviderEvent::TextDelta(text) => Ok(LlmEvent::TextDelta(text)),
             ProviderEvent::ReasoningDelta(summary) => Ok(LlmEvent::ReasoningDelta(summary)),
-            ProviderEvent::Completed(history) => {
+            ProviderEvent::Completed(mut history) => {
+                if let Some(ConversationMessage::User(prompt)) = history
+                    .iter_mut()
+                    .rev()
+                    .find(|message| matches!(message, ConversationMessage::User(_)))
+                {
+                    *prompt = history_prompt.clone();
+                }
                 Ok(LlmEvent::Completed(ConversationCommit { history }))
             }
         })))
@@ -148,6 +171,15 @@ impl LlmClient {
             .map_err(|_| LlmError::Internal("the LLM conversation is unavailable".into()))? =
             commit.history;
         Ok(())
+    }
+}
+
+fn prompt_with_mode(prompt: String, mode: SessionMode) -> String {
+    match mode {
+        SessionMode::Build => prompt,
+        SessionMode::Plan => format!(
+            "Plan mode is active. Produce a decision-complete implementation plan and do not modify files or execute tools.\n\n{prompt}"
+        ),
     }
 }
 
@@ -256,6 +288,54 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests[1].prompt, "second");
         assert_eq!(requests[1].history, first_history);
+    }
+
+    #[tokio::test]
+    async fn plan_instructions_are_not_saved_in_conversation_history() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            requests: Arc::clone(&requests),
+            responses: Mutex::new(VecDeque::from([
+                vec![Ok(ProviderEvent::Completed(vec![
+                    ConversationMessage::User("generated plan instruction".into()),
+                    ConversationMessage::Assistant("a plan".into()),
+                ]))],
+                vec![Ok(ProviderEvent::Completed(Vec::new()))],
+            ])),
+        };
+        let client = LlmClient::with_provider(Arc::new(provider));
+
+        let events = client
+            .stream_with_mode(
+                "review the architecture".into(),
+                "review the architecture".into(),
+                crate::composer::SessionMode::Plan,
+            )
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let commit = events
+            .into_iter()
+            .find_map(|event| match event.unwrap() {
+                LlmEvent::Completed(commit) => Some(commit),
+                LlmEvent::TextDelta(_) | LlmEvent::ReasoningDelta(_) => None,
+            })
+            .unwrap();
+        client.commit(commit).unwrap();
+        client
+            .stream("build it".into())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].prompt.contains("Plan mode is active"));
+        assert_eq!(
+            requests[1].history[0],
+            ConversationMessage::User("review the architecture".into())
+        );
     }
 
     #[tokio::test]

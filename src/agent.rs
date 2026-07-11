@@ -1,9 +1,12 @@
-use crate::llm::{ConversationCommit, LlmClient, LlmEvent};
-use crate::tools::{ReadFile, WorkspaceFileReader};
-use crate::transcript::{Attachment, ToolArtifact, ToolCallId};
+use crate::{
+    composer::SessionMode,
+    llm::{ConversationCommit, LlmClient, LlmEvent},
+    tools::{ReadFile, WorkspaceFileReader},
+    transcript::{Attachment, ToolArtifact, ToolCallId},
+};
 use futures::StreamExt as _;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     fmt,
     sync::mpsc::{self, Receiver, Sender},
     thread::{self, JoinHandle},
@@ -60,6 +63,7 @@ enum AgentCommand {
         request_id: RequestId,
         prompt: String,
         attachments: Vec<Attachment>,
+        mode: SessionMode,
     },
     Cancel {
         request_id: RequestId,
@@ -115,11 +119,22 @@ impl AgentTaskRunner {
         prompt: String,
         attachments: Vec<Attachment>,
     ) -> Result<(), RunnerUnavailable> {
+        self.submit_with_attachments_and_mode(request_id, prompt, attachments, SessionMode::Build)
+    }
+
+    pub fn submit_with_attachments_and_mode(
+        &self,
+        request_id: RequestId,
+        prompt: String,
+        attachments: Vec<Attachment>,
+        mode: SessionMode,
+    ) -> Result<(), RunnerUnavailable> {
         self.commands
             .send(AgentCommand::Submit {
                 request_id,
                 prompt,
                 attachments,
+                mode,
             })
             .map_err(|_| RunnerUnavailable)
     }
@@ -161,6 +176,7 @@ struct PendingRequest {
     request_id: RequestId,
     prompt: String,
     attachments: Vec<Attachment>,
+    mode: SessionMode,
 }
 
 struct ActiveRequest {
@@ -257,8 +273,8 @@ async fn run_coordinator_with_updates(
 
         tokio::select! {
             command = commands.recv() => match command {
-                Some(AgentCommand::Submit { request_id, prompt, attachments }) => {
-                    pending.push_back(PendingRequest { request_id, prompt, attachments });
+                Some(AgentCommand::Submit { request_id, prompt, attachments, mode }) => {
+                    pending.push_back(PendingRequest { request_id, prompt, attachments, mode });
                 }
                 Some(AgentCommand::Cancel { request_id }) => {
                     if active.as_ref().map(|request| request.request_id) == Some(request_id) {
@@ -359,8 +375,11 @@ async fn run_request(
             return;
         }
     };
-    let prompt = prompt_with_attachments(request.prompt, &files);
-    let mut stream = match llm.stream(prompt).await {
+    let prompt = prompt_with_attachments(request.prompt.clone(), &files);
+    let mut stream = match llm
+        .stream_with_mode(prompt, request.prompt, request.mode)
+        .await
+    {
         Ok(stream) => stream,
         Err(error) => {
             let _ = updates.send(RequestUpdate::Failed {
@@ -418,8 +437,10 @@ fn read_attachments(
     reader: &WorkspaceFileReader,
     updates: &async_mpsc::UnboundedSender<RequestUpdate>,
 ) -> Result<Vec<ReadFile>, String> {
+    let mut paths = HashSet::new();
     attachments
         .iter()
+        .filter(|attachment| paths.insert(attachment.path.as_str()))
         .enumerate()
         .map(|(index, attachment)| {
             let call_id = attachment_call_id(request_id, index);
@@ -487,8 +508,9 @@ fn prompt_with_attachments(prompt: String, files: &[ReadFile]) -> String {
 mod tests {
     use super::{
         AgentCommand, AgentEvent, AgentTaskRunner, RequestUpdate, prompt_with_attachments,
-        run_coordinator_with_updates,
+        read_attachments, run_coordinator_with_updates,
     };
+    use crate::composer::SessionMode;
     use crate::llm::{
         ConversationMessage, LlmClient, LlmError, Provider, ProviderEvent, ProviderRequest,
         ProviderStream,
@@ -516,6 +538,25 @@ mod tests {
 
         assert!(prompt.contains("src/app.rs"));
         assert!(prompt.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn duplicate_attachment_paths_are_read_once_in_first_mention_order() {
+        let reader = WorkspaceFileReader::from_current_dir().unwrap();
+        let (updates, _update_rx) = tokio::sync::mpsc::unbounded_channel();
+        let files = read_attachments(
+            1,
+            &[
+                crate::transcript::Attachment::workspace_file("Cargo.toml"),
+                crate::transcript::Attachment::workspace_file("Cargo.toml"),
+            ],
+            &reader,
+            &updates,
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "Cargo.toml");
     }
 
     #[test]
@@ -738,6 +779,7 @@ mod tests {
                 request_id: 1,
                 prompt: "first".into(),
                 attachments: Vec::new(),
+                mode: SessionMode::Build,
             })
             .unwrap();
         assert_eq!(
@@ -763,6 +805,7 @@ mod tests {
                 request_id: 2,
                 prompt: "second".into(),
                 attachments: Vec::new(),
+                mode: SessionMode::Build,
             })
             .unwrap();
 
