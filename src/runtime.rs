@@ -91,6 +91,10 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
             let auth_store =
                 AuthStore::standard().context("failed to locate ChatGPT credentials")?;
             let llm = LlmClient::new(config, auth_store).context("failed to configure the LLM")?;
+            app.set_current_model(
+                llm.current_model()
+                    .context("failed to read the selected model")?,
+            );
             (
                 Some(AgentTaskRunner::spawn(llm.clone())),
                 Some(ModelCatalogTaskRunner::spawn(llm)),
@@ -249,12 +253,14 @@ fn handle_mouse_event(
                 app.select_auth_provider()
             }
             Some(ui::UiTarget::Suggestion(index)) => app.activate_suggestion(index),
+            Some(ui::UiTarget::Model(index)) => app.activate_model(index),
             None => None,
         },
         MouseEventKind::Moved => {
             match regions.target_at(mouse.column, mouse.row) {
                 Some(ui::UiTarget::Suggestion(index)) => app.set_suggestion_selection(index),
                 Some(ui::UiTarget::AuthProvider(index)) => app.set_auth_selection(index),
+                Some(ui::UiTarget::Model(index)) => app.set_model_selection(index),
                 _ => {}
             }
             None
@@ -381,6 +387,20 @@ fn dispatch(
             }
             false
         }
+        AppAction::SelectModel { model } => {
+            match model_runner {
+                Some(model_runner) => {
+                    if let Err(error) = model_runner.select_model(model.clone()) {
+                        app.set_notice(error.to_string());
+                    } else {
+                        app.set_current_model(model.clone());
+                        app.set_notice(format!("Model changed to {model}"));
+                    }
+                }
+                None => app.set_notice("model selection is unavailable"),
+            }
+            false
+        }
         AppAction::Quit => true,
     }
 }
@@ -482,8 +502,10 @@ mod tests {
         app::{App, AppAction, Screen},
         auth::AuthTaskRunner,
         clipboard::{Clipboard, ClipboardTaskRunner},
+        llm::{ModelInfo, ProviderModels},
+        model_catalog::ModelCatalogEvent,
         terminal_selection::TerminalSelection,
-        ui::UiRegions,
+        ui::{ModelRegion, UiRegions},
     };
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{buffer::Buffer, layout::Rect, style::Style};
@@ -565,6 +587,53 @@ mod tests {
     }
 
     #[test]
+    fn mouse_hover_highlights_and_click_selects_a_model() {
+        let mut app = App::new();
+        app.open_models_dialog();
+        app.handle_model_catalog_event(ModelCatalogEvent::Loaded(vec![ProviderModels {
+            provider: "Test".into(),
+            source: "built-in catalog".into(),
+            models: vec![
+                ModelInfo {
+                    id: "model-a".into(),
+                    display_name: "Model A".into(),
+                },
+                ModelInfo {
+                    id: "model-b".into(),
+                    display_name: "Model B".into(),
+                },
+            ],
+        }]));
+        let regions = UiRegions {
+            models: vec![
+                ModelRegion {
+                    index: 0,
+                    area: Rect::new(4, 5, 20, 1),
+                },
+                ModelRegion {
+                    index: 1,
+                    area: Rect::new(4, 6, 20, 1),
+                },
+            ],
+            ..UiRegions::default()
+        };
+
+        handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::Moved, 4, 6));
+        assert_eq!(app.selected_model_index(), 1);
+        assert_eq!(
+            handle_mouse_event(
+                &mut app,
+                &regions,
+                mouse(MouseEventKind::Up(MouseButton::Left), 4, 6),
+            ),
+            Some(AppAction::SelectModel {
+                model: "model-b".into(),
+            })
+        );
+        assert_eq!(app.current_model(), "model-b");
+    }
+
+    #[test]
     fn releasing_a_mouse_drag_copies_the_selected_screen_text() {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
         buffer.set_string(0, 0, "copy this", Style::default());
@@ -612,15 +681,29 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_scrolls_the_models_dialog_instead_of_the_hidden_transcript() {
+    fn mouse_wheel_moves_the_models_selection_instead_of_the_hidden_transcript() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.open_models_dialog();
+        app.handle_model_catalog_event(ModelCatalogEvent::Loaded(vec![ProviderModels {
+            provider: "Test".into(),
+            source: "built-in catalog".into(),
+            models: vec![
+                ModelInfo {
+                    id: "model-a".into(),
+                    display_name: "Model A".into(),
+                },
+                ModelInfo {
+                    id: "model-b".into(),
+                    display_name: "Model B".into(),
+                },
+            ],
+        }]));
         let regions = UiRegions::default();
 
         handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
 
-        assert_eq!(app.models_scroll(), 1);
+        assert_eq!(app.selected_model_index(), 1);
         assert_eq!(app.scroll_from_bottom, 0);
     }
 

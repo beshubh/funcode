@@ -100,6 +100,9 @@ pub enum AppAction {
         text: String,
     },
     ListModels,
+    SelectModel {
+        model: String,
+    },
     Quit,
 }
 
@@ -136,7 +139,8 @@ pub struct App {
     commands: CommandRegistry,
     workspace_files: Vec<String>,
     suggestion_selected: usize,
-    models_scroll: usize,
+    models_selected: usize,
+    current_model: String,
     next_request_id: RequestId,
     last_escape: Option<Instant>,
     cancellation_requested: bool,
@@ -626,20 +630,76 @@ impl App {
 
     pub(crate) fn open_models_dialog(&mut self) {
         self.models_dialog = Some(ModelsDialogPhase::Loading);
-        self.models_scroll = 0;
+        self.models_selected = 0;
         self.last_escape = None;
     }
 
-    pub(crate) fn models_scroll(&self) -> usize {
-        self.models_scroll
+    pub(crate) fn set_current_model(&mut self, model: impl Into<String>) {
+        self.current_model = model.into();
+    }
+
+    pub(crate) fn current_model(&self) -> &str {
+        &self.current_model
+    }
+
+    pub(crate) fn selected_model_index(&self) -> usize {
+        self.models_selected
+            .min(self.available_models().len().saturating_sub(1))
+    }
+
+    pub(crate) fn set_model_selection(&mut self, index: usize) {
+        if index < self.available_models().len() {
+            self.models_selected = index;
+        }
+    }
+
+    pub(crate) fn activate_model(&mut self, index: usize) -> Option<AppAction> {
+        self.set_model_selection(index);
+        self.select_highlighted_model()
+    }
+
+    fn move_model_selection(&mut self, direction: isize) {
+        let count = self.available_models().len();
+        if count == 0 {
+            return;
+        }
+        let current = self.selected_model_index();
+        self.models_selected = if direction < 0 {
+            current
+                .saturating_sub(direction.unsigned_abs())
+                .min(count - 1)
+        } else {
+            current.saturating_add(direction as usize).min(count - 1)
+        };
+    }
+
+    fn available_models(&self) -> Vec<&crate::llm::ModelInfo> {
+        match self.models_dialog.as_ref() {
+            Some(ModelsDialogPhase::Loaded(catalogs)) => catalogs
+                .iter()
+                .flat_map(|catalog| catalog.models.iter())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn select_highlighted_model(&mut self) -> Option<AppAction> {
+        let model = self
+            .available_models()
+            .get(self.selected_model_index())?
+            .id
+            .clone();
+        self.current_model = model.clone();
+        self.models_dialog = None;
+        Some(AppAction::SelectModel { model })
     }
 
     pub(crate) fn scroll_models_up(&mut self) {
-        self.models_scroll = self.models_scroll.saturating_sub(1);
+        self.move_model_selection(-1);
     }
 
     pub(crate) fn scroll_models_down(&mut self) {
-        self.models_scroll = self.models_scroll.saturating_add(1);
+        self.move_model_selection(1);
     }
 
     pub(crate) fn handle_model_catalog_event(&mut self, event: ModelCatalogEvent) {
@@ -647,7 +707,14 @@ impl App {
             return;
         }
         self.models_dialog = Some(match event {
-            ModelCatalogEvent::Loaded(catalogs) => ModelsDialogPhase::Loaded(catalogs),
+            ModelCatalogEvent::Loaded(catalogs) => {
+                self.models_selected = catalogs
+                    .iter()
+                    .flat_map(|catalog| catalog.models.iter())
+                    .position(|model| model.id == self.current_model)
+                    .unwrap_or(0);
+                ModelsDialogPhase::Loaded(catalogs)
+            }
             ModelCatalogEvent::Failed(message) => ModelsDialogPhase::Failed(message),
         });
     }
@@ -756,19 +823,12 @@ impl App {
 
     fn handle_models_dialog_key(&mut self, key: KeyEvent) -> Option<AppAction> {
         match key.code {
-            KeyCode::Esc | KeyCode::Enter => self.models_dialog = None,
-            KeyCode::Up => self.scroll_models_up(),
-            KeyCode::Down => self.scroll_models_down(),
-            KeyCode::PageUp => {
-                for _ in 0..5 {
-                    self.scroll_models_up();
-                }
-            }
-            KeyCode::PageDown => {
-                for _ in 0..5 {
-                    self.scroll_models_down();
-                }
-            }
+            KeyCode::Esc => self.models_dialog = None,
+            KeyCode::Enter => return self.select_highlighted_model(),
+            KeyCode::Up => self.move_model_selection(-1),
+            KeyCode::Down => self.move_model_selection(1),
+            KeyCode::PageUp => self.move_model_selection(-5),
+            KeyCode::PageDown => self.move_model_selection(5),
             _ => {}
         }
         None
@@ -921,6 +981,41 @@ mod tests {
 
         app.handle_model_catalog_event(crate::model_catalog::ModelCatalogEvent::Loaded(Vec::new()));
 
+        assert!(app.models_dialog.is_none());
+    }
+
+    #[test]
+    fn models_dialog_keyboard_selects_a_model_for_the_session() {
+        let mut app = App::new();
+        app.set_current_model("model-a");
+        app.open_models_dialog();
+        app.handle_model_catalog_event(crate::model_catalog::ModelCatalogEvent::Loaded(vec![
+            crate::llm::ProviderModels {
+                provider: "Test".into(),
+                source: "built-in catalog".into(),
+                models: vec![
+                    crate::llm::ModelInfo {
+                        id: "model-a".into(),
+                        display_name: "Model A".into(),
+                    },
+                    crate::llm::ModelInfo {
+                        id: "model-b".into(),
+                        display_name: "Model B".into(),
+                    },
+                ],
+            },
+        ]));
+
+        assert_eq!(app.selected_model_index(), 0);
+        app.handle_key(key(KeyCode::Down), Instant::now());
+        assert_eq!(app.selected_model_index(), 1);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::SelectModel {
+                model: "model-b".into()
+            })
+        );
+        assert_eq!(app.current_model(), "model-b");
         assert!(app.models_dialog.is_none());
     }
 

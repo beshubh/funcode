@@ -155,7 +155,7 @@ impl Command for ModelsCommand {
     }
 
     fn description(&self) -> &'static str {
-        "List models available from supported providers"
+        "Choose a model from supported providers"
     }
 
     fn execute(&self, app: &mut App) -> Option<AppAction> {

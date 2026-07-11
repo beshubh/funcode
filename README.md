@@ -53,7 +53,7 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - `/auth`: open the authentication picker
 - `/plan`: enable persistent plan mode for this and later prompts
 - `/build`: return to normal build mode
-- `/models`: list user-visible models from every configured provider
+- `/models`: choose a model from every configured provider; use arrows or hover, then Enter/click
 - `/exit`: quit
 
 Prompts submitted while the runner is busy are shown immediately and processed in FIFO order. Only
@@ -68,3 +68,4 @@ the home screen and command popup both read from this registry, so they stay in 
 Model discovery runs outside the terminal event loop. Providers use their live model-catalog API
 when one is available; provider adapters can return a built-in catalog when no discovery endpoint
 exists. The current ChatGPT subscription provider reads its live Codex model catalog after sign-in.
+The active model is shown in the composer border and applies to subsequent model requests.

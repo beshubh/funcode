@@ -24,6 +24,13 @@ pub enum UiTarget {
     AuthProvider(usize),
     Suggestion(usize),
     MessageCopy,
+    Model(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelRegion {
+    pub index: usize,
+    pub area: Rect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -32,6 +39,7 @@ pub struct UiRegions {
     pub auth_providers: Vec<Rect>,
     pub suggestions: Vec<Rect>,
     pub message_copy: Option<Rect>,
+    pub models: Vec<ModelRegion>,
 }
 
 impl UiRegions {
@@ -49,6 +57,12 @@ impl UiRegions {
             .find(|(_, area)| area.contains(position))
         {
             Some(UiTarget::AuthProvider(index))
+        } else if let Some(region) = self
+            .models
+            .iter()
+            .find(|region| region.area.contains(position))
+        {
+            Some(UiTarget::Model(region.index))
         } else if let Some((index, _)) = self
             .suggestions
             .iter()
@@ -94,14 +108,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
         && area.width >= CHAT_MIN_WIDTH
         && area.height >= CHAT_MIN_HEIGHT
     {
-        render_models_dialog(frame, area, app, theme);
+        regions.models = render_models_dialog(frame, area, app, theme);
     }
     regions
 }
 
-fn render_models_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+fn render_models_dialog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+) -> Vec<ModelRegion> {
     let Some(phase) = app.models_dialog.as_ref() else {
-        return;
+        return Vec::new();
     };
     let width = area.width.saturating_sub(6).min(78);
     let height = area.height.saturating_sub(4).min(24);
@@ -112,10 +131,11 @@ fn render_models_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
         height,
     );
     frame.render_widget(Clear, dialog_area);
-    let block = panel_block(" Available models ", theme);
+    let block = panel_block(" Select model ", theme);
     let inner = block.inner(dialog_area).inner(Margin::new(1, 1));
     frame.render_widget(block, dialog_area);
 
+    let mut model_lines = Vec::new();
     let mut lines = match phase {
         ModelsDialogPhase::Loading => vec![
             Line::styled("Loading provider catalogs…", theme.status),
@@ -130,6 +150,7 @@ fn render_models_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
         ],
         ModelsDialogPhase::Loaded(catalogs) => {
             let mut lines = Vec::new();
+            let mut model_index = 0;
             for (provider_index, catalog) in catalogs.iter().enumerate() {
                 if provider_index > 0 {
                     lines.push(Line::from(""));
@@ -145,23 +166,66 @@ fn render_models_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
                     ));
                 }
                 for model in &catalog.models {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  • {}", model.display_name), theme.status),
-                        Span::styled(format!("  {}", model.id), theme.muted),
-                    ]));
+                    let selected = model_index == app.selected_model_index();
+                    let marker = if model.id == app.current_model() {
+                        "✓"
+                    } else {
+                        " "
+                    };
+                    let line_index = lines.len();
+                    let selection_style = if selected {
+                        ratatui::style::Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        ratatui::style::Style::default()
+                    };
+                    lines.push(
+                        Line::from(vec![
+                            Span::styled(format!(" {marker} {}", model.display_name), theme.status),
+                            Span::styled(format!("  {}", model.id), theme.muted),
+                        ])
+                        .style(selection_style),
+                    );
+                    model_lines.push((model_index, line_index));
+                    model_index += 1;
                 }
             }
             lines.push(Line::from(""));
-            lines.push(Line::styled("Enter or Esc close", theme.muted));
+            lines.push(Line::styled(
+                "↑/↓ select · Enter use · wheel scroll · Esc close",
+                theme.muted,
+            ));
             lines
         }
     };
     if lines.is_empty() {
         lines.push(Line::styled("No providers configured", theme.muted));
     }
-    let max_scroll = lines.len().saturating_sub(inner.height as usize);
-    let scroll = app.models_scroll().min(max_scroll).min(u16::MAX as usize) as u16;
+    let mut scroll = 0;
+    if let Some((_, selected_line)) = model_lines
+        .iter()
+        .find(|(index, _)| *index == app.selected_model_index())
+    {
+        if *selected_line < scroll {
+            scroll = *selected_line;
+        } else if *selected_line >= scroll.saturating_add(inner.height as usize) {
+            scroll = selected_line
+                .saturating_add(1)
+                .saturating_sub(inner.height as usize);
+        }
+    }
+    let visible_regions = model_lines
+        .into_iter()
+        .filter_map(|(index, line)| {
+            let visible_row = line.checked_sub(scroll)?;
+            (visible_row < inner.height as usize).then_some(ModelRegion {
+                index,
+                area: Rect::new(inner.x, inner.y + visible_row as u16, inner.width, 1),
+            })
+        })
+        .collect();
+    let scroll = scroll.min(u16::MAX as usize) as u16;
     frame.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll, 0)), inner);
+    visible_regions
 }
 
 fn render_auth_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Vec<Rect> {
@@ -515,8 +579,9 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     let title = format!(
-        "Enter send · Shift+Enter new line · Mode: {}",
-        app.session_mode.label()
+        "Enter send · Shift+Enter new line · Mode: {} · Model: {}",
+        app.session_mode.label(),
+        app.current_model()
     );
     let block = panel_block(title.as_str(), theme);
     let inner = block.inner(area);
@@ -801,7 +866,7 @@ mod tests {
 
         let (screen, _, _, _) = render_to_string(&app, 100, 30);
 
-        assert!(screen.contains("Available models"));
+        assert!(screen.contains("Select model"));
         assert!(screen.contains("ChatGPT"));
         assert!(screen.contains("live provider API"));
         assert!(screen.contains("GPT Test"));
@@ -826,11 +891,77 @@ mod tests {
         let (first_screen, _, _, _) = render_to_string(&app, 100, 30);
         assert!(!first_screen.contains("model-29"));
 
-        for _ in 0..40 {
-            app.scroll_models_down();
+        for _ in 0..29 {
+            app.handle_key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Down,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                std::time::Instant::now(),
+            );
         }
         let (last_screen, _, _, _) = render_to_string(&app, 100, 30);
         assert!(last_screen.contains("model-29"));
+        assert_eq!(app.selected_model_index(), 29);
+    }
+
+    #[test]
+    fn model_picker_shows_active_hoverable_selection_and_composer_model() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.set_current_model("model-a");
+        app.models_dialog = Some(ModelsDialogPhase::Loaded(vec![ProviderModels {
+            provider: "ChatGPT".into(),
+            source: "live provider API".into(),
+            models: vec![
+                ModelInfo {
+                    id: "model-a".into(),
+                    display_name: "Model A".into(),
+                },
+                ModelInfo {
+                    id: "model-b".into(),
+                    display_name: "Model B".into(),
+                },
+            ],
+        }]));
+        app.set_model_selection(1);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut regions = UiRegions::default();
+
+        terminal
+            .draw(|frame| regions = render(frame, &app, &Theme::default()))
+            .unwrap();
+
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("✓ Model A"));
+        let selected = regions
+            .models
+            .iter()
+            .find(|region| region.index == 1)
+            .unwrap();
+        assert_eq!(
+            regions.target_at(selected.area.x, selected.area.y),
+            Some(UiTarget::Model(1))
+        );
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .cell(Position::new(selected.area.x, selected.area.y))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+
+        app.models_dialog = None;
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &app, &Theme::default());
+            })
+            .unwrap();
+        assert!(terminal.backend().to_string().contains("Model: model-a"));
     }
 
     #[test]

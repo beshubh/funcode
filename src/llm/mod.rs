@@ -94,6 +94,7 @@ impl LlmConfig {
 
 #[derive(Clone)]
 pub(crate) struct ProviderRequest {
+    pub(crate) model: String,
     pub(crate) prompt: String,
     pub(crate) history: Vec<ConversationMessage>,
 }
@@ -124,6 +125,7 @@ pub(crate) trait Provider: Send + Sync {
 #[derive(Clone)]
 pub(crate) struct LlmClient {
     provider: Arc<dyn Provider>,
+    model: Arc<Mutex<String>>,
     history: Arc<Mutex<Vec<ConversationMessage>>>,
 }
 
@@ -132,16 +134,44 @@ impl LlmClient {
         config: LlmConfig,
         auth_store: crate::auth::AuthStore,
     ) -> Result<Self, LlmError> {
-        Ok(Self::with_provider(Arc::new(
-            providers::chatgpt::ChatGptProvider::new(config.model, auth_store),
-        )))
+        Ok(Self::with_provider_and_model(
+            Arc::new(providers::chatgpt::ChatGptProvider::new(auth_store)),
+            config.model,
+        ))
     }
 
+    #[cfg(test)]
     pub(crate) fn with_provider(provider: Arc<dyn Provider>) -> Self {
+        Self::with_provider_and_model(provider, DEFAULT_MODEL.to_owned())
+    }
+
+    fn with_provider_and_model(provider: Arc<dyn Provider>, model: String) -> Self {
         Self {
             provider,
+            model: Arc::new(Mutex::new(model)),
             history: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub(crate) fn current_model(&self) -> Result<String, LlmError> {
+        self.model
+            .lock()
+            .map_err(|_| LlmError::Internal("the selected model is unavailable".into()))
+            .map(|model| model.clone())
+    }
+
+    pub(crate) fn select_model(&self, model: impl Into<String>) -> Result<(), LlmError> {
+        let model = model.into().trim().to_owned();
+        if model.is_empty() {
+            return Err(LlmError::Configuration(
+                "the selected model must not be empty".into(),
+            ));
+        }
+        *self
+            .model
+            .lock()
+            .map_err(|_| LlmError::Internal("the selected model is unavailable".into()))? = model;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -161,10 +191,12 @@ impl LlmClient {
             .lock()
             .map_err(|_| LlmError::Internal("the LLM conversation is unavailable".into()))?
             .clone();
+        let model = self.current_model()?;
         let model_prompt = prompt_with_mode(prompt, mode);
         let stream = self
             .provider
             .stream(ProviderRequest {
+                model,
                 prompt: model_prompt,
                 history,
             })
@@ -316,6 +348,29 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests[1].prompt, "second");
         assert_eq!(requests[1].history, first_history);
+    }
+
+    #[tokio::test]
+    async fn selected_model_is_used_by_the_next_provider_request() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            requests: Arc::clone(&requests),
+            responses: Mutex::new(VecDeque::from([vec![Ok(ProviderEvent::Completed(
+                Vec::new(),
+            ))]])),
+        };
+        let client = LlmClient::with_provider(Arc::new(provider));
+
+        client.select_model("model-b").unwrap();
+        client
+            .stream("hello".into())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(requests.lock().unwrap()[0].model, "model-b");
+        assert_eq!(client.current_model().unwrap(), "model-b");
     }
 
     #[tokio::test]
