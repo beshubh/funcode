@@ -9,7 +9,7 @@ use crate::{
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
@@ -18,6 +18,9 @@ const CHAT_MIN_WIDTH: u16 = 60;
 const CHAT_MIN_HEIGHT: u16 = 20;
 const HOME_MIN_WIDTH: u16 = 40;
 const HOME_MIN_HEIGHT: u16 = 20;
+const COMPOSER_HORIZONTAL_PADDING: u16 = 2;
+const COMPOSER_VERTICAL_PADDING: u16 = 1;
+const COMPOSER_BORDER_HEIGHT: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiTarget {
@@ -534,11 +537,9 @@ fn render_message_dialog(
     frame.render_widget(block, dialog_area);
 
     let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).split(inner);
-    let lines = message.content.lines(
-        theme.style(ThemeRole::Text),
-        theme.accent_badge(),
-        theme.style(ThemeRole::Accent),
-    );
+    let lines = message
+        .content
+        .lines(theme.style(ThemeRole::Text), theme.accent_badge());
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
         rows[0],
@@ -657,7 +658,7 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme)
     }));
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "Enter start  ·  Ctrl+C quit",
+        "Enter start  ·  /exit quit",
         theme.style(ThemeRole::MutedText),
     ));
     let help = Text::from(lines);
@@ -672,7 +673,7 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme)
 fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> UiRegions {
     let inner = area.inner(Margin::new(1, 1));
     let suggestions = app.suggestions();
-    let composer_height = composer_height(app, inner.width, theme);
+    let composer_height = composer_height(app, inner.width);
 
     let rows = Layout::vertical([
         Constraint::Min(5),
@@ -803,7 +804,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
         .title(title)
         .title_bottom(Line::styled(
             format!(
-                " Enter send · Shift+Enter new line · Model: {} ",
+                " Enter send · Shift+Enter new line · Tab mode · Ctrl+C clear · Model: {} ",
                 app.current_model()
             ),
             theme.style(ThemeRole::MutedText),
@@ -811,12 +812,19 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
         .border_set(theme.border_set())
         .border_style(theme.style(mode_role));
     let inner = block.inner(area);
-    let input_area = inner;
-    let (cursor_column, cursor_row) = composer_cursor(
+    let input_area = inner.inner(Margin::new(
+        COMPOSER_HORIZONTAL_PADDING,
+        COMPOSER_VERTICAL_PADDING,
+    ));
+    let layout = composer_layout(
         app.composer.text(),
         app.composer.cursor(),
+        app.composer
+            .content()
+            .lines(theme.style(ThemeRole::Text), theme.accent_badge()),
         input_area.width.max(1),
     );
+    let (cursor_column, cursor_row) = layout.cursor;
     let vertical_scroll = cursor_row.saturating_sub(input_area.height.saturating_sub(1));
     let content = if app.composer.text().is_empty() {
         Text::from(Line::styled(
@@ -824,18 +832,12 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
             theme.style(ThemeRole::MutedText),
         ))
     } else {
-        Text::from(app.composer.content().lines(
-            theme.style(ThemeRole::Text),
-            theme.accent_badge(),
-            theme.style(mode_role).add_modifier(Modifier::REVERSED),
-        ))
+        Text::from(layout.lines)
     };
 
     frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new(content)
-            .wrap(Wrap { trim: false })
-            .scroll((vertical_scroll, 0)),
+        Paragraph::new(content).scroll((vertical_scroll, 0)),
         input_area,
     );
     if app.auth_dialog.is_none()
@@ -856,28 +858,141 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
     ]
 }
 
-fn composer_height(app: &App, width: u16, theme: &Theme) -> u16 {
-    let _ = (app, width, theme);
-    5
+fn composer_height(app: &App, width: u16) -> u16 {
+    let content_width = composer_content_width(width);
+    let lines = app
+        .composer
+        .content()
+        .lines(Style::default(), Style::default());
+    let line_count = composer_layout(
+        app.composer.text(),
+        app.composer.text().len(),
+        lines,
+        content_width,
+    )
+    .lines
+    .len()
+    .min(u16::MAX as usize) as u16;
+    line_count
+        .saturating_add(COMPOSER_BORDER_HEIGHT)
+        .saturating_add(COMPOSER_VERTICAL_PADDING.saturating_mul(2))
+        .max(5)
 }
 
-fn composer_cursor(text: &str, cursor: usize, width: u16) -> (u16, u16) {
-    let width = width.max(1) as usize;
-    let prefix = &text[..cursor];
-    let parts: Vec<_> = prefix.split('\n').collect();
-    let mut row = 0usize;
+struct ComposerLayout {
+    lines: Vec<Line<'static>>,
+    cursor: (u16, u16),
+}
 
-    for part in parts.iter().take(parts.len().saturating_sub(1)) {
-        let display_width = Line::from((*part).to_owned()).width();
-        row += display_width.div_ceil(width).max(1);
+struct ComposerGrapheme {
+    symbol: String,
+    style: Style,
+    byte_start: usize,
+    width: usize,
+    whitespace: bool,
+}
+
+fn composer_layout(
+    text: &str,
+    cursor: usize,
+    lines: Vec<Line<'static>>,
+    width: u16,
+) -> ComposerLayout {
+    let width = width.max(1) as usize;
+    let mut wrapped: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut cursor_position = None;
+    let mut byte_offset = 0;
+    let line_count = lines.len();
+
+    for (line_index, line) in lines.into_iter().enumerate() {
+        if line_index > 0 {
+            wrapped.push(Vec::new());
+        }
+        let mut column: usize = 0;
+        let mut graphemes = Vec::new();
+        for span in line.spans {
+            for grapheme in span.styled_graphemes(Style::default()) {
+                let symbol = grapheme.symbol.to_owned();
+                let symbol_len = symbol.len();
+                graphemes.push(ComposerGrapheme {
+                    width: Line::from(symbol.as_str()).width(),
+                    whitespace: symbol.chars().all(char::is_whitespace),
+                    symbol,
+                    style: grapheme.style,
+                    byte_start: byte_offset,
+                });
+                byte_offset = byte_offset.saturating_add(symbol_len);
+            }
+        }
+
+        let mut segment_start = 0;
+        while segment_start < graphemes.len() {
+            let mut segment_end = segment_start;
+            while segment_end < graphemes.len() && graphemes[segment_end].whitespace {
+                segment_end += 1;
+            }
+            while segment_end < graphemes.len() && !graphemes[segment_end].whitespace {
+                segment_end += 1;
+            }
+            let segment_width = graphemes[segment_start..segment_end]
+                .iter()
+                .map(|grapheme| grapheme.width)
+                .sum::<usize>();
+            if column > 0 && column.saturating_add(segment_width) > width {
+                wrapped.push(Vec::new());
+                column = 0;
+            }
+
+            for grapheme in &graphemes[segment_start..segment_end] {
+                if column > 0 && column.saturating_add(grapheme.width) > width {
+                    wrapped.push(Vec::new());
+                    column = 0;
+                }
+                let grapheme_end = grapheme.byte_start.saturating_add(grapheme.symbol.len());
+                if cursor_position.is_none()
+                    && cursor >= grapheme.byte_start
+                    && cursor < grapheme_end
+                {
+                    cursor_position = Some(normalize_cursor(column, wrapped.len() - 1, width));
+                }
+                wrapped
+                    .last_mut()
+                    .unwrap()
+                    .push(Span::styled(grapheme.symbol.clone(), grapheme.style));
+                column = column.saturating_add(grapheme.width);
+            }
+            segment_start = segment_end;
+        }
+
+        if cursor_position.is_none() && cursor == byte_offset {
+            cursor_position = Some(normalize_cursor(column, wrapped.len() - 1, width));
+        }
+        if line_index + 1 < line_count {
+            byte_offset = byte_offset.saturating_add(1);
+        }
     }
 
-    let final_width = Line::from(parts.last().copied().unwrap_or_default().to_owned()).width();
-    row += final_width / width;
+    let cursor = cursor_position.unwrap_or((0, 0));
+    while wrapped.len() <= cursor.1 as usize {
+        wrapped.push(Vec::new());
+    }
+    let lines = wrapped.into_iter().map(Line::from).collect();
+    debug_assert_eq!(byte_offset, text.len());
+    ComposerLayout { lines, cursor }
+}
+
+fn normalize_cursor(column: usize, row: usize, width: usize) -> (u16, u16) {
     (
-        (final_width % width) as u16,
-        row.min(u16::MAX as usize) as u16,
+        (column % width).min(u16::MAX as usize) as u16,
+        row.saturating_add(column / width).min(u16::MAX as usize) as u16,
     )
+}
+
+fn composer_content_width(width: u16) -> u16 {
+    width
+        .saturating_sub(2)
+        .saturating_sub(COMPOSER_HORIZONTAL_PADDING.saturating_mul(2))
+        .max(1)
 }
 
 fn panel_block<'a>(title: impl Into<Line<'a>>, theme: &Theme) -> Block<'a> {
@@ -915,7 +1030,7 @@ fn render_too_small(
 
 #[cfg(test)]
 mod tests {
-    use super::{UiRegions, UiTarget, render};
+    use super::{UiRegions, UiTarget, composer_height, render};
     use crate::{
         agent::AgentEvent,
         app::{App, ModelsDialogPhase, Screen},
@@ -966,6 +1081,26 @@ mod tests {
             .cell(Position::new(column, row as u16))
             .unwrap()
             .style()
+    }
+
+    fn position_of(terminal: &Terminal<TestBackend>, needle: &str) -> Position {
+        let buffer = terminal.backend().buffer();
+        let symbols: Vec<_> = needle
+            .chars()
+            .map(|character| character.to_string())
+            .collect();
+        for row in 0..buffer.area.height {
+            for column in 0..=buffer.area.width.saturating_sub(symbols.len() as u16) {
+                if symbols.iter().enumerate().all(|(offset, symbol)| {
+                    buffer
+                        .cell(Position::new(column + offset as u16, row))
+                        .is_some_and(|cell| cell.symbol() == symbol)
+                }) {
+                    return Position::new(column, row);
+                }
+            }
+        }
+        panic!("{needle:?} was not rendered")
     }
 
     #[test]
@@ -1135,6 +1270,71 @@ mod tests {
         let (screen, _, _, _) = render_to_string(&app, 100, 30);
 
         assert!(screen.contains("Review @src/app.rs"));
+    }
+
+    #[test]
+    fn wrapped_words_keep_the_cursor_at_the_end_of_rendered_text() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer
+            .insert_text("01234567890123456789012345678901234567890123456789 helloZ");
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &app, &Theme::default());
+            })
+            .unwrap();
+
+        let final_word = position_of(&terminal, "helloZ");
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(final_word.x + "helloZ".len() as u16, final_word.y)
+        );
+    }
+
+    #[test]
+    fn wide_graphemes_wrap_with_the_cursor_after_the_rendered_symbol() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text(&format!("{}界", "a".repeat(51)));
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let _ = render(frame, &app, &Theme::default());
+            })
+            .unwrap();
+
+        let symbol = position_of(&terminal, "界");
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            Position::new(symbol.x + 2, symbol.y)
+        );
+    }
+
+    #[test]
+    fn composer_grows_to_show_all_lines_with_padding() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("first\nsecond\nthird\nfourth");
+        let backend = TestBackend::new(60, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut regions = UiRegions::default();
+
+        terminal
+            .draw(|frame| regions = render(frame, &app, &Theme::default()))
+            .unwrap();
+
+        let first = position_of(&terminal, "first");
+        let fourth = position_of(&terminal, "fourth");
+        let composer_top = regions.mode_tabs[0].y;
+        assert!(first.x >= 4, "text should have left padding");
+        assert!(first.y >= composer_top + 2, "text should have top padding");
+        assert_eq!(fourth.y, first.y + 3);
+        assert!(composer_height(&app, 58) >= 8);
     }
 
     #[test]

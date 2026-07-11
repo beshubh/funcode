@@ -1,7 +1,7 @@
 use crate::{
     agent::{AgentEvent, RequestId},
     auth::AuthEvent,
-    commands::{Command, CommandBehavior, CommandRegistry},
+    commands::{Command, CommandRegistry},
     composer::{ComposerDocument, SessionMode},
     llm::ProviderModels,
     model_catalog::ModelCatalogEvent,
@@ -300,7 +300,14 @@ impl App {
         }
         self.last_escape = None;
 
-        if matches!(key.code, KeyCode::Enter | KeyCode::Tab)
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.composer.clear();
+            self.pending_indexed_file_selection = None;
+            self.suggestion_selected = 0;
+            return None;
+        }
+
+        if key.code == KeyCode::Enter
             && let Some(query) = self.pending_indexed_file_query()
         {
             self.pending_indexed_file_selection = Some(query);
@@ -309,7 +316,7 @@ impl App {
 
         if !self.suggestions().is_empty() {
             match key.code {
-                KeyCode::Enter | KeyCode::Tab => {
+                KeyCode::Enter => {
                     return self.activate_suggestion(self.selected_suggestion());
                 }
                 KeyCode::Up => {
@@ -422,17 +429,11 @@ impl App {
     }
 
     pub fn effective_mode(&self) -> SessionMode {
-        self.composer
-            .content()
-            .requested_mode()
-            .unwrap_or(self.session_mode)
+        self.session_mode
     }
 
     pub fn select_mode(&mut self, mode: SessionMode) {
-        if self.effective_mode() == mode {
-            return;
-        }
-        self.composer.set_mode(mode);
+        self.session_mode = mode;
         self.suggestion_selected = 0;
     }
 
@@ -460,20 +461,19 @@ impl App {
         if let Some((range, query)) = self.composer.active_command_query() {
             let standalone =
                 range.start == 0 && self.composer.cursor() == self.composer.text().len();
-            let commands: Vec<_> = self
-                .commands
-                .matching(query)
-                .filter(|command| {
-                    standalone || matches!(command.behavior(), CommandBehavior::Mode(_))
-                })
-                .map(|command| Suggestion {
-                    label: format!("/{}", command.name()),
-                    description: command.description().to_owned(),
-                    kind: SuggestionKind::Command,
-                })
-                .collect();
-            if !commands.is_empty() {
-                return commands;
+            if standalone {
+                let commands: Vec<_> = self
+                    .commands
+                    .matching(query)
+                    .map(|command| Suggestion {
+                        label: format!("/{}", command.name()),
+                        description: command.description().to_owned(),
+                        kind: SuggestionKind::Command,
+                    })
+                    .collect();
+                if !commands.is_empty() {
+                    return commands;
+                }
             }
         }
 
@@ -530,21 +530,11 @@ impl App {
                     .commands
                     .find(suggestion.label.trim_start_matches('/'))?;
                 let (range, _) = self.composer.active_command_query()?;
-                match command.behavior() {
-                    CommandBehavior::Immediate => {
-                        if range.start != 0 || self.composer.cursor() != self.composer.text().len()
-                        {
-                            return None;
-                        }
-                        self.composer.take_submission();
-                        command.execute(self)
-                    }
-                    CommandBehavior::Mode(mode) => {
-                        self.composer.insert_mode(range, mode);
-                        self.suggestion_selected = 0;
-                        None
-                    }
+                if range.start != 0 || self.composer.cursor() != self.composer.text().len() {
+                    return None;
                 }
+                self.composer.take_submission();
+                command.execute(self)
             }
             SuggestionKind::File => {
                 let (range, _) = self.composer.active_file_query()?;
@@ -1134,7 +1124,6 @@ impl App {
                 .text()
                 .strip_prefix('/')
                 .and_then(|name| self.commands.find(name))
-            && command.behavior() == CommandBehavior::Immediate
         {
             self.composer.take_submission();
             return command.execute(self);
@@ -1145,8 +1134,7 @@ impl App {
         }
 
         let content = self.composer.take_submission();
-        let mode = content.requested_mode().unwrap_or(self.session_mode);
-        self.session_mode = mode;
+        let mode = self.session_mode;
         let prompt = content.prompt_text();
         let attachments = content.attachments();
         let request_id = self.next_request_id;
@@ -1334,6 +1322,7 @@ mod tests {
     fn ctrl_c_does_not_exit_the_chat() {
         let mut app = App::new();
         app.screen = Screen::Chat;
+        app.composer.insert_text("discard me");
 
         assert_eq!(
             app.handle_key(
@@ -1343,6 +1332,7 @@ mod tests {
             None
         );
         assert_eq!(app.screen, Screen::Chat);
+        assert!(app.composer.text().is_empty());
     }
 
     #[test]
@@ -1509,13 +1499,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_and_build_tokens_snapshot_the_session_mode_for_each_submission() {
+    fn tab_selected_mode_is_snapshotted_for_each_submission() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.composer.insert_text("review this /plan");
-        assert_eq!(app.suggestions()[0].label, "/plan");
-        app.activate_suggestion(0);
-        app.composer.insert_text(" carefully");
+        app.composer.insert_text("review this carefully");
+        app.handle_key(key(KeyCode::Tab), Instant::now());
 
         assert!(matches!(
             app.handle_key(key(KeyCode::Enter), Instant::now()),
@@ -1526,18 +1514,8 @@ mod tests {
         ));
         assert_eq!(app.session_mode, SessionMode::Plan);
 
-        app.composer.insert_text("follow up");
-        assert!(matches!(
-            app.handle_key(key(KeyCode::Enter), Instant::now()),
-            Some(AppAction::Submit {
-                mode: SessionMode::Plan,
-                ..
-            })
-        ));
-
-        app.composer.insert_text("/build");
-        app.activate_suggestion(0);
-        app.composer.insert_text(" make it now");
+        app.composer.insert_text("make it now");
+        app.handle_key(key(KeyCode::Tab), Instant::now());
         assert!(matches!(
             app.handle_key(key(KeyCode::Enter), Instant::now()),
             Some(AppAction::Submit {
@@ -1549,49 +1527,37 @@ mod tests {
     }
 
     #[test]
-    fn tab_switches_the_effective_mode_without_stealing_suggestion_completion() {
-        let mut app = App::new();
+    fn tab_switches_mode_without_modifying_text_even_with_suggestions_open() {
+        let mut app = App::with_files(["src/app.rs"]);
         app.screen = Screen::Chat;
+        app.composer.insert_text("keep @src/");
+        assert!(!app.suggestions().is_empty());
 
         assert_eq!(app.effective_mode(), SessionMode::Build);
         app.select_mode(SessionMode::Build);
-        assert!(app.composer.text().is_empty());
+        assert_eq!(app.composer.text(), "keep @src/");
         assert_eq!(app.handle_key(key(KeyCode::Tab), Instant::now()), None);
         assert_eq!(app.effective_mode(), SessionMode::Plan);
-        assert_eq!(
-            app.composer.content().requested_mode(),
-            Some(SessionMode::Plan)
-        );
+        assert_eq!(app.composer.text(), "keep @src/");
 
         assert_eq!(app.handle_key(key(KeyCode::Tab), Instant::now()), None);
         assert_eq!(app.effective_mode(), SessionMode::Build);
-
-        app.composer.take_submission();
-        app.composer.insert_text("/plan");
-        assert_eq!(app.handle_key(key(KeyCode::Tab), Instant::now()), None);
-        assert_eq!(app.effective_mode(), SessionMode::Plan);
-        assert_eq!(app.composer.text(), "[Plan]");
+        assert_eq!(app.composer.text(), "keep @src/");
     }
 
     #[test]
-    fn selecting_plan_twice_keeps_one_inline_mode_token() {
+    fn plan_and_build_are_not_slash_command_suggestions() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.composer.insert_text("/plan");
-        app.activate_suggestion(0);
-        app.composer.insert_text(" /plan");
-        app.activate_suggestion(0);
+        app.composer.insert_text("/");
 
-        assert_eq!(app.composer.text(), "[Plan] ");
-        assert_eq!(
-            app.composer
-                .content()
-                .tokens()
-                .iter()
-                .filter(|token| matches!(token.kind, crate::composer::InlineTokenKind::Mode(_)))
-                .count(),
-            1
-        );
+        let labels: Vec<_> = app
+            .suggestions()
+            .into_iter()
+            .map(|suggestion| suggestion.label)
+            .collect();
+        assert!(!labels.contains(&"/plan".to_owned()));
+        assert!(!labels.contains(&"/build".to_owned()));
     }
 
     #[derive(Debug)]

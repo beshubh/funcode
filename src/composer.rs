@@ -18,13 +18,6 @@ impl SessionMode {
             Self::Build => "Build",
         }
     }
-
-    fn token_text(self) -> &'static str {
-        match self {
-            Self::Plan => "[Plan]",
-            Self::Build => "[Build]",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +34,6 @@ impl Attachment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InlineTokenKind {
     FileReference { path: String },
-    Mode(SessionMode),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,13 +83,7 @@ impl ComposerContent {
     }
 
     pub fn prompt_text(&self) -> String {
-        let mut prompt = self.text.clone();
-        for token in self.tokens.iter().rev() {
-            if matches!(token.kind, InlineTokenKind::Mode(_)) {
-                prompt.replace_range(token.range.clone(), "");
-            }
-        }
-        prompt
+        self.text.clone()
     }
 
     pub fn attachments(&self) -> Vec<Attachment> {
@@ -108,24 +94,12 @@ impl ComposerContent {
                 InlineTokenKind::FileReference { path } if paths.insert(path.clone()) => {
                     Some(Attachment::workspace_file(path))
                 }
-                InlineTokenKind::FileReference { .. } | InlineTokenKind::Mode(_) => None,
+                InlineTokenKind::FileReference { .. } => None,
             })
             .collect()
     }
 
-    pub fn requested_mode(&self) -> Option<SessionMode> {
-        self.tokens.iter().find_map(|token| match token.kind {
-            InlineTokenKind::Mode(mode) => Some(mode),
-            InlineTokenKind::FileReference { .. } => None,
-        })
-    }
-
-    pub fn lines(
-        &self,
-        text_style: Style,
-        file_style: Style,
-        mode_style: Style,
-    ) -> Vec<Line<'static>> {
+    pub fn lines(&self, text_style: Style, file_style: Style) -> Vec<Line<'static>> {
         let mut lines = vec![Vec::new()];
         let mut cursor = 0;
         for token in &self.tokens {
@@ -136,7 +110,6 @@ impl ComposerContent {
             );
             let style = match token.kind {
                 InlineTokenKind::FileReference { .. } => file_style,
-                InlineTokenKind::Mode(_) => mode_style,
             };
             push_text_lines(&mut lines, &self.text[token.range.clone()], style);
             cursor = token.range.end;
@@ -331,47 +304,14 @@ impl ComposerDocument {
         self.sort_tokens();
     }
 
-    pub fn insert_mode(&mut self, range: Range<usize>, mode: SessionMode) {
-        if self.content.requested_mode() == Some(mode) {
-            self.replace_range(range, "");
-            return;
-        }
-        let modes: Vec<_> = self
-            .content
-            .tokens
-            .iter()
-            .filter(|token| matches!(token.kind, InlineTokenKind::Mode(_)))
-            .cloned()
-            .collect();
-        let removed_before_range = modes
-            .iter()
-            .filter(|token| token.range.end <= range.start)
-            .map(|token| token.range.end - token.range.start)
-            .sum::<usize>();
-        for token in modes.into_iter().rev() {
-            self.remove_token(token);
-        }
-        let range = (range.start - removed_before_range)..(range.end - removed_before_range);
-        let replacement = mode.token_text();
-        self.replace_range(range.clone(), replacement);
-        self.content.tokens.push(InlineToken {
-            range: range.start..range.start + replacement.len(),
-            kind: InlineTokenKind::Mode(mode),
-        });
-        self.sort_tokens();
-    }
-
-    pub fn set_mode(&mut self, mode: SessionMode) {
-        if self.content.requested_mode() == Some(mode) {
-            return;
-        }
-        let cursor = self.cursor;
-        self.insert_mode(cursor..cursor, mode);
-    }
-
     pub fn take_submission(&mut self) -> ComposerContent {
         self.cursor = 0;
         std::mem::take(&mut self.content)
+    }
+
+    pub fn clear(&mut self) {
+        self.cursor = 0;
+        self.content = ComposerContent::default();
     }
 
     fn replace_range(&mut self, range: Range<usize>, replacement: &str) {
@@ -439,7 +379,7 @@ fn byte_index_at_character(text: &str, character_index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComposerDocument, SessionMode};
+    use super::ComposerDocument;
 
     #[test]
     fn file_references_stay_between_surrounding_text() {
@@ -498,19 +438,6 @@ mod tests {
         document.insert_file_reference(range, "src/app.rs".into());
 
         assert_eq!(document.content().attachments().len(), 1);
-    }
-
-    #[test]
-    fn modes_are_not_sent_as_prompt_text() {
-        let mut document = ComposerDocument::default();
-        document.insert_text("/plan");
-        let (range, _) = document.active_command_query().unwrap();
-        document.insert_mode(range, SessionMode::Plan);
-
-        document.insert_text(" review this");
-        assert_eq!(document.text(), "[Plan] review this");
-        assert_eq!(document.content().prompt_text(), " review this");
-        assert_eq!(document.content().requested_mode(), Some(SessionMode::Plan));
     }
 
     #[test]

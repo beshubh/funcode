@@ -36,12 +36,12 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 
 ## Controls
 
-- Enter: submit the composer
 - Up/Down: choose an open command or file suggestion
-- Tab: activate the selected suggestion when one is open; otherwise switch Plan/Build mode
+- Tab: switch between persistent Plan and Build modes without changing composer text
 - Enter: submit the composer or activate the selected suggestion
 - Shift+Enter: insert a newline on terminals with enhanced keyboard reporting
 - Ctrl+J: portable newline fallback
+- Ctrl+C: clear all composer text
 - PageUp/PageDown: scroll the transcript
 - End: return to the latest transcript content when scrolled up
 - Esc twice within 500 ms: interrupt the active response and continue with the next queued prompt
@@ -52,10 +52,8 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - Drag across terminal text to select and automatically copy it to the clipboard
 - Click a sent message: open a modal and copy its text and attached paths
 - Click a Thinking or tool block: expand its persistent activity summary
-- Click the Plan or Build composer tab: switch the pending mode; submission makes it persistent
+- Click the Plan or Build composer tab: switch the persistent session mode
 - `/auth`: open the authentication picker
-- `/plan`: enable persistent plan mode for this and later prompts
-- `/build`: return to normal build mode
 - `/models`: choose a model from every configured provider; use arrows or hover, then Enter/click
 - `/theme`: preview and select a bundled color theme
 - `/exit`: quit
@@ -65,9 +63,9 @@ completed turns are included in later model context; failed or interrupted turns
 are not sent again. Thinking is shown until the first response text arrives. Tool calls remain as
 expandable transcript blocks after completion. New composer commands implement
 the `Command` trait and are added through `App::register_command`; command actions can update app
-state and optionally return an `AppAction` for the runtime to dispatch. Commands can also insert
-inline mode tokens that affect the submitted request and later prompts. The commands displayed on
-the home screen and command popup both read from this registry, so they stay in sync.
+state and optionally return an `AppAction` for the runtime to dispatch. The commands displayed on the
+home screen and command popup both read from this registry, so they stay in sync. Plan/Build is
+session state controlled with Tab or the composer tabs, rather than composer text or slash commands.
 
 ## Agent tools
 

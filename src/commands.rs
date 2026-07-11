@@ -1,21 +1,9 @@
-use crate::{
-    app::{App, AppAction},
-    composer::SessionMode,
-};
+use crate::app::{App, AppAction};
 use std::{fmt, sync::Arc};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandBehavior {
-    Immediate,
-    Mode(SessionMode),
-}
 
 pub trait Command: fmt::Debug + Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
-    fn behavior(&self) -> CommandBehavior {
-        CommandBehavior::Immediate
-    }
     fn execute(&self, _app: &mut App) -> Option<AppAction> {
         None
     }
@@ -70,8 +58,6 @@ impl Default for CommandRegistry {
         let mut registry = Self::empty();
         registry.register(AuthCommand);
         registry.register(ExitCommand);
-        registry.register(PlanCommand);
-        registry.register(BuildCommand);
         registry.register(ModelsCommand);
         registry.register(ThemeCommand);
         registry
@@ -110,40 +96,6 @@ impl Command for ExitCommand {
 
     fn execute(&self, _app: &mut App) -> Option<AppAction> {
         Some(AppAction::Quit)
-    }
-}
-
-#[derive(Debug)]
-struct PlanCommand;
-
-impl Command for PlanCommand {
-    fn name(&self) -> &'static str {
-        "plan"
-    }
-
-    fn description(&self) -> &'static str {
-        "Work in persistent plan mode"
-    }
-
-    fn behavior(&self) -> CommandBehavior {
-        CommandBehavior::Mode(SessionMode::Plan)
-    }
-}
-
-#[derive(Debug)]
-struct BuildCommand;
-
-impl Command for BuildCommand {
-    fn name(&self) -> &'static str {
-        "build"
-    }
-
-    fn description(&self) -> &'static str {
-        "Return to normal build mode"
-    }
-
-    fn behavior(&self) -> CommandBehavior {
-        CommandBehavior::Mode(SessionMode::Build)
     }
 }
 

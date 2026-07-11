@@ -125,11 +125,7 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
             lines.extend(
                 message
                     .content
-                    .lines(
-                        theme.style(ThemeRole::Text),
-                        theme.accent_badge(),
-                        theme.style(ThemeRole::Accent),
-                    )
+                    .lines(theme.style(ThemeRole::Text), theme.accent_badge())
                     .into_iter()
                     .map(|line| {
                         let mut spans = vec![Span::styled("│ ", theme.style(ThemeRole::MutedText))];
