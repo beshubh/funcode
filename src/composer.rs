@@ -361,6 +361,14 @@ impl ComposerDocument {
         self.sort_tokens();
     }
 
+    pub fn set_mode(&mut self, mode: SessionMode) {
+        if self.content.requested_mode() == Some(mode) {
+            return;
+        }
+        let cursor = self.cursor;
+        self.insert_mode(cursor..cursor, mode);
+    }
+
     pub fn take_submission(&mut self) -> ComposerContent {
         self.cursor = 0;
         std::mem::take(&mut self.content)
