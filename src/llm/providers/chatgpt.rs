@@ -5,6 +5,7 @@ use super::super::{
 use crate::{
     auth::AuthStore,
     tools::{AgentTool, ToolSession, ToolSpec},
+    usage::TokenUsage,
 };
 use futures::{Stream, StreamExt, future, future::BoxFuture};
 use rig_core::{
@@ -113,6 +114,8 @@ struct ChatGptModel {
     slug: String,
     display_name: String,
     visibility: String,
+    #[serde(default)]
+    context_window: Option<u64>,
 }
 
 fn parse_models(body: &[u8]) -> Result<ProviderModels, LlmError> {
@@ -128,6 +131,7 @@ fn parse_models(body: &[u8]) -> Result<ProviderModels, LlmError> {
         .map(|model| ModelInfo {
             id: model.slug,
             display_name: model.display_name,
+            context_window: model.context_window,
         })
         .collect();
     Ok(ProviderModels {
@@ -214,6 +218,13 @@ impl Provider for ChatGptProvider {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
                     StreamedAssistantContent::ReasoningDelta { reasoning, .. },
                 )) => ChatGptStreamEvent::ReasoningSummary(reasoning),
+                Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                    ChatGptStreamEvent::Usage(TokenUsage {
+                        input_tokens: call.usage.input_tokens,
+                        output_tokens: call.usage.output_tokens,
+                        total_tokens: call.usage.total_tokens,
+                    })
+                }
                 Ok(MultiTurnStreamItem::FinalResponse(_)) => ChatGptStreamEvent::Finished,
                 Ok(_) => ChatGptStreamEvent::Ignored,
                 Err(error) => ChatGptStreamEvent::Failed(error.to_string()),
@@ -314,6 +325,7 @@ fn auth_error(error: anyhow::Error) -> LlmError {
 enum ChatGptStreamEvent {
     Text(String),
     ReasoningSummary(String),
+    Usage(TokenUsage),
     Finished,
     Failed(String),
     Ignored,
@@ -349,6 +361,7 @@ impl ConversationAssembler {
             ChatGptStreamEvent::ReasoningSummary(summary) => {
                 Some(Ok(ProviderEvent::ReasoningDelta(summary)))
             }
+            ChatGptStreamEvent::Usage(usage) => Some(Ok(ProviderEvent::Usage(usage))),
             ChatGptStreamEvent::Finished => {
                 self.terminal = true;
                 Some(Ok(ProviderEvent::Completed(completed_history(
@@ -567,6 +580,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_completion_usage_before_the_final_conversation_commit() {
+        let usage = crate::usage::TokenUsage {
+            input_tokens: 120,
+            output_tokens: 30,
+            total_tokens: 150,
+        };
+        let events = stream_events(
+            stream::iter([
+                ChatGptStreamEvent::Usage(usage),
+                ChatGptStreamEvent::Finished,
+            ]),
+            ConversationAssembler::new(Vec::new(), "prompt".into()),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(matches!(
+            events[0],
+            Ok(ProviderEvent::Usage(reported)) if reported == usage
+        ));
+        assert!(matches!(events[1], Ok(ProviderEvent::Completed(_))));
+    }
+
+    #[tokio::test]
     async fn stream_failures_do_not_emit_a_conversation_commit() {
         let events = stream_events(
             stream::iter([
@@ -656,7 +693,7 @@ mod tests {
         let catalog = parse_models(
             br#"{
                 "models": [
-                    {"slug":"gpt-visible","display_name":"GPT Visible","description":"Recommended","visibility":"list"},
+                    {"slug":"gpt-visible","display_name":"GPT Visible","description":"Recommended","visibility":"list","context_window":128000},
                     {"slug":"gpt-hidden","display_name":"GPT Hidden","description":null,"visibility":"hide"}
                 ]
             }"#,
@@ -667,5 +704,6 @@ mod tests {
         assert_eq!(catalog.models.len(), 1);
         assert_eq!(catalog.models[0].id, "gpt-visible");
         assert_eq!(catalog.models[0].display_name, "GPT Visible");
+        assert_eq!(catalog.models[0].context_window, Some(128_000));
     }
 }

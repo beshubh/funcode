@@ -13,6 +13,7 @@ pub mod theme;
 pub mod tools;
 pub mod transcript;
 pub mod ui;
+pub(crate) mod usage;
 pub mod workspace;
 
 mod runtime;

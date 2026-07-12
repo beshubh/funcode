@@ -170,6 +170,11 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         }
         LaunchMode::AuthOnly => (None, None, None),
     };
+    if let Some(model_runner) = model_runner.as_ref()
+        && let Err(error) = model_runner.load()
+    {
+        app.set_notice(format!("Could not load model capabilities: {error}"));
+    }
     let mut auth_runner = AuthTaskRunner::spawn();
     let mut clipboard = ClipboardTaskRunner::spawn();
     let mut next_tick = Instant::now() + TICK_RATE;
@@ -946,10 +951,12 @@ mod tests {
                 ModelInfo {
                     id: "model-a".into(),
                     display_name: "Model A".into(),
+                    context_window: None,
                 },
                 ModelInfo {
                     id: "model-b".into(),
                     display_name: "Model B".into(),
+                    context_window: None,
                 },
             ],
         }]));
@@ -1065,10 +1072,12 @@ mod tests {
                 ModelInfo {
                     id: "model-a".into(),
                     display_name: "Model A".into(),
+                    context_window: None,
                 },
                 ModelInfo {
                     id: "model-b".into(),
                     display_name: "Model B".into(),
+                    context_window: None,
                 },
             ],
         }]));

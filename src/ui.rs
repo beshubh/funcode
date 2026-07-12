@@ -766,7 +766,66 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
     );
     regions.suggestions = render_suggestions(frame, suggestion_area, app, &suggestions, theme);
     regions.composer_input = Some(render_composer(frame, composer_area, app, theme));
+    render_session_usage(frame, area, app, theme);
     regions
+}
+
+fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    const WIDGET_WIDTH: u16 = 16;
+    const WIDGET_HEIGHT: u16 = 5;
+
+    // Keep the compact transcript readable at the documented 60-column
+    // minimum. At normal widths the widget sits in the unused top-right area.
+    if area.width < 70 || area.height < WIDGET_HEIGHT + 2 {
+        return;
+    }
+
+    let widget_area = Rect::new(
+        area.x + area.width.saturating_sub(WIDGET_WIDTH + 1),
+        area.y + 1,
+        WIDGET_WIDTH,
+        WIDGET_HEIGHT,
+    );
+    let token_text = app
+        .session_usage
+        .total_tokens()
+        .map(format_token_count)
+        .unwrap_or_else(|| "—".into());
+    let context_text = app
+        .session_usage
+        .context_utilization_percent(app.current_model_context_window())
+        .map(|percent| format!("{percent}%"))
+        .unwrap_or_else(|| "—".into());
+    let block = panel_block(" Session ", theme);
+    let inner = block.inner(widget_area);
+    frame.render_widget(Clear, widget_area);
+    frame.render_widget(block, widget_area);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::styled(
+                format!(" {token_text} tokens"),
+                theme.style(ThemeRole::Text).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                format!(" Context {context_text}"),
+                theme.style(ThemeRole::MutedText),
+            ),
+        ])),
+        inner,
+    );
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    if tokens < 10_000 {
+        return format!("{:.1}K", tokens as f64 / 1_000.0);
+    }
+    if tokens < 1_000_000 {
+        return format!("{}K", tokens / 1_000);
+    }
+    format!("{:.1}M", tokens as f64 / 1_000_000.0)
 }
 
 fn render_suggestions(
@@ -1105,6 +1164,42 @@ mod tests {
     }
 
     #[test]
+    fn chat_renders_a_rounded_session_widget_with_reported_usage_and_context() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.open_models_dialog();
+        app.set_current_model("gpt-test");
+        app.handle_model_catalog_event(crate::model_catalog::ModelCatalogEvent::Loaded(vec![
+            ProviderModels {
+                provider: "ChatGPT".into(),
+                source: "live provider API".into(),
+                models: vec![ModelInfo {
+                    id: "gpt-test".into(),
+                    display_name: "GPT Test".into(),
+                    context_window: Some(1_000),
+                }],
+            },
+        ]));
+        app.models_dialog = None;
+        app.transcript.submit(1, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::Usage {
+            request_id: 1,
+            usage: crate::usage::TokenUsage {
+                input_tokens: 250,
+                output_tokens: 50,
+                total_tokens: 300,
+            },
+        });
+
+        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("Session"));
+        assert!(screen.contains("300 tokens"));
+        assert!(screen.contains("Context 25%"));
+    }
+
+    #[test]
     fn custom_theme_paints_the_frame_and_exposes_colored_mode_labels() {
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -1422,6 +1517,7 @@ mod tests {
             models: vec![ModelInfo {
                 id: "gpt-test".into(),
                 display_name: "GPT Test".into(),
+                context_window: None,
             }],
         }]));
 
@@ -1450,6 +1546,7 @@ mod tests {
                 .map(|index| ModelInfo {
                     id: format!("model-{index}"),
                     display_name: format!("Model {index}"),
+                    context_window: None,
                 })
                 .collect(),
         }]));
@@ -1485,10 +1582,12 @@ mod tests {
                 ModelInfo {
                     id: "model-a".into(),
                     display_name: "Model A".into(),
+                    context_window: None,
                 },
                 ModelInfo {
                     id: "model-b".into(),
                     display_name: "Model B".into(),
+                    context_window: None,
                 },
             ],
         }]));
