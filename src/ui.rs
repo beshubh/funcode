@@ -18,10 +18,8 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph, Wrap},
 };
 
-const CHAT_MIN_WIDTH: u16 = 60;
-const CHAT_MIN_HEIGHT: u16 = 20;
-const HOME_MIN_WIDTH: u16 = 40;
-const HOME_MIN_HEIGHT: u16 = 20;
+const FUN_MIN_WIDTH: u16 = 60;
+const FUN_MIN_HEIGHT: u16 = 20;
 const COMPOSER_HORIZONTAL_PADDING: u16 = 2;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
 const COMPOSER_BORDER_HEIGHT: u16 = 2;
@@ -100,51 +98,43 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
         area,
     );
     let mut regions = match app.screen {
-        Screen::Home if area.width < HOME_MIN_WIDTH || area.height < HOME_MIN_HEIGHT => {
-            render_too_small(frame, area, HOME_MIN_WIDTH, HOME_MIN_HEIGHT, theme);
-            UiRegions::default()
-        }
-        Screen::Chat if area.width < CHAT_MIN_WIDTH || area.height < CHAT_MIN_HEIGHT => {
-            render_too_small(frame, area, CHAT_MIN_WIDTH, CHAT_MIN_HEIGHT, theme);
-            UiRegions::default()
-        }
-        Screen::Home => {
-            render_home(frame, area, app, theme);
+        Screen::Chat if area.width < FUN_MIN_WIDTH || area.height < FUN_MIN_HEIGHT => {
+            render_too_small(frame, area, FUN_MIN_WIDTH, FUN_MIN_HEIGHT, theme);
             UiRegions::default()
         }
         Screen::Chat => render_chat(frame, area, app, theme),
     };
 
-    if app.auth_dialog.is_some() && area.width >= HOME_MIN_WIDTH && area.height >= HOME_MIN_HEIGHT {
+    if app.auth_dialog.is_some() && area.width >= FUN_MIN_WIDTH && area.height >= FUN_MIN_HEIGHT {
         regions = UiRegions::default();
         regions.auth_providers = render_auth_dialog(frame, area, app, theme);
     } else if app.message_dialog.is_some()
-        && area.width >= CHAT_MIN_WIDTH
-        && area.height >= CHAT_MIN_HEIGHT
+        && area.width >= FUN_MIN_WIDTH
+        && area.height >= FUN_MIN_HEIGHT
     {
         regions = UiRegions::default();
         regions.message_copy = render_message_dialog(frame, area, app, theme);
     } else if app.theme_dialog.is_some()
-        && area.width >= CHAT_MIN_WIDTH
-        && area.height >= CHAT_MIN_HEIGHT
+        && area.width >= FUN_MIN_WIDTH
+        && area.height >= FUN_MIN_HEIGHT
     {
         regions = UiRegions::default();
         regions.theme_options = render_theme_dialog(frame, area, app, theme);
     } else if app.models_dialog.is_some()
-        && area.width >= CHAT_MIN_WIDTH
-        && area.height >= CHAT_MIN_HEIGHT
+        && area.width >= FUN_MIN_WIDTH
+        && area.height >= FUN_MIN_HEIGHT
     {
         regions = UiRegions::default();
         (regions.models, regions.model_refresh) = render_models_dialog(frame, area, app, theme);
     } else if app.paste_confirmation().is_some()
-        && area.width >= CHAT_MIN_WIDTH
-        && area.height >= CHAT_MIN_HEIGHT
+        && area.width >= FUN_MIN_WIDTH
+        && area.height >= FUN_MIN_HEIGHT
     {
         regions = UiRegions::default();
         render_paste_confirmation(frame, area, app, theme);
     } else if app.pending_submission_view().is_some()
-        && area.width >= CHAT_MIN_WIDTH
-        && area.height >= CHAT_MIN_HEIGHT
+        && area.width >= FUN_MIN_WIDTH
+        && area.height >= FUN_MIN_HEIGHT
     {
         regions = UiRegions::default();
         render_pending_submission(frame, area, app, theme);
@@ -637,12 +627,11 @@ fn render_message_dialog(
     Some(Rect::new(rows[1].x, rows[1].y, copy_width, 1))
 }
 
-fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let inner = area.inner(Margin::new(2, 1));
+fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let inner = area.inner(Margin::new(2, 0));
     let rows = Layout::vertical([
         Constraint::Length(7),
         Constraint::Length(1),
-        Constraint::Length(10),
         Constraint::Min(0),
     ])
     .split(inner);
@@ -651,8 +640,7 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         rows[0],
     );
 
-    let columns = Layout::horizontal([Constraint::Length(44), Constraint::Min(0)]).split(rows[2]);
-    render_home_help(frame, columns[0], app, theme);
+    render_welcome_help(frame, rows[2], app, theme);
 }
 
 fn fun_logo(theme: &Theme) -> Text<'static> {
@@ -718,7 +706,7 @@ fn fun_logo(theme: &Theme) -> Text<'static> {
     ])
 }
 
-fn render_home_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+fn render_welcome_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     let mut lines = vec![Line::styled(
         "Available commands",
         theme.style(ThemeRole::Text).add_modifier(Modifier::BOLD),
@@ -734,7 +722,7 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme)
     }));
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "Enter start  ·  /exit quit",
+        "Type a request below  ·  /exit quit",
         theme.style(ThemeRole::MutedText),
     ));
     let help = Text::from(lines);
@@ -760,10 +748,12 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
     ])
     .split(inner);
 
-    let mut regions = UiRegions {
-        transcript_entries: transcript::render(frame, rows[0], app, theme),
-        ..UiRegions::default()
-    };
+    let mut regions = UiRegions::default();
+    if app.transcript.entries().is_empty() {
+        render_welcome(frame, rows[0], app, theme);
+    } else {
+        regions.transcript_entries = transcript::render(frame, rows[0], app, theme);
+    }
     render_activity(frame, rows[1], app, theme);
     let composer_area = rows[2];
     let suggestion_height =
@@ -1082,29 +1072,32 @@ mod tests {
     }
 
     #[test]
-    fn home_screen_has_no_app_border_and_one_compact_help_widget() {
-        let (screen, cursor_visible, _, top_left) = render_to_string(&App::new(), 100, 30);
+    fn fun_launch_unifies_logo_help_and_active_composer() {
+        let (screen, cursor_visible, regions, top_left) = render_to_string(&App::new(), 100, 30);
 
         assert!(screen.contains("██████████"));
+        assert!(screen.contains("Help"));
         assert!(screen.contains("/auth"));
         assert!(screen.contains("/exit"));
         assert!(!screen.contains("/sessions"));
         assert!(!screen.contains("/help"));
         assert!(screen.contains("/models"));
+        assert!(screen.contains("Type something"));
+        assert!(!screen.contains("No messages yet"));
         assert!(!screen.contains("Model: not connected"));
+        assert!(regions.transcript_entries.is_empty());
         assert_eq!(top_left, " ");
-        assert!(!cursor_visible);
+        assert!(cursor_visible);
     }
 
     #[test]
     fn idle_chat_has_no_transcript_entry_regions_and_no_app_border() {
-        let mut app = App::new();
-        app.screen = Screen::Chat;
+        let app = App::new();
 
         let (screen, cursor_visible, regions, top_left) = render_to_string(&app, 100, 30);
 
         assert!(!screen.contains("Agent messages"));
-        assert!(screen.contains("No messages yet"));
+        assert!(screen.contains("Type a request below"));
         assert!(screen.contains("Type something"));
         assert!(regions.transcript_entries.is_empty());
         assert_eq!(top_left, " ");
