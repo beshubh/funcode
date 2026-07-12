@@ -1,5 +1,6 @@
 use crate::session::SessionMode;
 use crate::tools::{ToolRegistry, ToolSession};
+use crate::usage::TokenUsage;
 use futures::{
     StreamExt,
     future::BoxFuture,
@@ -21,6 +22,7 @@ pub(crate) type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent, LlmError>
 pub(crate) enum LlmEvent {
     TextDelta(String),
     ReasoningDelta(String),
+    Usage(TokenUsage),
     Completed(ConversationCommit),
 }
 
@@ -47,6 +49,8 @@ pub(crate) enum LlmError {
 pub(crate) struct ModelInfo {
     pub(crate) id: String,
     pub(crate) display_name: String,
+    #[serde(default)]
+    pub(crate) context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -104,6 +108,7 @@ pub(crate) struct ProviderRequest {
 pub(crate) enum ProviderEvent {
     TextDelta(String),
     ReasoningDelta(String),
+    Usage(TokenUsage),
     Completed(Vec<ConversationMessage>),
 }
 
@@ -229,6 +234,7 @@ impl LlmClient {
         Ok(Box::pin(stream.map(move |event| match event? {
             ProviderEvent::TextDelta(text) => Ok(LlmEvent::TextDelta(text)),
             ProviderEvent::ReasoningDelta(summary) => Ok(LlmEvent::ReasoningDelta(summary)),
+            ProviderEvent::Usage(usage) => Ok(LlmEvent::Usage(usage)),
             ProviderEvent::Completed(mut history) => {
                 if let Some(ConversationMessage::User(prompt)) = history
                     .iter_mut()
@@ -331,6 +337,44 @@ mod tests {
         assert!(matches!(events[2], Ok(LlmEvent::Completed(_))));
     }
 
+    #[tokio::test]
+    async fn streams_provider_usage_without_turning_it_into_a_conversation_commit() {
+        struct UsageProvider;
+
+        impl Provider for UsageProvider {
+            fn stream(
+                &self,
+                _request: ProviderRequest,
+            ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+                Box::pin(async {
+                    Ok(Box::pin(stream::iter([Ok(ProviderEvent::Usage(
+                        crate::usage::TokenUsage {
+                            input_tokens: 20,
+                            output_tokens: 5,
+                            total_tokens: 25,
+                        },
+                    ))])) as ProviderStream)
+                })
+            }
+        }
+
+        let events = LlmClient::with_provider(Arc::new(UsageProvider))
+            .stream("hello".into())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            events,
+            vec![Ok(LlmEvent::Usage(crate::usage::TokenUsage {
+                input_tokens: 20,
+                output_tokens: 5,
+                total_tokens: 25,
+            }))]
+        );
+    }
+
     struct RecordingProvider {
         requests: Arc<Mutex<Vec<ProviderRequest>>>,
         responses: Mutex<VecDeque<Vec<Result<ProviderEvent, LlmError>>>>,
@@ -373,7 +417,7 @@ mod tests {
             .into_iter()
             .find_map(|event| match event.unwrap() {
                 LlmEvent::Completed(commit) => Some(commit),
-                LlmEvent::TextDelta(_) | LlmEvent::ReasoningDelta(_) => None,
+                LlmEvent::TextDelta(_) | LlmEvent::ReasoningDelta(_) | LlmEvent::Usage(_) => None,
             })
             .unwrap();
         client.commit(commit).unwrap();
@@ -441,7 +485,7 @@ mod tests {
             .into_iter()
             .find_map(|event| match event.unwrap() {
                 LlmEvent::Completed(commit) => Some(commit),
-                LlmEvent::TextDelta(_) | LlmEvent::ReasoningDelta(_) => None,
+                LlmEvent::TextDelta(_) | LlmEvent::ReasoningDelta(_) | LlmEvent::Usage(_) => None,
             })
             .unwrap();
         client.commit(commit).unwrap();
