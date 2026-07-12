@@ -180,6 +180,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     let mut next_tick = Instant::now() + TICK_RATE;
     let mut should_quit = false;
     let mut regions = ui::UiRegions::default();
+    let ui_state = ui::UiState::default();
     let mut selection = TerminalSelection::default();
     let mut rendered_buffer = Buffer::empty(ratatui::layout::Rect::default());
     let mut last_workspace_search: Option<(crate::composer::QueryId, Instant)> = None;
@@ -295,7 +296,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
             terminal
                 .draw(|frame| {
                     let theme = Theme::resolve(app.effective_theme_id());
-                    regions = ui::render(frame, &app, &theme);
+                    regions = ui::render_with_state(frame, &app, &theme, &ui_state);
                     selection.highlight(frame.buffer_mut());
                     rendered_buffer = frame.buffer_mut().clone();
                 })

@@ -108,6 +108,17 @@ pub struct Entry {
     pub id: EntryId,
     pub turn_id: TurnId,
     pub kind: EntryKind,
+    revision: u64,
+}
+
+impl Entry {
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +187,7 @@ impl Transcript {
     }
 
     pub fn is_queued(&self, turn_id: TurnId) -> bool {
-        self.entries.iter().any(|entry| {
+        self.entries.iter().rev().any(|entry| {
             entry.turn_id == turn_id
                 && matches!(
                     entry.kind,
@@ -211,29 +222,38 @@ impl Transcript {
     pub fn apply(&mut self, event: TranscriptEvent) {
         match event {
             TranscriptEvent::Started { turn_id } => {
-                if let Some(assistant) = self.assistant_mut(turn_id)
-                    && assistant.status == AssistantStatus::Queued
-                {
+                if self.update_assistant(turn_id, |assistant| {
+                    if assistant.status != AssistantStatus::Queued {
+                        return false;
+                    }
                     assistant.status = AssistantStatus::Thinking;
+                    true
+                }) {
                     self.ensure_reasoning(turn_id);
                 }
             }
             TranscriptEvent::TextDelta { turn_id, text } => {
-                if let Some(assistant) = self.assistant_mut(turn_id)
-                    && matches!(
+                if self.update_assistant(turn_id, |assistant| {
+                    if !matches!(
                         assistant.status,
                         AssistantStatus::Thinking | AssistantStatus::Streaming
-                    )
-                {
+                    ) {
+                        return false;
+                    }
                     assistant.status = AssistantStatus::Streaming;
                     assistant.text.push_str(&text);
+                    true
+                }) {
                     self.finish_reasoning(turn_id, ActivityStatus::Completed);
                 }
             }
             TranscriptEvent::ReasoningDelta { turn_id, summary } => {
                 if self.is_active(turn_id) {
-                    let reasoning = self.ensure_reasoning(turn_id);
-                    reasoning.summary.push_str(&summary);
+                    self.ensure_reasoning(turn_id);
+                    self.update_reasoning(turn_id, |reasoning| {
+                        reasoning.summary.push_str(&summary);
+                        true
+                    });
                 }
             }
             TranscriptEvent::Retrying {
@@ -260,7 +280,7 @@ impl Transcript {
                 summary,
                 artifacts,
             } => {
-                if self.is_active(turn_id) && self.tool_mut(turn_id, call_id).is_none() {
+                if self.is_active(turn_id) && !self.has_tool(turn_id, call_id) {
                     self.insert_activity(
                         turn_id,
                         EntryKind::Tool(ToolCall {
@@ -278,11 +298,16 @@ impl Transcript {
                 call_id,
                 chunk,
             } => {
-                if self.is_active(turn_id)
-                    && let Some(tool) = self.tool_mut(turn_id, call_id)
-                    && let Some(ToolArtifact::Terminal { output, .. }) = tool.artifacts.first_mut()
-                {
-                    output.push_str(&chunk);
+                if self.is_active(turn_id) {
+                    self.update_tool(turn_id, call_id, |tool| {
+                        let Some(ToolArtifact::Terminal { output, .. }) =
+                            tool.artifacts.first_mut()
+                        else {
+                            return false;
+                        };
+                        output.push_str(&chunk);
+                        true
+                    });
                 }
             }
             TranscriptEvent::ToolFinished {
@@ -291,14 +316,15 @@ impl Transcript {
                 summary,
                 artifacts,
             } => {
-                if self.is_active(turn_id)
-                    && let Some(tool) = self.tool_mut(turn_id, call_id)
-                {
-                    if let Some(summary) = summary {
-                        tool.summary = summary;
-                    }
-                    tool.artifacts = artifacts;
-                    tool.status = ActivityStatus::Completed;
+                if self.is_active(turn_id) {
+                    self.update_tool(turn_id, call_id, |tool| {
+                        if let Some(summary) = summary {
+                            tool.summary = summary;
+                        }
+                        tool.artifacts = artifacts;
+                        tool.status = ActivityStatus::Completed;
+                        true
+                    });
                 }
             }
             TranscriptEvent::ToolFailed {
@@ -306,38 +332,47 @@ impl Transcript {
                 call_id,
                 message,
             } => {
-                if self.is_active(turn_id)
-                    && let Some(tool) = self.tool_mut(turn_id, call_id)
-                {
-                    tool.status = ActivityStatus::Failed(message);
+                if self.is_active(turn_id) {
+                    self.update_tool(turn_id, call_id, |tool| {
+                        tool.status = ActivityStatus::Failed(message);
+                        true
+                    });
                 }
             }
             TranscriptEvent::Completed { turn_id } => {
-                if let Some(assistant) = self.assistant_mut(turn_id)
-                    && matches!(
+                if self.update_assistant(turn_id, |assistant| {
+                    if !matches!(
                         assistant.status,
                         AssistantStatus::Thinking | AssistantStatus::Streaming
-                    )
-                {
+                    ) {
+                        return false;
+                    }
                     assistant.status = AssistantStatus::Completed;
+                    true
+                }) {
                     self.finish_reasoning(turn_id, ActivityStatus::Completed);
                 }
             }
             TranscriptEvent::Interrupted { turn_id } => {
-                if let Some(assistant) = self.assistant_mut(turn_id)
-                    && matches!(
+                if self.update_assistant(turn_id, |assistant| {
+                    if !matches!(
                         assistant.status,
                         AssistantStatus::Thinking | AssistantStatus::Streaming
-                    )
-                {
+                    ) {
+                        return false;
+                    }
                     assistant.status = AssistantStatus::Interrupted;
+                    true
+                }) {
                     self.finish_reasoning(turn_id, ActivityStatus::Interrupted);
                     self.finish_running_tools(turn_id, ActivityStatus::Interrupted);
                 }
             }
             TranscriptEvent::Failed { turn_id, message } => {
-                if let Some(assistant) = self.assistant_mut(turn_id) {
+                if self.update_assistant(turn_id, |assistant| {
                     assistant.status = AssistantStatus::Failed(message.clone());
+                    true
+                }) {
                     self.finish_reasoning(turn_id, ActivityStatus::Failed(message.clone()));
                     self.finish_running_tools(turn_id, ActivityStatus::Failed(message));
                 }
@@ -357,7 +392,12 @@ impl Transcript {
     fn push(&mut self, turn_id: TurnId, kind: EntryKind) {
         let id = self.next_entry_id;
         self.next_entry_id = self.next_entry_id.wrapping_add(1);
-        self.entries.push(Entry { id, turn_id, kind });
+        self.entries.push(Entry {
+            id,
+            turn_id,
+            kind,
+            revision: 0,
+        });
     }
 
     fn insert_activity(&mut self, turn_id: TurnId, kind: EntryKind) {
@@ -369,33 +409,68 @@ impl Transcript {
         let index = self
             .entries
             .iter()
-            .position(|entry| {
+            .rposition(|entry| {
                 entry.turn_id == turn_id && matches!(entry.kind, EntryKind::Assistant(_))
             })
             .unwrap_or(self.entries.len());
-        self.entries.insert(index, Entry { id, turn_id, kind });
+        self.entries.insert(
+            index,
+            Entry {
+                id,
+                turn_id,
+                kind,
+                revision: 0,
+            },
+        );
     }
 
-    fn assistant_mut(&mut self, turn_id: TurnId) -> Option<&mut AssistantMessage> {
-        self.entries.iter_mut().find_map(|entry| {
-            (entry.turn_id == turn_id).then_some(match &mut entry.kind {
-                EntryKind::Assistant(message) => Some(message),
-                _ => None,
-            })?
-        })
+    fn update_assistant(
+        &mut self,
+        turn_id: TurnId,
+        update: impl FnOnce(&mut AssistantMessage) -> bool,
+    ) -> bool {
+        let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
+            entry.turn_id == turn_id && matches!(entry.kind, EntryKind::Assistant(_))
+        }) else {
+            return false;
+        };
+        let EntryKind::Assistant(assistant) = &mut entry.kind else {
+            unreachable!();
+        };
+        if !update(assistant) {
+            return false;
+        }
+        entry.touch();
+        true
     }
 
-    fn reasoning_mut(&mut self, turn_id: TurnId) -> Option<&mut Reasoning> {
-        self.entries.iter_mut().find_map(|entry| {
-            (entry.turn_id == turn_id).then_some(match &mut entry.kind {
-                EntryKind::Reasoning(reasoning) => Some(reasoning),
-                _ => None,
-            })?
-        })
+    fn update_reasoning(
+        &mut self,
+        turn_id: TurnId,
+        update: impl FnOnce(&mut Reasoning) -> bool,
+    ) -> bool {
+        let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
+            entry.turn_id == turn_id && matches!(entry.kind, EntryKind::Reasoning(_))
+        }) else {
+            return false;
+        };
+        let EntryKind::Reasoning(reasoning) = &mut entry.kind else {
+            unreachable!();
+        };
+        if !update(reasoning) {
+            return false;
+        }
+        entry.touch();
+        true
     }
 
-    fn ensure_reasoning(&mut self, turn_id: TurnId) -> &mut Reasoning {
-        if self.reasoning_mut(turn_id).is_none() {
+    fn ensure_reasoning(&mut self, turn_id: TurnId) {
+        if !self
+            .entries
+            .iter()
+            .rev()
+            .any(|entry| entry.turn_id == turn_id && matches!(entry.kind, EntryKind::Reasoning(_)))
+        {
             self.insert_activity(
                 turn_id,
                 EntryKind::Reasoning(Reasoning {
@@ -404,23 +479,38 @@ impl Transcript {
                 }),
             );
         }
-        self.reasoning_mut(turn_id)
-            .expect("reasoning entry was just inserted")
     }
 
-    fn tool_mut(&mut self, turn_id: TurnId, call_id: ToolCallId) -> Option<&mut ToolCall> {
+    fn has_tool(&self, turn_id: TurnId, call_id: ToolCallId) -> bool {
         self.entries
-            .iter_mut()
-            .find_map(|entry| match &mut entry.kind {
-                EntryKind::Tool(tool) if entry.turn_id == turn_id && tool.call_id == call_id => {
-                    Some(tool)
-                }
-                _ => None,
-            })
+            .iter()
+            .rev()
+            .any(|entry| matches!(&entry.kind, EntryKind::Tool(tool) if entry.turn_id == turn_id && tool.call_id == call_id))
+    }
+
+    fn update_tool(
+        &mut self,
+        turn_id: TurnId,
+        call_id: ToolCallId,
+        update: impl FnOnce(&mut ToolCall) -> bool,
+    ) -> bool {
+        let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
+            matches!(&entry.kind, EntryKind::Tool(tool) if entry.turn_id == turn_id && tool.call_id == call_id)
+        }) else {
+            return false;
+        };
+        let EntryKind::Tool(tool) = &mut entry.kind else {
+            unreachable!();
+        };
+        if !update(tool) {
+            return false;
+        }
+        entry.touch();
+        true
     }
 
     fn is_active(&self, turn_id: TurnId) -> bool {
-        self.entries.iter().any(|entry| {
+        self.entries.iter().rev().any(|entry| {
             entry.turn_id == turn_id
                 && matches!(
                     entry.kind,
@@ -433,11 +523,13 @@ impl Transcript {
     }
 
     fn finish_reasoning(&mut self, turn_id: TurnId, status: ActivityStatus) {
-        if let Some(reasoning) = self.reasoning_mut(turn_id)
-            && reasoning.status == ActivityStatus::Running
-        {
+        self.update_reasoning(turn_id, |reasoning| {
+            if reasoning.status != ActivityStatus::Running {
+                return false;
+            }
             reasoning.status = status;
-        }
+            true
+        });
     }
 
     fn finish_running_tools(&mut self, turn_id: TurnId, status: ActivityStatus) {
@@ -447,6 +539,7 @@ impl Transcript {
                 && tool.status == ActivityStatus::Running
             {
                 tool.status = status.clone();
+                entry.touch();
             }
         }
     }

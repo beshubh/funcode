@@ -11,7 +11,7 @@ use crate::{
     session::SessionMode,
     submission::{DraftId, PreparedRequest, SubmissionEvent},
     theme::ThemeId,
-    transcript::{EntryId, EntryKind, ToolArtifact, Transcript, TranscriptEvent},
+    transcript::{Entry, EntryId, EntryKind, ToolArtifact, Transcript, TranscriptEvent},
     usage::SessionUsage,
     workspace::WorkspacePath,
 };
@@ -1160,8 +1160,18 @@ impl App {
     }
 
     pub fn toggle_entry(&mut self, entry_id: EntryId) {
-        let default_expanded = self.entry_is_expanded_by_default(entry_id);
-        if self.entry_is_expanded(entry_id) {
+        let default_expanded = self
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .is_some_and(Self::entry_is_expanded_by_default);
+        let expanded = if self.collapsed_entries.contains(&entry_id) {
+            false
+        } else {
+            self.expanded_entries.contains(&entry_id) || default_expanded
+        };
+        if expanded {
             self.expanded_entries
                 .retain(|expanded| *expanded != entry_id);
             if default_expanded && !self.collapsed_entries.contains(&entry_id) {
@@ -1177,30 +1187,34 @@ impl App {
     }
 
     pub fn entry_is_expanded(&self, entry_id: EntryId) -> bool {
-        if self.collapsed_entries.contains(&entry_id) {
-            false
-        } else {
-            self.expanded_entries.contains(&entry_id) || self.entry_is_expanded_by_default(entry_id)
-        }
-    }
-
-    fn entry_is_expanded_by_default(&self, entry_id: EntryId) -> bool {
         self.transcript
             .entries()
             .iter()
             .find(|entry| entry.id == entry_id)
-            .is_some_and(|entry| match &entry.kind {
-                EntryKind::Tool(tool) => {
-                    tool.name == "terminal"
-                        || tool.artifacts.iter().any(|artifact| {
-                            matches!(
-                                artifact,
-                                ToolArtifact::Patch { .. } | ToolArtifact::Terminal { .. }
-                            )
-                        })
-                }
-                _ => false,
-            })
+            .is_some_and(|entry| self.transcript_entry_is_expanded(entry))
+    }
+
+    pub(crate) fn transcript_entry_is_expanded(&self, entry: &Entry) -> bool {
+        if self.collapsed_entries.contains(&entry.id) {
+            false
+        } else {
+            self.expanded_entries.contains(&entry.id) || Self::entry_is_expanded_by_default(entry)
+        }
+    }
+
+    fn entry_is_expanded_by_default(entry: &Entry) -> bool {
+        match &entry.kind {
+            EntryKind::Tool(tool) => {
+                tool.name == "terminal"
+                    || tool.artifacts.iter().any(|artifact| {
+                        matches!(
+                            artifact,
+                            ToolArtifact::Patch { .. } | ToolArtifact::Terminal { .. }
+                        )
+                    })
+            }
+            _ => false,
+        }
     }
 
     pub fn open_message_dialog(&mut self, entry_id: EntryId) {
@@ -2519,7 +2533,7 @@ mod tests {
         });
 
         assert_eq!(app.session_usage.total_tokens(), Some(150));
-        assert_eq!(app.session_usage.context_tokens(), Some(120));
+        assert_eq!(app.session_usage.context_tokens(), Some(150));
     }
 
     #[test]

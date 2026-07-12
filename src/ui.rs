@@ -43,6 +43,11 @@ pub struct UiRegions {
     pub context_usage: Option<Rect>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct UiState {
+    transcript: transcript::TranscriptRenderCache,
+}
+
 impl UiRegions {
     pub fn target_at(&self, column: u16, row: u16) -> Option<UiTarget> {
         let position = Position::new(column, row);
@@ -101,6 +106,15 @@ impl UiRegions {
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
+    render_with_state(frame, app, theme, &UiState::default())
+}
+
+pub(crate) fn render_with_state(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: &Theme,
+    state: &UiState,
+) -> UiRegions {
     let area = frame.area();
     frame.render_widget(
         Block::default().style(theme.style(ThemeRole::Surface)),
@@ -111,7 +125,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
             render_too_small(frame, area, FUN_MIN_WIDTH, FUN_MIN_HEIGHT, theme);
             UiRegions::default()
         }
-        Screen::Chat => render_chat(frame, area, app, theme),
+        Screen::Chat => render_chat(frame, area, app, theme, state),
     };
 
     if app.auth_dialog.is_some() && area.width >= FUN_MIN_WIDTH && area.height >= FUN_MIN_HEIGHT {
@@ -756,7 +770,13 @@ fn welcome_help_area(area: Rect, content_lines: u16) -> Rect {
     )
 }
 
-fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> UiRegions {
+fn render_chat(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    state: &UiState,
+) -> UiRegions {
     let inner = area.inner(Margin::new(1, 1));
     let suggestions = app.suggestions();
     let activity_height = u16::from(!activity_text(app).is_empty());
@@ -774,7 +794,8 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
     if app.transcript.entries().is_empty() {
         render_welcome(frame, rows[0], app, theme);
     } else {
-        regions.transcript_entries = transcript::render(frame, rows[0], app, theme);
+        regions.transcript_entries =
+            transcript::render(frame, rows[0], app, theme, &state.transcript);
     }
     render_activity(frame, rows[1], app, theme);
     let composer_area = rows[2];
@@ -808,11 +829,14 @@ fn render_session_usage(
         return None;
     }
 
-    let total_tokens = app.session_usage.total_tokens();
+    // Keep the count and percentage on the card in the same unit: both describe
+    // the latest request context. The cumulative session total can be much
+    // larger because providers report the repeated history on every call.
+    let context_tokens = app.session_usage.context_tokens();
     let context_percent = app
         .session_usage
         .context_utilization_percent(app.current_model_context_window());
-    if total_tokens.is_none() && context_percent.is_none() {
+    if context_tokens.is_none() && context_percent.is_none() {
         return None;
     }
     let widget_area = Rect::new(
@@ -821,10 +845,9 @@ fn render_session_usage(
         WIDGET_WIDTH,
         WIDGET_HEIGHT,
     );
-    let token_text = total_tokens
+    let token_text = context_tokens
         .map(format_token_count)
         .unwrap_or_else(|| "—".into());
-    // BUG: this is always showing as "- used"
     let context_text = context_percent
         .map(|percent| format!("{percent}%"))
         .unwrap_or_else(|| "—".into());
@@ -1137,7 +1160,9 @@ fn render_too_small(
 
 #[cfg(test)]
 mod tests {
-    use super::{UiRegions, UiTarget, composer_height, render, welcome_help_area};
+    use super::{
+        UiRegions, UiState, UiTarget, composer_height, render, render_with_state, welcome_help_area,
+    };
     use crate::{
         agent::AgentEvent,
         app::{App, ModelsDialogPhase, Screen},
@@ -1153,11 +1178,20 @@ mod tests {
     };
 
     fn render_to_string(app: &App, width: u16, height: u16) -> (String, bool, UiRegions, String) {
+        render_to_string_with_state(app, width, height, &UiState::default())
+    }
+
+    fn render_to_string_with_state(
+        app: &App,
+        width: u16,
+        height: u16,
+        state: &UiState,
+    ) -> (String, bool, UiRegions, String) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut regions = UiRegions::default();
         terminal
-            .draw(|frame| regions = render(frame, app, &Theme::default()))
+            .draw(|frame| regions = render_with_state(frame, app, &Theme::default(), state))
             .unwrap();
         (
             terminal.backend().to_string(),
@@ -1287,7 +1321,7 @@ mod tests {
 
         assert!(screen.contains("context"));
         assert!(screen.contains("300 tok"));
-        assert!(screen.contains("25% used"));
+        assert!(screen.contains("30% used"));
         assert!(screen.contains("░░░░░░░░░░"));
         let context_usage = regions.context_usage.unwrap();
         assert_eq!(
@@ -1378,7 +1412,10 @@ mod tests {
             .cell(Position::new(build.x.saturating_sub(11), build.y))
             .unwrap()
             .style();
-        assert_eq!(composer_border.fg, theme.style(crate::theme::ThemeRole::Text).fg);
+        assert_eq!(
+            composer_border.fg,
+            theme.style(crate::theme::ThemeRole::Text).fg
+        );
     }
 
     #[test]
@@ -1866,6 +1903,153 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_long_transcripts_reuse_measurements_and_visible_lines() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        for request_id in 1..=200 {
+            app.transcript
+                .submit(request_id, format!("prompt {request_id}"), Vec::new());
+            app.handle_agent_event(AgentEvent::Started { request_id });
+            app.handle_agent_event(AgentEvent::ToolStarted {
+                request_id,
+                call_id: request_id,
+                name: "terminal".into(),
+                summary: format!("command {request_id}"),
+                artifacts: vec![ToolArtifact::Terminal {
+                    description: format!("command {request_id}"),
+                    command: "printf output".into(),
+                    output: format!("output {request_id}\n"),
+                    exit_code: None,
+                }],
+            });
+            app.handle_agent_event(AgentEvent::ToolFinished {
+                request_id,
+                call_id: request_id,
+                summary: Some("complete".into()),
+                artifacts: vec![ToolArtifact::Terminal {
+                    description: format!("command {request_id}"),
+                    command: "printf output".into(),
+                    output: format!("output {request_id}\n"),
+                    exit_code: Some(0),
+                }],
+            });
+            app.handle_agent_event(AgentEvent::TextDelta {
+                request_id,
+                text: format!("answer {request_id}"),
+            });
+            app.handle_agent_event(AgentEvent::Completed { request_id });
+        }
+
+        let state = UiState::default();
+        let _ = render_to_string_with_state(&app, 100, 30, &state);
+        let after_first_frame = state.transcript.stats();
+        let _ = render_to_string_with_state(&app, 100, 30, &state);
+        let after_second_frame = state.transcript.stats();
+
+        assert!(after_first_frame.0 >= 600);
+        assert!(after_first_frame.1 > 0);
+        assert_eq!(after_second_frame, after_first_frame);
+
+        app.scroll_transcript_up();
+        app.composer.insert_text("responsive input");
+        let (screen, _, _, _) = render_to_string_with_state(&app, 100, 30, &state);
+
+        assert!(screen.contains("responsive input"));
+        assert_eq!(state.transcript.stats(), after_second_frame);
+    }
+
+    #[test]
+    fn streamed_entry_updates_invalidate_only_the_changed_render_cache_entry() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 1,
+            text: "short".into(),
+        });
+        let state = UiState::default();
+        let _ = render_to_string_with_state(&app, 100, 30, &state);
+        let before_update = state.transcript.stats();
+
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 1,
+            text: " and now visibly longer".into(),
+        });
+        let (screen, _, _, _) = render_to_string_with_state(&app, 100, 30, &state);
+        let after_update = state.transcript.stats();
+
+        assert!(screen.contains("short and now visibly longer"));
+        assert_eq!(after_update.0, before_update.0 + 1);
+        assert_eq!(after_update.1, before_update.1 + 1);
+    }
+
+    #[test]
+    fn interruption_invalidates_running_entries_and_late_events_reuse_the_cache() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 1,
+            call_id: 7,
+            name: "terminal".into(),
+            summary: "running command".into(),
+            artifacts: vec![ToolArtifact::Terminal {
+                description: "run".into(),
+                command: "echo before".into(),
+                output: "before".into(),
+                exit_code: None,
+            }],
+        });
+        let state = UiState::default();
+        let _ = render_to_string_with_state(&app, 100, 30, &state);
+        let before_interrupt = state.transcript.stats();
+
+        app.handle_agent_event(AgentEvent::Interrupted { request_id: 1 });
+        let (interrupted, _, _, _) = render_to_string_with_state(&app, 100, 30, &state);
+        let after_interrupt = state.transcript.stats();
+        assert!(interrupted.contains("interrupted"));
+        assert!(after_interrupt.0 > before_interrupt.0);
+        assert!(after_interrupt.1 > before_interrupt.1);
+
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 1,
+            text: "late assistant text".into(),
+        });
+        app.handle_agent_event(AgentEvent::ToolOutputDelta {
+            request_id: 1,
+            call_id: 7,
+            chunk: "late tool text".into(),
+        });
+        let (late, _, _, _) = render_to_string_with_state(&app, 100, 30, &state);
+
+        assert!(!late.contains("late assistant text"));
+        assert!(!late.contains("late tool text"));
+        assert_eq!(state.transcript.stats(), after_interrupt);
+    }
+
+    #[test]
+    fn failure_invalidates_cached_running_entries() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        let state = UiState::default();
+        let _ = render_to_string_with_state(&app, 100, 30, &state);
+        let before_failure = state.transcript.stats();
+
+        app.handle_agent_event(AgentEvent::Failed {
+            request_id: 1,
+            message: "provider failed".into(),
+        });
+        let (failed, _, _, _) = render_to_string_with_state(&app, 100, 30, &state);
+
+        assert!(failed.contains("provider failed"));
+        assert!(state.transcript.stats().0 > before_failure.0);
+    }
+
+    #[test]
     fn reasoning_is_a_clickable_collapsed_transcript_block() {
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -2155,6 +2339,22 @@ mod tests {
             ),
             Some(UiTarget::TranscriptEntry(regions.transcript_entries[0].id))
         );
+    }
+
+    #[test]
+    fn submitted_pastes_render_their_original_text_instead_of_an_editor_badge() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.handle_paste("alpha\n  beta");
+        let submitted = app.composer.freeze();
+        app.composer.clear();
+        app.transcript.submit_content(1, submitted);
+
+        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("alpha"));
+        assert!(screen.contains("  beta"));
+        assert!(!screen.contains("[2 lines pasted]"));
     }
 
     #[test]

@@ -21,9 +21,9 @@ impl TokenUsage {
 
 /// Usage accumulated only from provider-reported completion snapshots.
 ///
-/// `context_tokens` is the input size of the most recent provider completion.
-/// It represents the active context, unlike `input_tokens`, which is a sum over
-/// the session and therefore includes repeated conversation history.
+/// `context_tokens` is the input plus output size of the most recent provider
+/// completion. It approximates the context available to the next call, unlike
+/// the session totals, which include repeated conversation history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct SessionUsage {
     input_tokens: u64,
@@ -43,9 +43,10 @@ impl SessionUsage {
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
         self.total_tokens = self.total_tokens.saturating_add(usage.normalized_total());
         self.reported_calls = self.reported_calls.saturating_add(1);
-        self.context_tokens = (usage.input_tokens != 0).then_some(usage.input_tokens);
+        self.context_tokens = (usage.input_tokens != 0).then_some(usage.normalized_total());
     }
 
+    #[cfg(test)]
     pub(crate) const fn total_tokens(self) -> Option<u64> {
         if self.reported_calls != 0 {
             Some(self.total_tokens)
@@ -54,7 +55,6 @@ impl SessionUsage {
         }
     }
 
-    #[cfg(test)]
     pub(crate) const fn context_tokens(self) -> Option<u64> {
         self.context_tokens
     }
@@ -72,7 +72,7 @@ mod tests {
     use super::{SessionUsage, TokenUsage};
 
     #[test]
-    fn session_usage_accumulates_reported_calls_and_uses_the_latest_input_for_context() {
+    fn session_usage_accumulates_calls_and_uses_the_latest_total_for_context() {
         let mut usage = SessionUsage::default();
         usage.record(TokenUsage {
             input_tokens: 120,
@@ -86,8 +86,8 @@ mod tests {
         });
 
         assert_eq!(usage.total_tokens(), Some(410));
-        assert_eq!(usage.context_tokens(), Some(240));
-        assert_eq!(usage.context_utilization_percent(Some(1_000)), Some(24));
+        assert_eq!(usage.context_tokens(), Some(260));
+        assert_eq!(usage.context_utilization_percent(Some(1_000)), Some(26));
     }
 
     #[test]

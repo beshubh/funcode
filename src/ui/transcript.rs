@@ -1,7 +1,7 @@
 use crate::{
     app::App,
     composer::DisplayRunKind,
-    theme::{Theme, ThemeRole},
+    theme::{Theme, ThemeId, ThemeRole},
     transcript::{ActivityStatus, AssistantStatus, Entry, EntryId, EntryKind, ToolArtifact},
 };
 use ratatui::{
@@ -10,7 +10,11 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::Paragraph,
 };
-use std::sync::Arc;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -20,11 +24,115 @@ pub struct EntryRegion {
     pub area: Rect,
 }
 
+const RENDERED_ENTRY_CACHE_CAPACITY: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeightKey {
+    revision: u64,
+    width: usize,
+    expanded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinesKey {
+    revision: u64,
+    expanded: bool,
+    theme: ThemeId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedHeight {
+    key: HeightKey,
+    height: usize,
+}
+
+#[derive(Debug)]
+struct CachedLines {
+    entry_id: EntryId,
+    key: LinesKey,
+    lines: Arc<Vec<Line<'static>>>,
+}
+
+#[derive(Debug, Default)]
+struct RenderCacheInner {
+    heights: HashMap<EntryId, CachedHeight>,
+    lines: VecDeque<CachedLines>,
+    height_builds: usize,
+    line_builds: usize,
+}
+
+/// Retains immutable transcript measurements between terminal frames.
+///
+/// Historical entries dominate long conversations, so their wrapped heights
+/// are cached without a fixed limit. Fully materialized lines are much larger;
+/// only a small viewport-oriented LRU is retained for those.
+#[derive(Debug, Default)]
+pub(crate) struct TranscriptRenderCache {
+    inner: RefCell<RenderCacheInner>,
+}
+
+impl TranscriptRenderCache {
+    fn height(&self, entry_id: EntryId, key: HeightKey) -> Option<usize> {
+        self.inner
+            .borrow()
+            .heights
+            .get(&entry_id)
+            .filter(|cached| cached.key == key)
+            .map(|cached| cached.height)
+    }
+
+    fn store_height(&self, entry_id: EntryId, key: HeightKey, height: usize) {
+        let mut inner = self.inner.borrow_mut();
+        inner.height_builds = inner.height_builds.saturating_add(1);
+        inner.heights.insert(entry_id, CachedHeight { key, height });
+    }
+
+    fn lines(&self, entry_id: EntryId, key: LinesKey) -> Option<Arc<Vec<Line<'static>>>> {
+        let mut inner = self.inner.borrow_mut();
+        let index = inner
+            .lines
+            .iter()
+            .position(|cached| cached.entry_id == entry_id && cached.key == key)?;
+        let cached = inner.lines.remove(index)?;
+        let lines = Arc::clone(&cached.lines);
+        inner.lines.push_back(cached);
+        Some(lines)
+    }
+
+    fn store_lines(
+        &self,
+        entry_id: EntryId,
+        key: LinesKey,
+        lines: Vec<Line<'static>>,
+    ) -> Arc<Vec<Line<'static>>> {
+        let mut inner = self.inner.borrow_mut();
+        inner.line_builds = inner.line_builds.saturating_add(1);
+        inner.lines.retain(|cached| cached.entry_id != entry_id);
+        let lines = Arc::new(lines);
+        inner.lines.push_back(CachedLines {
+            entry_id,
+            key,
+            lines: Arc::clone(&lines),
+        });
+        while inner.lines.len() > RENDERED_ENTRY_CACHE_CAPACITY {
+            inner.lines.pop_front();
+        }
+        lines
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> (usize, usize) {
+        let inner = self.inner.borrow();
+        (inner.height_builds, inner.line_builds)
+    }
+}
+
 pub(super) fn render(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &App,
     theme: &Theme,
+    cache: &TranscriptRenderCache,
 ) -> Vec<EntryRegion> {
     let content_area = area.inner(Margin::new(2, 0));
     if app.transcript.entries().is_empty() {
@@ -50,7 +158,7 @@ pub(super) fn render(
             _ => None,
         };
         let height = user_layout.as_ref().map_or_else(
-            || wrapped_height(&entry_lines(entry, app, theme), width),
+            || measured_entry_height(entry, app, theme, width, cache),
             |layout| layout.total_rows().saturating_add(2),
         );
         let start = next_line;
@@ -109,7 +217,8 @@ pub(super) fn render(
         {
             visible_user_lines(message, layout, local, theme)
         } else {
-            visible_wrapped_lines(&entry_lines(measured.entry, app, theme), width, local)
+            let lines = cached_entry_lines(measured.entry, app, theme, cache);
+            visible_wrapped_lines(lines.as_slice(), width, local)
         };
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
         if matches!(
@@ -123,6 +232,53 @@ pub(super) fn render(
         }
     }
     regions
+}
+
+fn measured_entry_height(
+    entry: &Entry,
+    app: &App,
+    theme: &Theme,
+    width: usize,
+    cache: &TranscriptRenderCache,
+) -> usize {
+    let key = HeightKey {
+        revision: entry.revision(),
+        width,
+        expanded: app.transcript_entry_is_expanded(entry),
+    };
+    if let Some(height) = cache.height(entry.id, key) {
+        return height;
+    }
+    let lines = cached_entry_lines(entry, app, theme, cache);
+    let height = wrapped_height(lines.as_slice(), width);
+    cache.store_height(entry.id, key, height);
+    height
+}
+
+fn cached_entry_lines(
+    entry: &Entry,
+    app: &App,
+    theme: &Theme,
+    cache: &TranscriptRenderCache,
+) -> Arc<Vec<Line<'static>>> {
+    let key = LinesKey {
+        revision: entry.revision(),
+        expanded: app.transcript_entry_is_expanded(entry),
+        theme: theme.id(),
+    };
+    let cacheable = !matches!(
+        &entry.kind,
+        EntryKind::Reasoning(reasoning) if reasoning.status == ActivityStatus::Running
+    );
+    if cacheable && let Some(lines) = cache.lines(entry.id, key) {
+        return lines;
+    }
+    let lines = entry_lines(entry, app, theme);
+    if cacheable {
+        cache.store_lines(entry.id, key, lines)
+    } else {
+        Arc::new(lines)
+    }
 }
 
 struct MeasuredEntry<'a> {
@@ -303,7 +459,7 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
             lines
         }
         EntryKind::Reasoning(reasoning) => {
-            let expanded = app.entry_is_expanded(entry.id);
+            let expanded = app.transcript_entry_is_expanded(entry);
             let status = status_label(&reasoning.status);
             let mut lines = vec![Line::from(vec![
                 Span::styled("┌─ thinking", theme.style(ThemeRole::Accent)),
@@ -350,7 +506,7 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
             lines
         }
         EntryKind::Tool(tool) => {
-            let expanded = app.entry_is_expanded(entry.id);
+            let expanded = app.transcript_entry_is_expanded(entry);
             let title = if tool.name == "terminal" {
                 "┌─ terminal".to_owned()
             } else {
