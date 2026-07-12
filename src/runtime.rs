@@ -3,9 +3,11 @@ use crate::{
     app::{App, AppAction, AuthProvider, FILE_SUGGESTION_LIMIT, PointerEvent},
     auth::{AuthEvent, AuthStore, AuthTaskRunner},
     clipboard::{ClipboardEvent, ClipboardTaskRunner},
+    composer::SubmittedContent,
     llm::{LlmClient, LlmConfig},
     model_catalog::ModelCatalogTaskRunner,
-    submission::{SubmissionEvent, SubmissionTaskRunner},
+    session::SessionMode,
+    submission::{DraftId, SubmissionEvent, SubmissionTaskRunner},
     terminal_selection::TerminalSelection,
     theme::{Theme, ThemeConfigEvent, ThemeConfigLoad, ThemeConfigStore, ThemeConfigTaskRunner},
     ui, workspace,
@@ -119,10 +121,6 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         .as_ref()
         .cloned()
         .map(workspace::WorkspaceTaskRunner::spawn);
-    let mut submission_runner = workspace_root
-        .as_ref()
-        .cloned()
-        .map(SubmissionTaskRunner::spawn);
     let mut app = match &launch_mode {
         LaunchMode::Interactive(_) => App::new(),
         LaunchMode::AuthOnly => App::for_auth(),
@@ -144,7 +142,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     if let Some(warning) = theme_load.warning {
         app.set_notice(warning);
     }
-    let (mut runner, mut model_runner) = match &launch_mode {
+    let (mut runner, mut model_runner, mut submission_runner) = match &launch_mode {
         LaunchMode::Interactive(_) => {
             let config = LlmConfig::from_env().context("failed to load LLM configuration")?;
             let auth_store =
@@ -161,10 +159,16 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                         .clone()
                         .expect("interactive mode has a workspace"),
                 )),
-                Some(ModelCatalogTaskRunner::spawn(llm)),
+                Some(ModelCatalogTaskRunner::spawn(llm.clone())),
+                Some(SubmissionTaskRunner::spawn_with_llm(
+                    workspace_root
+                        .clone()
+                        .expect("interactive mode has a workspace"),
+                    llm,
+                )),
             )
         }
-        LaunchMode::AuthOnly => (None, None),
+        LaunchMode::AuthOnly => (None, None, None),
     };
     let mut auth_runner = AuthTaskRunner::spawn();
     let mut clipboard = ClipboardTaskRunner::spawn();
@@ -176,6 +180,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     let mut last_workspace_search: Option<(crate::composer::QueryId, Instant)> = None;
     let mut workspace_search_ready = false;
     let mut redraw = RedrawScheduler::default();
+    let mut deferred_preflight = None;
 
     while !should_quit {
         if let Some(workspace_runner) = workspace_runner.as_ref() {
@@ -201,6 +206,13 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                 redraw.mark_dirty();
             }
         }
+        if runner.as_ref().is_some_and(AgentTaskRunner::is_idle)
+            && let Some(preflight) = deferred_preflight.take()
+            && let Some(submission_runner) = submission_runner.as_ref()
+        {
+            start_preflight(&mut app, submission_runner, preflight);
+            redraw.mark_dirty();
+        }
         if let Some(submission_runner) = submission_runner.as_ref() {
             while let Some(event) = submission_runner.try_event() {
                 redraw.mark_dirty();
@@ -215,6 +227,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                             auth_runner: &auth_runner,
                             clipboard: &clipboard,
                             theme_runner: theme_runner.as_ref(),
+                            deferred_preflight: &mut deferred_preflight,
                         },
                     );
                 }
@@ -303,6 +316,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                                 auth_runner: &auth_runner,
                                 clipboard: &clipboard,
                                 theme_runner: theme_runner.as_ref(),
+                                deferred_preflight: &mut deferred_preflight,
                             },
                         );
                     }
@@ -331,6 +345,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                                         auth_runner: &auth_runner,
                                         clipboard: &clipboard,
                                         theme_runner: theme_runner.as_ref(),
+                                        deferred_preflight: &mut deferred_preflight,
                                     },
                                 );
                             }
@@ -419,6 +434,27 @@ fn handle_mouse_event(
     app.handle_pointer(event)
 }
 
+struct DeferredPreflight {
+    draft_id: DraftId,
+    content: SubmittedContent,
+    mode: SessionMode,
+}
+
+fn start_preflight(
+    app: &mut App,
+    submission_runner: &SubmissionTaskRunner,
+    preflight: DeferredPreflight,
+) {
+    if let Err(error) =
+        submission_runner.request(preflight.draft_id, preflight.content, preflight.mode)
+    {
+        let _ = app.handle_submission_event(SubmissionEvent::Failed {
+            draft_id: preflight.draft_id,
+            message: error.to_string(),
+        });
+    }
+}
+
 struct DispatchContext<'a> {
     app: &'a mut App,
     runner: Option<&'a AgentTaskRunner>,
@@ -427,6 +463,7 @@ struct DispatchContext<'a> {
     auth_runner: &'a AuthTaskRunner,
     clipboard: &'a ClipboardTaskRunner,
     theme_runner: Option<&'a ThemeConfigTaskRunner>,
+    deferred_preflight: &'a mut Option<DeferredPreflight>,
 }
 
 fn dispatch(action: AppAction, context: DispatchContext<'_>) -> bool {
@@ -438,6 +475,7 @@ fn dispatch(action: AppAction, context: DispatchContext<'_>) -> bool {
         auth_runner,
         clipboard,
         theme_runner,
+        deferred_preflight,
     } = context;
     match action {
         AppAction::Preflight {
@@ -445,26 +483,42 @@ fn dispatch(action: AppAction, context: DispatchContext<'_>) -> bool {
             content,
             mode,
         } => {
-            match submission_runner {
-                Some(runner) => {
-                    if let Err(error) = runner.request(draft_id, content, mode) {
-                        let _ = app.handle_submission_event(SubmissionEvent::Failed {
-                            draft_id,
-                            message: error.to_string(),
-                        });
-                    }
-                }
-                None => {
+            match (runner, submission_runner) {
+                (_, None) => {
                     let _ = app.handle_submission_event(SubmissionEvent::Failed {
                         draft_id,
                         message: "submission preflight is unavailable in authentication-only mode"
                             .into(),
                     });
                 }
+                (Some(runner), Some(_)) if !runner.is_idle() => {
+                    *deferred_preflight = Some(DeferredPreflight {
+                        draft_id,
+                        content,
+                        mode,
+                    });
+                }
+                (_, Some(submission_runner)) => start_preflight(
+                    app,
+                    submission_runner,
+                    DeferredPreflight {
+                        draft_id,
+                        content,
+                        mode,
+                    },
+                ),
             }
             false
         }
         AppAction::CancelPreflight { draft_id } => {
+            if deferred_preflight
+                .as_ref()
+                .is_some_and(|preflight| preflight.draft_id == draft_id)
+            {
+                *deferred_preflight = None;
+                let _ = app.handle_submission_event(SubmissionEvent::Cancelled { draft_id });
+                return false;
+            }
             if let Some(runner) = submission_runner
                 && let Err(error) = runner.cancel(draft_id)
             {
@@ -1017,6 +1071,7 @@ mod tests {
         let mut app = App::new();
         let mut auth_runner = AuthTaskRunner::spawn();
         let mut clipboard = ClipboardTaskRunner::spawn_with(RecordingClipboard);
+        let mut deferred_preflight = None;
 
         assert!(!dispatch(
             AppAction::CopyToClipboard {
@@ -1030,6 +1085,7 @@ mod tests {
                 auth_runner: &auth_runner,
                 clipboard: &clipboard,
                 theme_runner: None,
+                deferred_preflight: &mut deferred_preflight,
             },
         ));
         handle_clipboard_event(

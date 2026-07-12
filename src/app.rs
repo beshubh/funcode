@@ -1771,6 +1771,40 @@ mod tests {
         models.open_models_dialog();
         apps.push(models);
 
+        let mut large_paste = App::new();
+        large_paste.screen = Screen::Chat;
+        large_paste.handle_paste(&format!(
+            "{}\nend",
+            "x".repeat(crate::composer::REQUEST_CONFIRM_BYTES)
+        ));
+        assert!(large_paste.paste_confirmation().is_some());
+        apps.push(large_paste);
+
+        let mut pending_confirmation = App::new();
+        pending_confirmation.screen = Screen::Chat;
+        pending_confirmation
+            .composer
+            .insert_text(&"x".repeat(crate::composer::REQUEST_CONFIRM_BYTES + 1));
+        let Some(AppAction::Preflight {
+            draft_id,
+            content,
+            mode,
+        }) = pending_confirmation.handle_key(key(KeyCode::Enter), Instant::now())
+        else {
+            panic!("large draft should start preflight");
+        };
+        pending_confirmation.handle_submission_event(
+            crate::submission::SubmissionEvent::Prepared {
+                draft_id,
+                request: crate::submission::PreparedRequest::for_test(content, mode),
+            },
+        );
+        assert!(matches!(
+            pending_confirmation.pending_submission_view(),
+            Some(super::PendingSubmissionView::Confirming { .. })
+        ));
+        apps.push(pending_confirmation);
+
         for app in &mut apps {
             app.screen = Screen::Chat;
             app.composer.insert_text("unchanged");

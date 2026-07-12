@@ -1,7 +1,7 @@
 use super::{
     AgentTool, ToolDisplay, ToolExecutionContext, ToolFailure, ToolInvocation, ToolResult, ToolSpec,
 };
-use crate::session::SessionMode;
+use crate::{session::SessionMode, workspace::WorkspacePath};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::json;
@@ -39,7 +39,7 @@ impl AgentTool for ReadFileTool {
     fn invocation(&self, arguments: &str) -> ToolInvocation {
         serde_json::from_str::<ReadFileArgs>(arguments)
             .map(|args| ToolInvocation {
-                summary: format!("Reading {}", args.path),
+                summary: format!("Reading {}", WorkspacePath::from_raw(args.path).display()),
                 display: None,
             })
             .unwrap_or_else(|_| ToolInvocation {
@@ -66,20 +66,22 @@ impl AgentTool for ReadFileTool {
 fn read_file(arguments: String, context: ToolExecutionContext) -> Result<ToolResult, ToolFailure> {
     let args: ReadFileArgs = serde_json::from_str(&arguments)
         .map_err(|error| ToolFailure::new(format!("invalid read_file arguments: {error}")))?;
+    let display_path = WorkspacePath::from_raw(args.path.clone()).display();
     let path = context.workspace().existing_file(&args.path)?;
-    let metadata = fs::metadata(&path)
-        .map_err(|error| ToolFailure::new(format!("could not inspect '{}': {error}", args.path)))?;
+    let metadata = fs::metadata(&path).map_err(|error| {
+        ToolFailure::new(format!("could not inspect '{display_path}': {error}"))
+    })?;
     if metadata.len() > MAX_READ_BYTES {
         return Err(ToolFailure::new(format!(
             "'{}' exceeds the {} KiB read limit",
-            args.path,
+            display_path,
             MAX_READ_BYTES / 1024
         )));
     }
     let content = fs::read_to_string(&path).map_err(|error| {
         ToolFailure::new(format!(
             "could not read '{}' as UTF-8 text: {error}",
-            args.path
+            display_path
         ))
     })?;
     let lines = content.lines().collect::<Vec<_>>();
@@ -89,7 +91,7 @@ fn read_file(arguments: String, context: ToolExecutionContext) -> Result<ToolRes
     if start == 0 || end == 0 || start > end || start > total || end > total {
         return Err(ToolFailure::new(format!(
             "invalid line range {start}-{end}; '{}' has {total} line(s)",
-            args.path
+            display_path
         )));
     }
     let selected = if lines.is_empty() {

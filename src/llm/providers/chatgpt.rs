@@ -4,14 +4,16 @@ use super::super::{
 };
 use crate::{
     auth::AuthStore,
-    tools::{AgentTool, ToolSession},
+    tools::{AgentTool, ToolSession, ToolSpec},
 };
 use futures::{Stream, StreamExt, future, future::BoxFuture};
 use rig_core::{
+    OneOrMany,
     agent::MultiTurnStreamItem,
     client::CompletionClient,
-    completion::Message,
+    completion::{CompletionRequest as RigCompletionRequest, Message, ToolDefinition},
     providers::chatgpt::{self, ChatGPTAuth},
+    providers::openai::responses_api::{CompletionRequest as ResponsesRequest, Include},
     streaming::{StreamedAssistantContent, StreamingPrompt},
     tool::{ToolDyn, ToolError},
     wasm_compat::WasmBoxedFuture,
@@ -23,6 +25,73 @@ const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 // The backend uses this as a model-catalog schema capability version. Funcode's package is still
 // 0.x, which the backend treats as predating picker-visible catalog entries.
 const MODEL_CATALOG_CLIENT_VERSION: &str = "1.0.0";
+
+pub(in crate::llm) fn serialized_request_bytes(
+    model: &str,
+    prompt: &str,
+    history: &[ConversationMessage],
+    tools: &[ToolSpec],
+) -> Result<usize, LlmError> {
+    let mut messages = rig_history(history);
+    messages.push(Message::user(prompt));
+    let completion = RigCompletionRequest {
+        model: None,
+        preamble: None,
+        chat_history: OneOrMany::many(messages).map_err(|error| {
+            LlmError::Internal(format!("could not serialize the ChatGPT request: {error}"))
+        })?,
+        documents: Vec::new(),
+        tools: tools
+            .iter()
+            .map(|tool| ToolDefinition {
+                name: tool.name.to_owned(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            })
+            .collect(),
+        temperature: None,
+        max_tokens: None,
+        tool_choice: None,
+        additional_params: None,
+        output_schema: None,
+    };
+    let mut request =
+        ResponsesRequest::try_from((model.to_owned(), completion)).map_err(|error| {
+            LlmError::Internal(format!("could not serialize the ChatGPT request: {error}"))
+        })?;
+
+    // Keep this in lockstep with `ChatGptProvider::stream` and Rig's ChatGPT
+    // request normalization. This is the exact body passed to `serde_json::to_vec`
+    // by the provider before the HTTP request is sent.
+    request.instructions = Some(SYSTEM_INSTRUCTIONS.to_owned());
+    request.temperature = None;
+    request.max_output_tokens = None;
+    request.stream = Some(true);
+    let include = request
+        .additional_parameters
+        .include
+        .get_or_insert_with(Vec::new);
+    if !include
+        .iter()
+        .any(|item| matches!(item, Include::ReasoningEncryptedContent))
+    {
+        include.push(Include::ReasoningEncryptedContent);
+    }
+    request.additional_parameters.background = None;
+    request.additional_parameters.metadata.clear();
+    request.additional_parameters.parallel_tool_calls = None;
+    request.additional_parameters.service_tier = None;
+    request.additional_parameters.store = Some(false);
+    request.additional_parameters.text = None;
+    request.additional_parameters.top_p = None;
+    request.additional_parameters.user = None;
+
+    serde_json::to_vec(&request)
+        .map(|body| body.len())
+        .map_err(|error| {
+            LlmError::Internal(format!("could not serialize the ChatGPT request: {error}"))
+        })
+}
 
 #[derive(serde::Deserialize)]
 struct ModelsResponse {
@@ -336,11 +405,11 @@ fn chatgpt_stream_error(message: String) -> LlmError {
 mod tests {
     use super::{
         ChatGptStreamEvent, ConversationAssembler, RigToolAdapter, chatgpt_stream_error,
-        parse_models, rig_history, stream_events,
+        parse_models, rig_history, serialized_request_bytes, stream_events,
     };
     use crate::llm::{ConversationMessage, LlmError, ProviderEvent};
     use crate::session::SessionMode;
-    use crate::tools::ToolSession;
+    use crate::tools::{ToolRegistry, ToolSession};
     use futures::{StreamExt, stream};
     use rig_core::completion::Message;
     use rig_core::tool::ToolDyn;
@@ -357,6 +426,27 @@ mod tests {
         assert_eq!(
             rig_history(&history),
             vec![Message::user("first"), Message::assistant("first response")]
+        );
+    }
+
+    #[test]
+    fn serialized_request_size_includes_json_escaping_history_instructions_and_tools() {
+        let prompt = "quoted \" text\nwith control \u{1}";
+        let history = vec![
+            ConversationMessage::User("earlier".into()),
+            ConversationMessage::Assistant("answer".into()),
+        ];
+        let build_tools = ToolRegistry::for_mode(SessionMode::Build).specs(SessionMode::Build);
+        let plan_tools = ToolRegistry::for_mode(SessionMode::Plan).specs(SessionMode::Plan);
+
+        let build_bytes =
+            serialized_request_bytes("gpt-5.4", prompt, &history, &build_tools).unwrap();
+        let plan_bytes = serialized_request_bytes("gpt-5.4", prompt, &[], &plan_tools).unwrap();
+
+        assert!(build_bytes > prompt.len());
+        assert!(build_bytes > plan_bytes);
+        assert!(
+            build_bytes > serialized_request_bytes("gpt-5.4", prompt, &[], &build_tools).unwrap()
         );
     }
 

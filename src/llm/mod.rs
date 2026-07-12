@@ -1,6 +1,5 @@
-#[cfg(test)]
 use crate::session::SessionMode;
-use crate::tools::ToolSession;
+use crate::tools::{ToolRegistry, ToolSession};
 use futures::{
     StreamExt,
     future::BoxFuture,
@@ -241,6 +240,29 @@ impl LlmClient {
                 Ok(LlmEvent::Completed(ConversationCommit { history }))
             }
         })))
+    }
+
+    pub(crate) fn serialized_request_bytes(
+        &self,
+        model_prompt: &str,
+        mode: SessionMode,
+    ) -> Result<usize, LlmError> {
+        let history = self
+            .history
+            .lock()
+            .map_err(|_| LlmError::Internal("the LLM conversation is unavailable".into()))?
+            .clone();
+        let model = self.current_model()?;
+        let tools = ToolRegistry::for_mode(mode).specs(mode);
+        providers::chatgpt::serialized_request_bytes(&model, model_prompt, &history, &tools)
+    }
+
+    pub(crate) fn serialized_standalone_request_bytes(
+        model_prompt: &str,
+        mode: SessionMode,
+    ) -> Result<usize, LlmError> {
+        let tools = ToolRegistry::for_mode(mode).specs(mode);
+        providers::chatgpt::serialized_request_bytes(DEFAULT_MODEL, model_prompt, &[], &tools)
     }
 
     pub(crate) fn commit(&self, commit: ConversationCommit) -> Result<(), LlmError> {

@@ -1,5 +1,6 @@
 use crate::{
     composer::{REQUEST_HARD_LIMIT_BYTES, SubmittedContent},
+    llm::LlmClient,
     session::SessionMode,
     tools::WorkspaceFileReader,
     workspace::WorkspacePath,
@@ -13,6 +14,8 @@ use std::{
     },
     thread::{self, JoinHandle},
 };
+
+type RequestSizer = Arc<dyn Fn(&str, SessionMode) -> Result<usize, String> + Send + Sync>;
 
 pub type DraftId = u64;
 
@@ -211,6 +214,26 @@ pub struct SubmissionTaskRunner {
 
 impl SubmissionTaskRunner {
     pub fn spawn(root: PathBuf) -> Self {
+        Self::spawn_with_sizer(
+            root,
+            Arc::new(|prompt, mode| {
+                LlmClient::serialized_standalone_request_bytes(prompt, mode)
+                    .map_err(|error| error.to_string())
+            }),
+        )
+    }
+
+    pub(crate) fn spawn_with_llm(root: PathBuf, llm: LlmClient) -> Self {
+        Self::spawn_with_sizer(
+            root,
+            Arc::new(move |prompt, mode| {
+                llm.serialized_request_bytes(prompt, mode)
+                    .map_err(|error| error.to_string())
+            }),
+        )
+    }
+
+    fn spawn_with_sizer(root: PathBuf, request_sizer: RequestSizer) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let control = Arc::new(Mutex::new(SubmissionControl::default()));
@@ -229,9 +252,13 @@ impl SubmissionTaskRunner {
                             continue;
                         }
                         let result = match &reader {
-                            Ok(reader) => prepare_request(content, mode, reader, || {
-                                is_working(&worker_control, token)
-                            })
+                            Ok(reader) => prepare_request(
+                                content,
+                                mode,
+                                reader,
+                                request_sizer.as_ref(),
+                                || is_working(&worker_control, token),
+                            )
                             .map(Arc::new)
                             .map_err(|error| error.to_string()),
                             Err(message) => Err(message.clone()),
@@ -430,6 +457,7 @@ enum PrepareError {
     Cancelled,
     RequestTooLarge { bytes: usize, limit: usize },
     SizeOverflow,
+    SerializeRequest(String),
     ReadAttachment(String),
 }
 
@@ -444,6 +472,7 @@ impl fmt::Display for PrepareError {
                 )
             }
             Self::SizeOverflow => formatter.write_str("the serialized request size overflowed"),
+            Self::SerializeRequest(message) => formatter.write_str(message),
             Self::ReadAttachment(message) => formatter.write_str(message),
         }
     }
@@ -453,6 +482,7 @@ fn prepare_request(
     content: SubmittedContent,
     mode: SessionMode,
     reader: &WorkspaceFileReader,
+    request_sizer: &(dyn Fn(&str, SessionMode) -> Result<usize, String> + Send + Sync),
     is_active: impl Fn() -> bool,
 ) -> Result<PreparedRequest, PrepareError> {
     if !is_active() {
@@ -489,11 +519,11 @@ fn prepare_request(
 
         // Stop as soon as the files read so far prove the request cannot fit.
         // This prevents an unbounded attachment list from being accumulated.
-        reject_above_limit(serialized_size(history_bytes, mode_bytes, &attachments)?)?;
+        reject_above_limit(prompt_size(history_bytes, mode_bytes, &attachments)?)?;
     }
 
-    let serialized_bytes = serialized_size(history_bytes, mode_bytes, &attachments)?;
-    reject_above_limit(serialized_bytes)?;
+    let prompt_bytes = prompt_size(history_bytes, mode_bytes, &attachments)?;
+    reject_above_limit(prompt_bytes)?;
     if !is_active() {
         return Err(PrepareError::Cancelled);
     }
@@ -502,7 +532,10 @@ fn prepare_request(
     debug_assert_eq!(history_prompt.len(), history_bytes);
     let attachment_prompt = append_attachments(history_prompt.clone(), &attachments, mode_bytes)?;
     let model_prompt = mode.apply_to_prompt(attachment_prompt);
-    debug_assert_eq!(model_prompt.len(), serialized_bytes);
+    debug_assert_eq!(model_prompt.len(), prompt_bytes);
+    let serialized_bytes =
+        request_sizer(&model_prompt, mode).map_err(PrepareError::SerializeRequest)?;
+    reject_above_limit(serialized_bytes)?;
 
     Ok(PreparedRequest {
         content,
@@ -514,7 +547,7 @@ fn prepare_request(
     })
 }
 
-fn serialized_size(
+fn prompt_size(
     history_bytes: usize,
     mode_bytes: usize,
     attachments: &[PreparedAttachment],
@@ -547,7 +580,7 @@ fn append_attachments(
     if attachments.is_empty() {
         return Ok(prompt);
     }
-    let final_capacity = serialized_size(prompt.len(), mode_bytes, attachments)?;
+    let final_capacity = prompt_size(prompt.len(), mode_bytes, attachments)?;
     let attachment_capacity = final_capacity
         .checked_sub(mode_bytes)
         .ok_or(PrepareError::SizeOverflow)?;
@@ -589,10 +622,11 @@ mod tests {
     };
     use crate::{
         composer::SubmittedContent,
+        llm::LlmClient,
         session::SessionMode,
         workspace::{Attachment, WorkspacePath},
     };
-    use std::{fs, thread, time::Duration};
+    use std::{fs, sync::Arc, thread, time::Duration};
 
     fn wait_for_event(runner: &SubmissionTaskRunner) -> SubmissionEvent {
         for _ in 0..1_000 {
@@ -629,8 +663,15 @@ mod tests {
         );
         let expected_model_prompt = SessionMode::Plan.apply_to_prompt(expected_attachment_prompt);
         assert_eq!(request.model_prompt(), expected_model_prompt);
-        assert_eq!(request.serialized_bytes(), expected_model_prompt.len());
-        assert_eq!(request.serialized_bytes(), request.model_prompt().len());
+        assert_eq!(
+            request.serialized_bytes(),
+            LlmClient::serialized_standalone_request_bytes(
+                &expected_model_prompt,
+                SessionMode::Plan,
+            )
+            .unwrap()
+        );
+        assert!(request.serialized_bytes() > request.model_prompt().len());
     }
 
     #[test]
@@ -679,6 +720,27 @@ mod tests {
             panic!("aggregate request should fail");
         };
         assert_eq!(draft_id, 19);
+        assert!(message.contains(&REQUEST_HARD_LIMIT_BYTES.to_string()));
+    }
+
+    #[test]
+    fn transport_json_escaping_can_trigger_the_aggregate_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let content = SubmittedContent::plain("\"".repeat(600 * 1024));
+        let runner = SubmissionTaskRunner::spawn_with_sizer(
+            root.path().to_owned(),
+            Arc::new(|prompt, _| {
+                serde_json::to_vec(&serde_json::json!({ "input": prompt }))
+                    .map(|body| body.len())
+                    .map_err(|error| error.to_string())
+            }),
+        );
+        runner.request(21, content, SessionMode::Build).unwrap();
+
+        let SubmissionEvent::Failed { draft_id, message } = wait_for_event(&runner) else {
+            panic!("JSON-expanded request should fail");
+        };
+        assert_eq!(draft_id, 21);
         assert!(message.contains(&REQUEST_HARD_LIMIT_BYTES.to_string()));
     }
 

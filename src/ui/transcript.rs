@@ -377,7 +377,7 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
                 }
             } else {
                 lines.push(Line::styled(
-                    format!("│ {}", tool.summary),
+                    format!("│ {}", crate::composer::safe_single_line(&tool.summary, 2)),
                     theme.style(ThemeRole::MutedText),
                 ));
             }
@@ -437,13 +437,19 @@ fn artifact_lines(artifact: &ToolArtifact, theme: &Theme) -> Vec<Line<'static>> 
                 } else {
                     ThemeRole::MutedText
                 };
-                Line::styled(format!("│ {line}"), theme.style(role))
+                Line::styled(
+                    format!("│ {}", crate::composer::safe_single_line(line, 2)),
+                    theme.style(role),
+                )
             }));
             lines
         }
         ToolArtifact::SearchResults { query, matches } => {
             let mut lines = vec![Line::styled(
-                format!("│ Search /{query}/"),
+                format!(
+                    "│ Search /{}/",
+                    crate::composer::safe_single_line(query, 10)
+                ),
                 theme.style(ThemeRole::Accent),
             )];
             lines.extend(message_lines(matches, theme.style(ThemeRole::MutedText)));
@@ -457,10 +463,13 @@ fn artifact_lines(artifact: &ToolArtifact, theme: &Theme) -> Vec<Line<'static>> 
         } => {
             let mut lines = vec![
                 Line::styled(
-                    format!("│ {description}"),
+                    format!("│ {}", crate::composer::safe_single_line(description, 2)),
                     theme.style(ThemeRole::MutedText),
                 ),
-                Line::styled(format!("│ $ {command}"), theme.style(ThemeRole::Text)),
+                Line::styled(
+                    format!("│ $ {}", crate::composer::safe_single_line(command, 4)),
+                    theme.style(ThemeRole::Text),
+                ),
             ];
             if !output.is_empty() {
                 lines.extend(message_lines(output, theme.style(ThemeRole::Text)));

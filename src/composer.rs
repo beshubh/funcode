@@ -1915,6 +1915,26 @@ fn push_safe_text(output: &mut String, text: &str, column: &mut usize) {
     }
 }
 
+pub(crate) fn safe_single_line(text: &str, initial_column: usize) -> String {
+    let mut output = String::new();
+    let mut column = initial_column;
+    for grapheme in text.graphemes(true) {
+        if grapheme == "\n" {
+            output.push_str("\\n");
+            column = column.saturating_add(2);
+        } else if grapheme == "\t" {
+            let spaces = TAB_WIDTH - column % TAB_WIDTH;
+            output.push_str(&" ".repeat(spaces));
+            column = column.saturating_add(spaces);
+        } else {
+            let safe = safe_grapheme(grapheme);
+            output.push_str(safe.as_ref());
+            column = column.saturating_add(UnicodeWidthStr::width(safe.as_ref()));
+        }
+    }
+    output
+}
+
 fn normalized_len(raw: &str) -> Result<usize, ComposerEditError> {
     let mut bytes = 0usize;
     let mut characters = raw.chars().peekable();

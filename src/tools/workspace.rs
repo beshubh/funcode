@@ -1,4 +1,5 @@
 use super::ToolFailure;
+use crate::workspace::WorkspacePath;
 use std::{
     fs,
     io::Write,
@@ -26,15 +27,18 @@ impl Workspace {
     }
 
     pub(crate) fn existing_file(&self, path: &str) -> Result<PathBuf, ToolFailure> {
+        let display_path = WorkspacePath::from_raw(path).display();
         let relative = safe_relative(path)?;
         let resolved = fs::canonicalize(self.root.join(relative)).map_err(|error| {
-            ToolFailure::new(format!("could not access workspace file '{path}': {error}"))
+            ToolFailure::new(format!(
+                "could not access workspace file '{display_path}': {error}"
+            ))
         })?;
         if !resolved.starts_with(&self.root) {
             return Err(ToolFailure::new("the path resolves outside the workspace"));
         }
         if !resolved.is_file() {
-            return Err(ToolFailure::new(format!("'{path}' is not a file")));
+            return Err(ToolFailure::new(format!("'{display_path}' is not a file")));
         }
         Ok(resolved)
     }
@@ -43,9 +47,12 @@ impl Workspace {
         let Some(path) = path.filter(|path| !path.trim().is_empty()) else {
             return Ok(self.root.clone());
         };
+        let display_path = WorkspacePath::from_raw(path).display();
         let relative = safe_relative(path)?;
         let resolved = fs::canonicalize(self.root.join(relative)).map_err(|error| {
-            ToolFailure::new(format!("could not access search scope '{path}': {error}"))
+            ToolFailure::new(format!(
+                "could not access search scope '{display_path}': {error}"
+            ))
         })?;
         if !resolved.starts_with(&self.root) {
             return Err(ToolFailure::new(
@@ -56,22 +63,25 @@ impl Workspace {
     }
 
     pub(crate) fn new_file(&self, path: &str) -> Result<PathBuf, ToolFailure> {
+        let display_path = WorkspacePath::from_raw(path).display();
         let relative = safe_relative(path)?;
         let target = self.root.join(relative);
         if target.exists() {
-            return Err(ToolFailure::new(format!("'{path}' already exists")));
+            return Err(ToolFailure::new(format!("'{display_path}' already exists")));
         }
         let mut ancestor = target.parent().ok_or_else(|| {
-            ToolFailure::new(format!("could not determine the parent of '{path}'"))
+            ToolFailure::new(format!(
+                "could not determine the parent of '{display_path}'"
+            ))
         })?;
         while !ancestor.exists() {
             ancestor = ancestor.parent().ok_or_else(|| {
-                ToolFailure::new(format!("could not validate the parent of '{path}'"))
+                ToolFailure::new(format!("could not validate the parent of '{display_path}'"))
             })?;
         }
         let ancestor = fs::canonicalize(ancestor).map_err(|error| {
             ToolFailure::new(format!(
-                "could not validate the parent of '{path}': {error}"
+                "could not validate the parent of '{display_path}': {error}"
             ))
         })?;
         if !ancestor.starts_with(&self.root) {
@@ -182,22 +192,25 @@ impl WorkspaceFileReader {
     }
 
     pub fn read(&self, path: &str) -> Result<ReadFile, FileReadError> {
+        let display_path = WorkspacePath::from_raw(path).display();
         let resolved = self
             .workspace
             .existing_file(path)
             .map_err(|error| FileReadError(error.to_string()))?;
         let metadata = fs::metadata(&resolved).map_err(|error| {
-            FileReadError(format!("could not inspect attached file '{path}': {error}"))
+            FileReadError(format!(
+                "could not inspect attached file '{display_path}': {error}"
+            ))
         })?;
         if metadata.len() > MAX_ATTACHMENT_BYTES {
             return Err(FileReadError(format!(
-                "attached file '{path}' exceeds the {} KiB limit",
+                "attached file '{display_path}' exceeds the {} KiB limit",
                 MAX_ATTACHMENT_BYTES / 1024
             )));
         }
         let content = fs::read_to_string(&resolved).map_err(|error| {
             FileReadError(format!(
-                "could not read attached file '{path}' as UTF-8 text: {error}"
+                "could not read attached file '{display_path}' as UTF-8 text: {error}"
             ))
         })?;
         let line_count = content.lines().count().max(1) as u32;

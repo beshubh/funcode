@@ -315,13 +315,17 @@ impl ToolRegistry {
             .map(|tool| tool.spec(SessionMode::Build).name)
             .collect()
     }
+
+    pub(crate) fn specs(&self, mode: SessionMode) -> Vec<ToolSpec> {
+        self.tools.iter().map(|tool| tool.spec(mode)).collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         AgentTool, ToolDisplay, ToolEvent, ToolExecutionContext, ToolFailure, ToolRegistry,
-        ToolResult, ToolSession, ToolSpec, read::ReadFileTool,
+        ToolResult, ToolSession, ToolSpec, edit::EditFileTool, read::ReadFileTool,
     };
     use crate::session::SessionMode;
     use futures::future::BoxFuture;
@@ -332,6 +336,18 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn control_bearing_tool_paths_are_escaped_in_summaries() {
+        let read = ReadFileTool.invocation(r#"{"path":"line\nbreak\t.rs"}"#);
+        let edit = EditFileTool
+            .invocation(r#"{"operation":"create","path":"line\nbreak\t.rs","content":""}"#);
+
+        assert_eq!(read.summary, r"Reading line\nbreak\t.rs");
+        assert_eq!(edit.summary, r"Editing line\nbreak\t.rs");
+        assert!(!read.summary.contains('\n'));
+        assert!(!edit.summary.contains('\t'));
+    }
     use tokio::sync::mpsc;
 
     struct BrokenInfrastructureTool;

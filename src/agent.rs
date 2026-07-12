@@ -11,6 +11,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
@@ -93,6 +94,7 @@ impl std::error::Error for RunnerUnavailable {}
 pub struct AgentTaskRunner {
     commands: async_mpsc::UnboundedSender<AgentCommand>,
     events: Receiver<AgentEvent>,
+    outstanding: Arc<AtomicUsize>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -108,17 +110,26 @@ impl AgentTaskRunner {
     pub(crate) fn spawn_in(llm: LlmClient, workspace_root: PathBuf) -> Self {
         let (command_tx, command_rx) = async_mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let coordinator_outstanding = Arc::clone(&outstanding);
         let thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to create the LLM runtime");
-            runtime.block_on(run_coordinator(command_rx, event_tx, llm, workspace_root));
+            runtime.block_on(run_coordinator(
+                command_rx,
+                event_tx,
+                llm,
+                workspace_root,
+                coordinator_outstanding,
+            ));
         });
 
         Self {
             commands: command_tx,
             events: event_rx,
+            outstanding,
             thread: Some(thread),
         }
     }
@@ -128,12 +139,16 @@ impl AgentTaskRunner {
         request_id: RequestId,
         request: Arc<PreparedRequest>,
     ) -> Result<(), RunnerUnavailable> {
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
         self.commands
             .send(AgentCommand::Submit {
                 request_id,
                 request,
             })
-            .map_err(|_| RunnerUnavailable)
+            .map_err(|_| {
+                self.outstanding.fetch_sub(1, Ordering::AcqRel);
+                RunnerUnavailable
+            })
     }
 
     pub fn cancel(&self, request_id: RequestId) -> Result<(), RunnerUnavailable> {
@@ -144,6 +159,10 @@ impl AgentTaskRunner {
 
     pub fn try_event(&self) -> Option<AgentEvent> {
         self.events.try_recv().ok()
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.outstanding.load(Ordering::Acquire) == 0
     }
 
     #[cfg(test)]
@@ -227,9 +246,19 @@ async fn run_coordinator(
     events: Sender<AgentEvent>,
     llm: LlmClient,
     workspace_root: PathBuf,
+    outstanding: Arc<AtomicUsize>,
 ) {
     let (update_tx, update_rx) = async_mpsc::unbounded_channel();
-    run_coordinator_with_updates(commands, events, llm, workspace_root, update_tx, update_rx).await;
+    run_coordinator_with_updates(
+        commands,
+        events,
+        llm,
+        workspace_root,
+        update_tx,
+        update_rx,
+        outstanding,
+    )
+    .await;
 }
 
 async fn run_coordinator_with_updates(
@@ -239,6 +268,7 @@ async fn run_coordinator_with_updates(
     workspace_root: PathBuf,
     update_tx: async_mpsc::UnboundedSender<RequestUpdate>,
     mut update_rx: async_mpsc::UnboundedReceiver<RequestUpdate>,
+    outstanding: Arc<AtomicUsize>,
 ) {
     let mut pending: VecDeque<PendingRequest> = VecDeque::new();
     let mut active: Option<ActiveRequest> = None;
@@ -278,6 +308,7 @@ async fn run_coordinator_with_updates(
                         if events.send(AgentEvent::Interrupted { request_id }).is_err() {
                             return;
                         }
+                        outstanding.fetch_sub(1, Ordering::AcqRel);
                     }
                 }
                 Some(AgentCommand::Shutdown) | None => {
@@ -343,6 +374,12 @@ async fn run_coordinator_with_updates(
                         AgentEvent::Failed { request_id, message }
                     }
                 };
+                if matches!(
+                    event,
+                    AgentEvent::Completed { .. } | AgentEvent::Failed { .. }
+                ) {
+                    outstanding.fetch_sub(1, Ordering::AcqRel);
+                }
                 if events.send(event).is_err() {
                     return;
                 }
@@ -581,7 +618,7 @@ mod tests {
     use futures::{StreamExt as _, future::BoxFuture, stream};
     use std::{
         fs,
-        sync::{Arc, mpsc},
+        sync::{Arc, atomic::AtomicUsize, mpsc},
         thread,
         time::Duration,
     };
@@ -781,6 +818,7 @@ mod tests {
         let mut runner = AgentTaskRunner::spawn(client);
         submit(&runner, 1, "first");
         submit(&runner, 2, "second");
+        assert!(!runner.is_idle());
 
         let mut events = Vec::new();
         while !events.contains(&AgentEvent::Completed { request_id: 2 }) {
@@ -803,6 +841,7 @@ mod tests {
                 text
             } if text == "response to first"
         )));
+        assert!(runner.is_idle());
 
         runner.shutdown();
     }
@@ -925,6 +964,7 @@ mod tests {
                     workspace_root,
                     coordinator_update_tx,
                     update_rx,
+                    Arc::new(AtomicUsize::new(2)),
                 ));
         });
 

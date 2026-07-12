@@ -2,7 +2,7 @@ use super::{
     AgentTool, ToolAvailability, ToolDisplay, ToolExecutionContext, ToolFailure, ToolInvocation,
     ToolResult, ToolSpec,
 };
-use crate::session::SessionMode;
+use crate::{session::SessionMode, workspace::WorkspacePath};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::json;
@@ -75,7 +75,7 @@ impl AgentTool for EditFileTool {
             .and_then(|value| value.get("path")?.as_str().map(str::to_owned));
         ToolInvocation {
             summary: path
-                .map(|path| format!("Editing {path}"))
+                .map(|path| format!("Editing {}", WorkspacePath::from_raw(path).display()))
                 .unwrap_or_else(|| "Editing a workspace file".into()),
             display: None,
         }
@@ -112,11 +112,14 @@ fn replace_file(
     if replacements.is_empty() {
         return Err(ToolFailure::new("at least one replacement is required"));
     }
+    let display_path = WorkspacePath::from_raw(path.clone()).display();
     let resolved = context.workspace().existing_file(&path)?;
-    let metadata = fs::metadata(&resolved)
-        .map_err(|error| ToolFailure::new(format!("could not inspect '{path}': {error}")))?;
-    let original = fs::read_to_string(&resolved)
-        .map_err(|error| ToolFailure::new(format!("could not read '{path}' as UTF-8: {error}")))?;
+    let metadata = fs::metadata(&resolved).map_err(|error| {
+        ToolFailure::new(format!("could not inspect '{display_path}': {error}"))
+    })?;
+    let original = fs::read_to_string(&resolved).map_err(|error| {
+        ToolFailure::new(format!("could not read '{display_path}' as UTF-8: {error}"))
+    })?;
     let mut ranges = Vec::with_capacity(replacements.len());
     for replacement in &replacements {
         if replacement.old_text.is_empty() {
@@ -127,7 +130,7 @@ fn replace_file(
             .collect::<Vec<_>>();
         if occurrences.len() != 1 {
             return Err(ToolFailure::new(format!(
-                "old_text must occur exactly once in '{path}', but occurred {} time(s)",
+                "old_text must occur exactly once in '{display_path}', but occurred {} time(s)",
                 occurrences.len()
             )));
         }
@@ -150,7 +153,7 @@ fn replace_file(
         cursor = end;
     }
     edited.push_str(&original[cursor..]);
-    let diff = unified_diff(&path, &path, &original, &edited);
+    let diff = unified_diff(&display_path, &display_path, &original, &edited);
     context
         .workspace()
         .write_atomic(&resolved, &edited, Some(metadata.permissions()))?;
@@ -163,7 +166,8 @@ fn create_file(
     context: ToolExecutionContext,
 ) -> Result<ToolResult, ToolFailure> {
     let resolved = context.workspace().new_file(&path)?;
-    let diff = unified_diff("/dev/null", &path, "", &content);
+    let display_path = WorkspacePath::from_raw(path.clone()).display();
+    let diff = unified_diff("/dev/null", &display_path, "", &content);
     context
         .workspace()
         .write_atomic(&resolved, &content, None)?;
@@ -171,13 +175,14 @@ fn create_file(
 }
 
 fn edit_result(path: String, diff: String) -> ToolResult {
+    let display_path = WorkspacePath::from_raw(path.clone()).display();
     ToolResult {
         output: diff.clone(),
         display: ToolDisplay::Patch {
             path: path.clone(),
             diff,
         },
-        summary: Some(format!("Edited {path}")),
+        summary: Some(format!("Edited {display_path}")),
     }
 }
 
