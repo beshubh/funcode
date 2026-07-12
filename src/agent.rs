@@ -1,5 +1,5 @@
 use crate::{
-    llm::{ConversationCommit, LlmClient, LlmEvent},
+    llm::{ConversationCommit, LlmClient, LlmError, LlmEvent},
     submission::{PreparedAttachment, PreparedRequest},
     tools::{ToolDisplay, ToolEvent, ToolSession},
     transcript::{ToolArtifact, ToolCallId},
@@ -20,6 +20,9 @@ use std::{
 use tokio::{sync::mpsc as async_mpsc, task::JoinHandle as AsyncJoinHandle};
 
 pub type RequestId = u64;
+
+/// Number of additional provider attempts after the initial request.
+const MAX_PROVIDER_RETRIES: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
@@ -428,83 +431,103 @@ async fn run_request(
             return;
         }
     };
-    let mut stream = match llm
-        .stream_prepared_with_tools(
-            request.request.model_prompt().to_owned(),
-            request.request.history_prompt().to_owned(),
-            Some(tools),
-        )
-        .await
-    {
-        Ok(stream) => stream,
-        Err(error) => {
-            let _ = updates.send(RequestUpdate::Failed {
-                request_id,
-                message: error.to_string(),
-            });
+    let mut retries = 0;
+    loop {
+        let mut stream = match llm
+            .stream_prepared_with_tools(
+                request.request.model_prompt().to_owned(),
+                request.request.history_prompt().to_owned(),
+                Some(tools.clone()),
+            )
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                if retry_provider_failure(&error, &mut retries) {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                fail_request(&llm, &request, request_id, error, &updates);
+                return;
+            }
+        };
+
+        loop {
+            let event = tokio::select! {
+                biased;
+                Some(tool_event) = tool_events_rx.recv() => {
+                    if forward_tool_event(request_id, tool_event, &updates).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                event = stream.next() => event,
+            };
+            let error = match event {
+                Some(Ok(LlmEvent::TextDelta(text))) => {
+                    if updates
+                        .send(RequestUpdate::TextDelta { request_id, text })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                Some(Ok(LlmEvent::ReasoningDelta(summary))) => {
+                    if updates
+                        .send(RequestUpdate::ReasoningDelta {
+                            request_id,
+                            summary,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                Some(Ok(LlmEvent::Completed(commit))) => {
+                    let _ = updates.send(RequestUpdate::Completed { request_id, commit });
+                    return;
+                }
+                Some(Err(error)) => error,
+                None => LlmError::Provider("the model stream ended before completion".into()),
+            };
+            if retry_provider_failure(&error, &mut retries) {
+                tokio::task::yield_now().await;
+                break;
+            }
+            fail_request(&llm, &request, request_id, error, &updates);
             return;
         }
-    };
-
-    loop {
-        let event = tokio::select! {
-            biased;
-            Some(tool_event) = tool_events_rx.recv() => {
-                if forward_tool_event(request_id, tool_event, &updates).is_err() {
-                    return;
-                }
-                continue;
-            }
-            event = stream.next() => event,
-        };
-        let Some(event) = event else {
-            break;
-        };
-        match event {
-            Ok(LlmEvent::TextDelta(text)) => {
-                if updates
-                    .send(RequestUpdate::TextDelta { request_id, text })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            Ok(LlmEvent::ReasoningDelta(summary)) => {
-                if updates
-                    .send(RequestUpdate::ReasoningDelta {
-                        request_id,
-                        summary,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            Ok(LlmEvent::Usage(usage)) => {
-                if updates
-                    .send(RequestUpdate::Usage { request_id, usage })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            Ok(LlmEvent::Completed(commit)) => {
-                let _ = updates.send(RequestUpdate::Completed { request_id, commit });
-                return;
-            }
-            Err(error) => {
-                let _ = updates.send(RequestUpdate::Failed {
-                    request_id,
-                    message: error.to_string(),
-                });
-                return;
-            }
-        }
     }
+}
 
+fn retry_provider_failure(error: &LlmError, retries: &mut usize) -> bool {
+    if matches!(error, LlmError::Provider(_)) && *retries < MAX_PROVIDER_RETRIES {
+        *retries += 1;
+        true
+    } else {
+        false
+    }
+}
+
+fn fail_request(
+    llm: &LlmClient,
+    request: &PendingRequest,
+    request_id: RequestId,
+    error: LlmError,
+    updates: &async_mpsc::UnboundedSender<RequestUpdate>,
+) {
+    let message = match llm.retain_failed_user_message(request.request.history_prompt().to_owned())
+    {
+        Ok(()) => error.to_string(),
+        Err(history_error) => {
+            format!("{error}; could not retain the failed prompt: {history_error}")
+        }
+    };
     let _ = updates.send(RequestUpdate::Failed {
         request_id,
-        message: "the model stream ended before completion".into(),
+        message,
     });
 }
 
@@ -625,7 +648,8 @@ fn attachment_call_id(request_id: RequestId, index: usize) -> ToolCallId {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCommand, AgentEvent, AgentTaskRunner, RequestUpdate, run_coordinator_with_updates,
+        AgentCommand, AgentEvent, AgentTaskRunner, MAX_PROVIDER_RETRIES, RequestUpdate,
+        run_coordinator_with_updates,
     };
     use crate::composer::SubmittedContent;
     use crate::llm::{
@@ -639,7 +663,7 @@ mod tests {
     use futures::{StreamExt as _, future::BoxFuture, stream};
     use std::{
         fs,
-        sync::{Arc, atomic::AtomicUsize, mpsc},
+        sync::{Arc, Mutex, atomic::AtomicUsize, mpsc},
         thread,
         time::Duration,
     };
@@ -821,6 +845,97 @@ mod tests {
                         Ok(ProviderEvent::Completed(history)),
                     ])) as ProviderStream)
                 }
+            })
+        }
+    }
+
+    struct AlwaysFailProvider {
+        attempts: AtomicUsize,
+    }
+
+    impl Provider for AlwaysFailProvider {
+        fn stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err(LlmError::Provider("provider unavailable".into())) })
+        }
+    }
+
+    struct FailsThenSucceedsProvider {
+        attempts: AtomicUsize,
+    }
+
+    impl Provider for FailsThenSucceedsProvider {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+        ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if attempt == 0 {
+                    return Err(LlmError::Provider("provider unavailable".into()));
+                }
+                let mut history = request.history;
+                history.push(ConversationMessage::User(request.prompt));
+                history.push(ConversationMessage::Assistant("recovered".into()));
+                Ok(Box::pin(stream::iter([
+                    Ok(ProviderEvent::TextDelta("recovered".into())),
+                    Ok(ProviderEvent::Completed(history)),
+                ])) as ProviderStream)
+            })
+        }
+    }
+
+    struct FailureThenPendingProvider {
+        attempts: AtomicUsize,
+        retry_started: mpsc::Sender<()>,
+    }
+
+    impl Provider for FailureThenPendingProvider {
+        fn stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let retry_started = self.retry_started.clone();
+            Box::pin(async move {
+                if attempt == 0 {
+                    return Err(LlmError::Provider("provider unavailable".into()));
+                }
+                let _ = retry_started.send(());
+                Ok(Box::pin(stream::pending()) as ProviderStream)
+            })
+        }
+    }
+
+    struct FailingPromptRecordingProvider {
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    impl Provider for FailingPromptRecordingProvider {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+        ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+            self.requests.lock().unwrap().push(request.clone());
+            Box::pin(async move {
+                if request.prompt == "failed" {
+                    return Err(LlmError::Provider("provider unavailable".into()));
+                }
+                let mut history = request.history;
+                history.push(ConversationMessage::User(request.prompt));
+                history.push(ConversationMessage::Assistant("understood".into()));
+                Ok(
+                    Box::pin(stream::iter([Ok(ProviderEvent::Completed(history))]))
+                        as ProviderStream,
+                )
             })
         }
     }
@@ -1007,6 +1122,120 @@ mod tests {
             AgentEvent::TextDelta { request_id: 2, text } if text == "recovered"
         )));
 
+        runner.shutdown();
+    }
+
+    #[test]
+    fn provider_failure_retries_up_to_the_configured_limit_before_failing() {
+        let provider = Arc::new(AlwaysFailProvider {
+            attempts: AtomicUsize::new(0),
+        });
+        let client = LlmClient::with_provider(provider.clone());
+        let mut runner = AgentTaskRunner::spawn(client);
+        submit(&runner, 1, "first");
+
+        let mut events = Vec::new();
+        while !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Failed { request_id: 1, .. }))
+        {
+            events.push(runner.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+
+        assert_eq!(
+            provider.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_PROVIDER_RETRIES + 1
+        );
+        runner.shutdown();
+    }
+
+    #[test]
+    fn provider_success_after_a_retry_completes_the_original_request() {
+        let provider = Arc::new(FailsThenSucceedsProvider {
+            attempts: AtomicUsize::new(0),
+        });
+        let client = LlmClient::with_provider(provider.clone());
+        let mut runner = AgentTaskRunner::spawn(client);
+        submit(&runner, 1, "first");
+
+        let mut events = Vec::new();
+        while !events.contains(&AgentEvent::Completed { request_id: 1 }) {
+            events.push(runner.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+
+        assert_eq!(
+            provider.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta { request_id: 1, text } if text == "recovered"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Failed { request_id: 1, .. }))
+        );
+        runner.shutdown();
+    }
+
+    #[test]
+    fn interrupted_retry_stops_without_using_the_remaining_attempts() {
+        let (retry_started_tx, retry_started_rx) = mpsc::channel();
+        let provider = Arc::new(FailureThenPendingProvider {
+            attempts: AtomicUsize::new(0),
+            retry_started: retry_started_tx,
+        });
+        let client = LlmClient::with_provider(provider.clone());
+        let mut runner = AgentTaskRunner::spawn(client);
+        submit(&runner, 1, "first");
+
+        assert_eq!(
+            runner.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AgentEvent::Started { request_id: 1 }
+        );
+        retry_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        runner.cancel(1).unwrap();
+
+        assert_eq!(
+            runner.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AgentEvent::Interrupted { request_id: 1 }
+        );
+        assert_eq!(
+            provider.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        runner.shutdown();
+    }
+
+    #[test]
+    fn exhausted_provider_failure_retains_the_original_prompt_for_the_next_turn() {
+        let provider = Arc::new(FailingPromptRecordingProvider {
+            requests: Mutex::new(Vec::new()),
+        });
+        let client = LlmClient::with_provider(provider.clone());
+        let mut runner = AgentTaskRunner::spawn(client);
+        submit(&runner, 1, "failed");
+
+        while !matches!(
+            runner.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AgentEvent::Failed { request_id: 1, .. }
+        ) {}
+
+        submit(&runner, 2, "retry that request");
+        while !matches!(
+            runner.recv_timeout(Duration::from_secs(1)).unwrap(),
+            AgentEvent::Completed { request_id: 2 }
+        ) {}
+
+        let requests = provider.requests.lock().unwrap();
+        let retry = requests.last().unwrap();
+        assert_eq!(
+            retry.history,
+            vec![ConversationMessage::User("failed".into())]
+        );
         runner.shutdown();
     }
 

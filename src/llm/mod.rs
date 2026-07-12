@@ -280,6 +280,20 @@ impl LlmClient {
         Ok(())
     }
 
+    /// Preserve a prompt whose provider request could not complete.
+    ///
+    /// A failed turn has no assistant response to commit, but retaining its
+    /// user message lets a later turn understand what an explicit retry refers
+    /// to. The request coordinator calls this only after its retry budget is
+    /// exhausted, so automatic attempts use the original history unchanged.
+    pub(crate) fn retain_failed_user_message(&self, prompt: String) -> Result<(), LlmError> {
+        self.history
+            .lock()
+            .map_err(|_| LlmError::Internal("the LLM conversation is unavailable".into()))?
+            .push(ConversationMessage::User(prompt));
+        Ok(())
+    }
+
     pub(crate) async fn list_models(&self) -> Result<Vec<ProviderModels>, LlmError> {
         self.provider
             .list_models()
@@ -533,6 +547,33 @@ mod tests {
             .await;
 
         assert!(requests.lock().unwrap()[1].history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retained_failed_prompt_is_sent_with_the_next_request() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            requests: Arc::clone(&requests),
+            responses: Mutex::new(VecDeque::from([vec![Ok(ProviderEvent::Completed(
+                Vec::new(),
+            ))]])),
+        };
+        let client = LlmClient::with_provider(Arc::new(provider));
+
+        client
+            .retain_failed_user_message("failed request".into())
+            .unwrap();
+        client
+            .stream("retry that".into())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            requests.lock().unwrap()[0].history,
+            vec![ConversationMessage::User("failed request".into())]
+        );
     }
 
     #[test]
