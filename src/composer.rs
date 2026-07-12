@@ -11,8 +11,8 @@ use std::{
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete, UnicodeSegmentation};
 use unicode_width::UnicodeWidthStr;
 
-pub const REQUEST_CONFIRM_BYTES: usize = 256 * 1024;
-pub const REQUEST_HARD_LIMIT_BYTES: usize = 1024 * 1024;
+pub const REQUEST_CONFIRM_BYTES: usize = 100 * 1024 * 1024;
+pub const REQUEST_HARD_LIMIT_BYTES: usize = 1000 * 1024 * 1024;
 const TAB_WIDTH: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
