@@ -12,7 +12,8 @@ available for registered commands and workspace files.
 cargo run
 ```
 
-Press Enter on the home screen to open the chat.
+Funcode opens directly into its chat surface, with the Fun logo, command help, and an active input
+box ready for your first request.
 
 To open the authentication picker directly:
 
@@ -69,8 +70,8 @@ turns are included in later model context; failed or interrupted turns remain vi
 sent again. Thinking is shown until the first response text arrives. Tool calls remain as expandable
 transcript blocks after completion. New composer commands implement
 the `Command` trait and are added through `App::register_command`; command actions can update app
-state and optionally return an `AppAction` for the runtime to dispatch. The commands displayed on the
-home screen and command popup both read from this registry, so they stay in sync. Plan/Build is
+state and optionally return an `AppAction` for the runtime to dispatch. The commands displayed in the
+launch help widget and command popup both read from this registry, so they stay in sync. Plan/Build is
 session state controlled with Tab and reflected by the composer labels, rather than composer text or
 slash commands.
 

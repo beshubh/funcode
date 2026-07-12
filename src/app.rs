@@ -28,7 +28,6 @@ pub(crate) const FILE_SUGGESTION_LIMIT: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Screen {
     #[default]
-    Home,
     Chat,
 }
 
@@ -183,7 +182,6 @@ enum InputOwner {
     Models,
     PasteConfirmation,
     PendingSubmission,
-    Home,
     Suggestions,
     Composer,
 }
@@ -369,12 +367,6 @@ impl App {
             InputOwner::Models => return self.handle_models_dialog_key(key),
             InputOwner::PasteConfirmation => return self.handle_large_paste_key(key),
             InputOwner::PendingSubmission => return self.handle_pending_submission_key(key),
-            InputOwner::Home => {
-                if key.code == KeyCode::Enter {
-                    self.screen = Screen::Chat;
-                }
-                return None;
-            }
             InputOwner::Suggestions | InputOwner::Composer => {}
         }
 
@@ -595,8 +587,7 @@ impl App {
                     InputOwner::Composer => self.scroll_transcript_up(),
                     InputOwner::Message
                     | InputOwner::PasteConfirmation
-                    | InputOwner::PendingSubmission
-                    | InputOwner::Home => {}
+                    | InputOwner::PendingSubmission => {}
                 }
                 None
             }
@@ -609,8 +600,7 @@ impl App {
                     InputOwner::Composer => self.scroll_transcript_down(),
                     InputOwner::Message
                     | InputOwner::PasteConfirmation
-                    | InputOwner::PendingSubmission
-                    | InputOwner::Home => {}
+                    | InputOwner::PendingSubmission => {}
                 }
                 None
             }
@@ -661,8 +651,6 @@ impl App {
             InputOwner::PasteConfirmation
         } else if self.pending_submission.is_some() {
             InputOwner::PendingSubmission
-        } else if self.screen == Screen::Home {
-            InputOwner::Home
         } else if !self.suggestions().is_empty() {
             InputOwner::Suggestions
         } else {
@@ -1611,6 +1599,19 @@ mod tests {
     }
 
     #[test]
+    fn interactive_app_starts_in_chat_and_accepts_input_immediately() {
+        let mut app = App::new();
+
+        assert_eq!(app.screen, Screen::Chat);
+        assert!(app.composer_cursor_visible());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('h')), Instant::now()),
+            None
+        );
+        assert_eq!(app.composer.submission_text(), "h");
+    }
+
+    #[test]
     fn models_command_starts_provider_catalog_loading() {
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -2347,7 +2348,6 @@ mod tests {
     #[test]
     fn a_submitted_prompt_is_updated_by_correlated_stream_events() {
         let mut app = App::new();
-        app.handle_key(key(KeyCode::Enter), Instant::now());
         assert_eq!(app.screen, Screen::Chat);
 
         app.composer.insert_text("hello");
