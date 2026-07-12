@@ -913,6 +913,27 @@ mod tests {
     }
 
     #[test]
+    fn mouse_click_places_the_composer_cursor_at_the_clicked_column() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("alpha beta");
+        let regions = UiRegions {
+            composer_input: Some(Rect::new(10, 20, 40, 2)),
+            ..UiRegions::default()
+        };
+        app.set_composer_width(40);
+
+        handle_mouse_event(
+            &mut app,
+            &regions,
+            mouse(MouseEventKind::Up(MouseButton::Left), 13, 20),
+        );
+        app.composer.insert_text("X");
+
+        assert_eq!(app.composer.submission_text(), "alpXha beta");
+    }
+
+    #[test]
     fn mouse_previews_then_commits_themes() {
         let mut app = App::new();
         app.screen = Screen::Chat;
