@@ -153,6 +153,7 @@ pub enum PointerTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PointerEvent {
     Activate(Option<PointerTarget>),
+    PlaceComposerCursor { column: u16, row: u16, height: u16 },
     Hover(Option<PointerTarget>),
     ScrollUp,
     ScrollDown,
@@ -437,6 +438,14 @@ impl App {
                 self.suggestion_selected = 0;
                 None
             }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.composer.move_home();
+                None
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.composer.move_end();
+                None
+            }
             KeyCode::Left => {
                 self.composer.move_left();
                 None
@@ -538,6 +547,21 @@ impl App {
     pub(crate) fn handle_pointer(&mut self, event: PointerEvent) -> Option<AppAction> {
         let owner = self.input_owner();
         match event {
+            PointerEvent::PlaceComposerCursor {
+                column,
+                row,
+                height,
+            } => {
+                if matches!(owner, InputOwner::Composer | InputOwner::Suggestions) {
+                    self.composer.move_to_visual_position(
+                        self.composer_width as usize,
+                        height as usize,
+                        row as usize,
+                        column as usize,
+                    );
+                }
+                None
+            }
             PointerEvent::Activate(target) => match (owner, target) {
                 (InputOwner::Auth, Some(PointerTarget::AuthProvider(index))) => {
                     self.set_auth_selection(index);
@@ -909,6 +933,21 @@ impl App {
                 }
                 return;
             }
+            AgentEvent::Retrying {
+                request_id,
+                attempt,
+                max_retries,
+                message,
+            } => (
+                request_id,
+                TranscriptEvent::Retrying {
+                    turn_id: request_id,
+                    attempt,
+                    max_retries,
+                    message,
+                },
+                false,
+            ),
             AgentEvent::ToolStarted {
                 request_id,
                 call_id,
@@ -1146,7 +1185,7 @@ impl App {
         match kind {
             Some(EntryKind::User(_)) => self.open_message_dialog(entry_id),
             Some(EntryKind::Reasoning(_) | EntryKind::Tool(_)) => self.toggle_entry(entry_id),
-            Some(EntryKind::Assistant(_)) | None => {}
+            Some(EntryKind::Assistant(_) | EntryKind::Retry(_)) | None => {}
         }
     }
 
@@ -1956,9 +1995,9 @@ mod tests {
         let EntryKind::User(message) = &app.transcript.entries()[0].kind else {
             panic!("submission should create a user message");
         };
-        assert_eq!(message.copy_text(), "[2 lines pasted]");
+        assert_eq!(message.copy_text(), "alpha\nbeta");
         assert_eq!(message.content.submission_text(), "alpha\nbeta");
-        assert!(!message.copy_text().contains("alpha"));
+        assert!(message.copy_text().contains("alpha"));
     }
 
     #[test]
@@ -2450,6 +2489,28 @@ mod tests {
     }
 
     #[test]
+    fn provider_retry_is_preserved_as_visible_transcript_activity() {
+        let mut app = App::new();
+        app.transcript.submit(3, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 3 });
+
+        app.handle_agent_event(AgentEvent::Retrying {
+            request_id: 3,
+            attempt: 1,
+            max_retries: 20,
+            message: "provider unavailable".into(),
+        });
+
+        assert!(app.transcript.entries().iter().any(|entry| matches!(
+            &entry.kind,
+            EntryKind::Retry(retry)
+                if retry.attempt == 1
+                    && retry.max_retries == 20
+                    && retry.message == "provider unavailable"
+        )));
+    }
+
+    #[test]
     fn two_escape_presses_within_500ms_cancel_only_the_active_request() {
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -2499,6 +2560,25 @@ mod tests {
         app.handle_key(key(KeyCode::Backspace), Instant::now());
 
         assert_eq!(app.composer.submission_text(), "ab");
+    }
+
+    #[test]
+    fn command_arrows_move_to_the_start_and_end_of_the_logical_line() {
+        let mut app = App::new();
+        app.composer.insert_text("first\nsecond");
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER),
+            Instant::now(),
+        );
+        app.composer.insert_text("|");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER),
+            Instant::now(),
+        );
+        app.composer.insert_text("|");
+
+        assert_eq!(app.composer.submission_text(), "first\n|second|");
     }
 
     #[test]

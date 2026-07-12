@@ -234,6 +234,14 @@ impl SubmissionTaskRunner {
     }
 
     fn spawn_with_sizer(root: PathBuf, request_sizer: RequestSizer) -> Self {
+        Self::spawn_with_sizer_and_limit(root, request_sizer, REQUEST_HARD_LIMIT_BYTES)
+    }
+
+    fn spawn_with_sizer_and_limit(
+        root: PathBuf,
+        request_sizer: RequestSizer,
+        hard_limit_bytes: usize,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let control = Arc::new(Mutex::new(SubmissionControl::default()));
@@ -257,6 +265,7 @@ impl SubmissionTaskRunner {
                                 mode,
                                 reader,
                                 request_sizer.as_ref(),
+                                hard_limit_bytes,
                                 || is_working(&worker_control, token),
                             )
                             .map(Arc::new)
@@ -483,6 +492,7 @@ fn prepare_request(
     mode: SessionMode,
     reader: &WorkspaceFileReader,
     request_sizer: &(dyn Fn(&str, SessionMode) -> Result<usize, String> + Send + Sync),
+    hard_limit_bytes: usize,
     is_active: impl Fn() -> bool,
 ) -> Result<PreparedRequest, PrepareError> {
     if !is_active() {
@@ -493,7 +503,7 @@ fn prepare_request(
         .submission_bytes()
         .map_err(|_| PrepareError::SizeOverflow)?;
     let mode_bytes = mode.apply_to_prompt(String::new()).len();
-    reject_above_limit(checked_sum([history_bytes, mode_bytes])?)?;
+    reject_above_limit(checked_sum([history_bytes, mode_bytes])?, hard_limit_bytes)?;
 
     // `SubmittedContent::attachments` already performs first-mention
     // deduplication while retaining semantic document order.
@@ -519,11 +529,14 @@ fn prepare_request(
 
         // Stop as soon as the files read so far prove the request cannot fit.
         // This prevents an unbounded attachment list from being accumulated.
-        reject_above_limit(prompt_size(history_bytes, mode_bytes, &attachments)?)?;
+        reject_above_limit(
+            prompt_size(history_bytes, mode_bytes, &attachments)?,
+            hard_limit_bytes,
+        )?;
     }
 
     let prompt_bytes = prompt_size(history_bytes, mode_bytes, &attachments)?;
-    reject_above_limit(prompt_bytes)?;
+    reject_above_limit(prompt_bytes, hard_limit_bytes)?;
     if !is_active() {
         return Err(PrepareError::Cancelled);
     }
@@ -535,7 +548,7 @@ fn prepare_request(
     debug_assert_eq!(model_prompt.len(), prompt_bytes);
     let serialized_bytes =
         request_sizer(&model_prompt, mode).map_err(PrepareError::SerializeRequest)?;
-    reject_above_limit(serialized_bytes)?;
+    reject_above_limit(serialized_bytes, hard_limit_bytes)?;
 
     Ok(PreparedRequest {
         content,
@@ -603,12 +616,9 @@ fn checked_sum(values: impl IntoIterator<Item = usize>) -> Result<usize, Prepare
     })
 }
 
-fn reject_above_limit(bytes: usize) -> Result<(), PrepareError> {
-    if bytes > REQUEST_HARD_LIMIT_BYTES {
-        Err(PrepareError::RequestTooLarge {
-            bytes,
-            limit: REQUEST_HARD_LIMIT_BYTES,
-        })
+fn reject_above_limit(bytes: usize, limit: usize) -> Result<(), PrepareError> {
+    if bytes > limit {
+        Err(PrepareError::RequestTooLarge { bytes, limit })
     } else {
         Ok(())
     }
@@ -618,7 +628,7 @@ fn reject_above_limit(bytes: usize) -> Result<(), PrepareError> {
 mod tests {
     use super::{
         ATTACHMENT_CLOSE, ATTACHMENT_OPEN, ATTACHMENT_OPEN_END, ATTACHMENT_PREAMBLE,
-        REQUEST_HARD_LIMIT_BYTES, SubmissionEvent, SubmissionTaskRunner,
+        SubmissionEvent, SubmissionTaskRunner,
     };
     use crate::{
         composer::SubmittedContent,
@@ -704,6 +714,7 @@ mod tests {
 
     #[test]
     fn aggregate_attachment_payload_over_one_mib_is_rejected() {
+        const TEST_LIMIT: usize = 1024 * 1024;
         let root = tempfile::tempdir().unwrap();
         let attachments = (0..4)
             .map(|index| {
@@ -713,27 +724,33 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let content = SubmittedContent::with_attachments("inspect", &attachments);
-        let runner = SubmissionTaskRunner::spawn(root.path().to_owned());
+        let runner = SubmissionTaskRunner::spawn_with_sizer_and_limit(
+            root.path().to_owned(),
+            Arc::new(|prompt, _| Ok(prompt.len())),
+            TEST_LIMIT,
+        );
         runner.request(19, content, SessionMode::Build).unwrap();
 
         let SubmissionEvent::Failed { draft_id, message } = wait_for_event(&runner) else {
             panic!("aggregate request should fail");
         };
         assert_eq!(draft_id, 19);
-        assert!(message.contains(&REQUEST_HARD_LIMIT_BYTES.to_string()));
+        assert!(message.contains(&TEST_LIMIT.to_string()));
     }
 
     #[test]
     fn transport_json_escaping_can_trigger_the_aggregate_limit() {
+        const TEST_LIMIT: usize = 1024 * 1024;
         let root = tempfile::tempdir().unwrap();
         let content = SubmittedContent::plain("\"".repeat(600 * 1024));
-        let runner = SubmissionTaskRunner::spawn_with_sizer(
+        let runner = SubmissionTaskRunner::spawn_with_sizer_and_limit(
             root.path().to_owned(),
             Arc::new(|prompt, _| {
                 serde_json::to_vec(&serde_json::json!({ "input": prompt }))
                     .map(|body| body.len())
                     .map_err(|error| error.to_string())
             }),
+            TEST_LIMIT,
         );
         runner.request(21, content, SessionMode::Build).unwrap();
 
@@ -741,7 +758,7 @@ mod tests {
             panic!("JSON-expanded request should fail");
         };
         assert_eq!(draft_id, 21);
-        assert!(message.contains(&REQUEST_HARD_LIMIT_BYTES.to_string()));
+        assert!(message.contains(&TEST_LIMIT.to_string()));
     }
 
     #[test]

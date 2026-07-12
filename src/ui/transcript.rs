@@ -384,6 +384,15 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
             lines.push(Line::styled("└", theme.style(ThemeRole::Accent)));
             lines
         }
+        EntryKind::Retry(retry) => vec![Line::from(vec![
+            Span::styled("↻ ", theme.style(ThemeRole::Accent)),
+            Span::styled(
+                format!("Attempt {}/{} failed: ", retry.attempt, retry.max_retries),
+                theme.style(ThemeRole::Warning),
+            ),
+            Span::styled(retry.message.clone(), theme.style(ThemeRole::Warning)),
+            Span::styled(" · Retrying…", theme.style(ThemeRole::Accent)),
+        ])],
     }
 }
 

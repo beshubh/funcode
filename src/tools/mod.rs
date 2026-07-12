@@ -838,13 +838,13 @@ mod tests {
             json!({
                 "description": "Wait too long",
                 "command": "sleep 10 & echo $!; wait",
-                "timeout_seconds": 1
+                "timeout_seconds": 2
             }),
         )
         .await;
 
         assert!(started.elapsed() < Duration::from_secs(4));
-        assert!(output.contains("timed out after 1 second"));
+        assert!(output.contains("timed out after 2 second"));
         assert!(matches!(events.last(), Some(ToolEvent::Failed { .. })));
         #[cfg(unix)]
         {

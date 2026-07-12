@@ -41,6 +41,12 @@ pub enum AgentEvent {
         request_id: RequestId,
         usage: TokenUsage,
     },
+    Retrying {
+        request_id: RequestId,
+        attempt: usize,
+        max_retries: usize,
+        message: String,
+    },
     ToolStarted {
         request_id: RequestId,
         call_id: ToolCallId,
@@ -220,6 +226,12 @@ enum RequestUpdate {
         request_id: RequestId,
         usage: TokenUsage,
     },
+    Retrying {
+        request_id: RequestId,
+        attempt: usize,
+        max_retries: usize,
+        message: String,
+    },
     ToolStarted {
         request_id: RequestId,
         call_id: ToolCallId,
@@ -338,6 +350,7 @@ async fn run_coordinator_with_updates(
                     RequestUpdate::TextDelta { request_id, .. }
                     | RequestUpdate::ReasoningDelta { request_id, .. }
                     | RequestUpdate::Usage { request_id, .. }
+                    | RequestUpdate::Retrying { request_id, .. }
                     | RequestUpdate::ToolStarted { request_id, .. }
                     | RequestUpdate::ToolOutputDelta { request_id, .. }
                     | RequestUpdate::ToolFinished { request_id, .. }
@@ -358,6 +371,17 @@ async fn run_coordinator_with_updates(
                     RequestUpdate::Usage { request_id, usage } => {
                         AgentEvent::Usage { request_id, usage }
                     }
+                    RequestUpdate::Retrying {
+                        request_id,
+                        attempt,
+                        max_retries,
+                        message,
+                    } => AgentEvent::Retrying {
+                        request_id,
+                        attempt,
+                        max_retries,
+                        message,
+                    },
                     RequestUpdate::ToolStarted { request_id, call_id, name, summary, artifacts } => {
                         AgentEvent::ToolStarted { request_id, call_id, name, summary, artifacts }
                     }
@@ -443,7 +467,18 @@ async fn run_request(
         {
             Ok(stream) => stream,
             Err(error) => {
-                if retry_provider_failure(&error, &mut retries) {
+                if let Some(attempt) = next_provider_retry(&error, &mut retries) {
+                    if updates
+                        .send(RequestUpdate::Retrying {
+                            request_id,
+                            attempt,
+                            max_retries: MAX_PROVIDER_RETRIES,
+                            message: error.to_string(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                     tokio::task::yield_now().await;
                     continue;
                 }
@@ -485,6 +520,15 @@ async fn run_request(
                     }
                     continue;
                 }
+                Some(Ok(LlmEvent::Usage(usage))) => {
+                    if updates
+                        .send(RequestUpdate::Usage { request_id, usage })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 Some(Ok(LlmEvent::Completed(commit))) => {
                     let _ = updates.send(RequestUpdate::Completed { request_id, commit });
                     return;
@@ -492,7 +536,18 @@ async fn run_request(
                 Some(Err(error)) => error,
                 None => LlmError::Provider("the model stream ended before completion".into()),
             };
-            if retry_provider_failure(&error, &mut retries) {
+            if let Some(attempt) = next_provider_retry(&error, &mut retries) {
+                if updates
+                    .send(RequestUpdate::Retrying {
+                        request_id,
+                        attempt,
+                        max_retries: MAX_PROVIDER_RETRIES,
+                        message: error.to_string(),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
                 tokio::task::yield_now().await;
                 break;
             }
@@ -502,12 +557,12 @@ async fn run_request(
     }
 }
 
-fn retry_provider_failure(error: &LlmError, retries: &mut usize) -> bool {
+fn next_provider_retry(error: &LlmError, retries: &mut usize) -> Option<usize> {
     if matches!(error, LlmError::Provider(_)) && *retries < MAX_PROVIDER_RETRIES {
         *retries += 1;
-        true
+        Some(*retries)
     } else {
-        false
+        None
     }
 }
 
@@ -1171,6 +1226,15 @@ mod tests {
             event,
             AgentEvent::TextDelta { request_id: 1, text } if text == "recovered"
         )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Retrying {
+                request_id: 1,
+                attempt: 1,
+                max_retries: MAX_PROVIDER_RETRIES,
+                message,
+            } if message == "provider unavailable"
+        )));
         assert!(
             !events
                 .iter()
@@ -1199,9 +1263,14 @@ mod tests {
             .unwrap();
         runner.cancel(1).unwrap();
 
-        assert_eq!(
-            runner.recv_timeout(Duration::from_secs(1)).unwrap(),
-            AgentEvent::Interrupted { request_id: 1 }
+        let mut events = Vec::new();
+        while !events.contains(&AgentEvent::Interrupted { request_id: 1 }) {
+            events.push(runner.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Retrying { request_id: 1, .. }))
         );
         assert_eq!(
             provider.attempts.load(std::sync::atomic::Ordering::SeqCst),

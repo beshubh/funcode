@@ -88,11 +88,19 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryAttempt {
+    pub attempt: usize,
+    pub max_retries: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
     User(UserMessage),
     Assistant(AssistantMessage),
     Reasoning(Reasoning),
     Tool(ToolCall),
+    Retry(RetryAttempt),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +122,12 @@ pub enum TranscriptEvent {
     ReasoningDelta {
         turn_id: TurnId,
         summary: String,
+    },
+    Retrying {
+        turn_id: TurnId,
+        attempt: usize,
+        max_retries: usize,
+        message: String,
     },
     ToolStarted {
         turn_id: TurnId,
@@ -220,6 +234,23 @@ impl Transcript {
                 if self.is_active(turn_id) {
                     let reasoning = self.ensure_reasoning(turn_id);
                     reasoning.summary.push_str(&summary);
+                }
+            }
+            TranscriptEvent::Retrying {
+                turn_id,
+                attempt,
+                max_retries,
+                message,
+            } => {
+                if self.is_active(turn_id) {
+                    self.insert_activity(
+                        turn_id,
+                        EntryKind::Retry(RetryAttempt {
+                            attempt,
+                            max_retries,
+                            message,
+                        }),
+                    );
                 }
             }
             TranscriptEvent::ToolStarted {

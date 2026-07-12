@@ -430,7 +430,19 @@ fn handle_mouse_event(
 ) -> Option<AppAction> {
     let target = || regions.target_at(mouse.column, mouse.row);
     let event = match mouse.kind {
-        MouseEventKind::Up(MouseButton::Left) => PointerEvent::Activate(target()),
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(area) = regions.composer_input
+                && area.contains(Position::new(mouse.column, mouse.row))
+            {
+                PointerEvent::PlaceComposerCursor {
+                    column: mouse.column.saturating_sub(area.x),
+                    row: mouse.row.saturating_sub(area.y),
+                    height: area.height,
+                }
+            } else {
+                PointerEvent::Activate(target())
+            }
+        }
         MouseEventKind::Moved => PointerEvent::Hover(target()),
         MouseEventKind::ScrollUp => PointerEvent::ScrollUp,
         MouseEventKind::ScrollDown => PointerEvent::ScrollDown,
@@ -1058,6 +1070,26 @@ mod tests {
         handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
         assert_eq!(app.scroll_from_bottom, 0);
         assert!(app.follow_output);
+    }
+
+    #[test]
+    fn clicking_inside_the_composer_places_the_editing_cursor() {
+        let mut app = App::new();
+        app.set_composer_width(10);
+        app.composer.insert_text("abcdefghij");
+        let regions = UiRegions {
+            composer_input: Some(Rect::new(2, 4, 10, 2)),
+            ..UiRegions::default()
+        };
+
+        handle_mouse_event(
+            &mut app,
+            &regions,
+            mouse(MouseEventKind::Up(MouseButton::Left), 5, 4),
+        );
+        app.composer.insert_text("X");
+
+        assert_eq!(app.composer.submission_text(), "abcXdefghij");
     }
 
     #[test]

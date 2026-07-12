@@ -725,13 +725,26 @@ fn render_welcome_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &The
         "Type a request below  ·  /exit quit",
         theme.style(ThemeRole::MutedText),
     ));
+    let card_area = welcome_help_area(area, lines.len() as u16);
     let help = Text::from(lines);
     frame.render_widget(
         Paragraph::new(help)
             .wrap(Wrap { trim: false })
             .block(panel_block("Help", theme)),
-        area,
+        card_area,
     );
+}
+
+fn welcome_help_area(area: Rect, content_lines: u16) -> Rect {
+    const MAX_WIDTH: u16 = 58;
+    let width = area.width.min(MAX_WIDTH);
+    let height = content_lines.saturating_add(2).min(area.height);
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y,
+        width,
+        height,
+    )
 }
 
 fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> UiRegions {
@@ -771,8 +784,8 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
 }
 
 fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    const WIDGET_WIDTH: u16 = 16;
-    const WIDGET_HEIGHT: u16 = 5;
+    const WIDGET_WIDTH: u16 = 24;
+    const WIDGET_HEIGHT: u16 = 3;
 
     // Keep the compact transcript readable at the documented 60-column
     // minimum. At normal widths the widget sits in the unused top-right area.
@@ -780,35 +793,41 @@ fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
         return;
     }
 
+    let total_tokens = app.session_usage.total_tokens();
+    let context_percent = app
+        .session_usage
+        .context_utilization_percent(app.current_model_context_window());
+    if total_tokens.is_none() && context_percent.is_none() {
+        return;
+    }
     let widget_area = Rect::new(
         area.x + area.width.saturating_sub(WIDGET_WIDTH + 1),
         area.y + 1,
         WIDGET_WIDTH,
         WIDGET_HEIGHT,
     );
-    let token_text = app
-        .session_usage
-        .total_tokens()
+    let token_text = total_tokens
         .map(format_token_count)
         .unwrap_or_else(|| "—".into());
-    let context_text = app
-        .session_usage
-        .context_utilization_percent(app.current_model_context_window())
+    let context_text = context_percent
         .map(|percent| format!("{percent}%"))
         .unwrap_or_else(|| "—".into());
-    let block = panel_block(" Session ", theme);
+    let block = Block::bordered()
+        .border_set(theme.border_set())
+        .border_style(theme.style(ThemeRole::MutedText));
     let inner = block.inner(widget_area);
     frame.render_widget(Clear, widget_area);
     frame.render_widget(block, widget_area);
     frame.render_widget(
-        Paragraph::new(Text::from(vec![
-            Line::styled(
-                format!(" {token_text} tokens"),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {token_text} tok"),
                 theme.style(ThemeRole::Text).add_modifier(Modifier::BOLD),
             ),
-            Line::styled(
-                format!(" Context {context_text}"),
-                theme.style(ThemeRole::MutedText),
+            Span::styled("  ·  ", theme.style(ThemeRole::MutedText)),
+            Span::styled(
+                format!("{context_text} ctx"),
+                theme.style(ThemeRole::Accent).add_modifier(Modifier::BOLD),
             ),
         ])),
         inner,
@@ -1057,7 +1076,7 @@ fn render_too_small(
 
 #[cfg(test)]
 mod tests {
-    use super::{UiRegions, UiTarget, composer_height, render};
+    use super::{UiRegions, UiTarget, composer_height, render, welcome_help_area};
     use crate::{
         agent::AgentEvent,
         app::{App, ModelsDialogPhase, Screen},
@@ -1068,7 +1087,7 @@ mod tests {
     use ratatui::{
         Terminal,
         backend::TestBackend,
-        layout::Position,
+        layout::{Position, Rect},
         style::{Color, Modifier},
     };
 
@@ -1164,6 +1183,17 @@ mod tests {
     }
 
     #[test]
+    fn welcome_help_is_a_centered_content_sized_card() {
+        let available = Rect::new(0, 10, 100, 18);
+        let card = welcome_help_area(available, 8);
+
+        assert_eq!(card.width, 58);
+        assert_eq!(card.height, 10);
+        assert_eq!(card.x, 21);
+        assert_eq!(card.y, 10);
+    }
+
+    #[test]
     fn chat_renders_a_rounded_session_widget_with_reported_usage_and_context() {
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -1194,9 +1224,28 @@ mod tests {
 
         let (screen, _, _, _) = render_to_string(&app, 100, 30);
 
-        assert!(screen.contains("Session"));
-        assert!(screen.contains("300 tokens"));
-        assert!(screen.contains("Context 25%"));
+        assert!(!screen.contains("Session"));
+        assert!(screen.contains("300 tok"));
+        assert!(screen.contains("25% ctx"));
+    }
+
+    #[test]
+    fn retry_failure_and_retrying_state_are_visible_together() {
+        let mut app = App::new();
+        app.transcript.submit(1, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::Retrying {
+            request_id: 1,
+            attempt: 2,
+            max_retries: 20,
+            message: "gateway timeout".into(),
+        });
+
+        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("gateway timeout"));
+        assert!(screen.contains("Retrying"));
+        assert!(screen.contains("2/20"));
     }
 
     #[test]

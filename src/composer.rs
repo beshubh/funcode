@@ -143,7 +143,11 @@ struct PastedBlock {
 
 impl PastedBlock {
     fn summary(&self) -> String {
-        format!("[{} lines pasted]", self.line_count)
+        if self.line_count == 1 {
+            "[1 line pasted]".into()
+        } else {
+            format!("[{} lines pasted]", self.line_count)
+        }
     }
 }
 
@@ -272,9 +276,7 @@ impl SubmittedContent {
                     column = column.saturating_add(UnicodeWidthStr::width(display.as_str()));
                 }
                 SubmittedSegment::PastedBlock(block) => {
-                    let summary = block.summary();
-                    projection.push_str(&summary);
-                    column = column.saturating_add(summary.len());
+                    push_safe_text(&mut projection, &block.raw, &mut column);
                 }
             }
         }
@@ -337,7 +339,9 @@ impl SubmittedContent {
                     DisplayRunKind::FileReference,
                 ),
                 SubmittedSegment::PastedBlock(block) => {
-                    builder.push_atom(&block.summary(), DisplayRunKind::PastedBlock)
+                    for grapheme in block.raw.graphemes(true) {
+                        builder.push_text_grapheme(grapheme, DisplayRunKind::Text);
+                    }
                 }
             }
         }
@@ -358,7 +362,7 @@ impl SubmittedContent {
             .map(|segment| match segment {
                 SubmittedSegment::Text(text) => Segment::Text(text.clone()),
                 SubmittedSegment::FileReference(path) => Segment::FileReference(path.clone()),
-                SubmittedSegment::PastedBlock(block) => Segment::PastedBlock(block.clone()),
+                SubmittedSegment::PastedBlock(block) => Segment::Text(Rope::from_str(&block.raw)),
             })
             .collect::<Vec<_>>();
         let layout = Arc::new(build_layout(&segments, width));
@@ -770,7 +774,28 @@ impl ComposerDocument {
     }
 
     pub fn visible_text(&self) -> String {
-        self.freeze().visible_text()
+        let mut projection = String::new();
+        let mut column = 0usize;
+        for segment in &self.segments {
+            match segment {
+                Segment::Text(text) => {
+                    for chunk in text.chunks() {
+                        push_safe_text(&mut projection, chunk, &mut column);
+                    }
+                }
+                Segment::FileReference(path) => {
+                    let display = format!("@{}", path.display());
+                    projection.push_str(&display);
+                    column = column.saturating_add(UnicodeWidthStr::width(display.as_str()));
+                }
+                Segment::PastedBlock(block) => {
+                    let summary = block.summary();
+                    projection.push_str(&summary);
+                    column = column.saturating_add(UnicodeWidthStr::width(summary.as_str()));
+                }
+            }
+        }
+        projection
     }
 
     pub fn submission_text(&self) -> String {
@@ -892,6 +917,29 @@ impl ComposerDocument {
 
     pub fn move_down(&mut self, width: usize) {
         self.move_vertical(width, 1);
+    }
+
+    pub fn move_to_visual_position(
+        &mut self,
+        width: usize,
+        viewport_height: usize,
+        visible_row: usize,
+        column: usize,
+    ) {
+        let layout = self.layout(width);
+        let current = self.cursor_geometry(&layout);
+        let vertical_scroll = current
+            .row
+            .saturating_sub(viewport_height.saturating_sub(1));
+        let row = vertical_scroll
+            .saturating_add(visible_row)
+            .min(layout.total_rows().saturating_sub(1));
+        let Some(cursor) = layout.closest_cursor(row, column) else {
+            return;
+        };
+        let old = self.cursor;
+        self.cursor = cursor;
+        self.finish_cursor_move(old);
     }
 
     pub fn backspace(&mut self) {
@@ -1038,14 +1086,16 @@ impl ComposerDocument {
             return Err(ComposerEditError::StalePaste);
         }
         let multiline = proposal.is_multiline();
-        if multiline {
-            self.insert_atom_at_cursor(Segment::PastedBlock(PastedBlock {
-                raw: proposal.normalized,
-                line_count: proposal.line_count,
-            }))?;
-        } else {
-            self.insert_text_unchecked(&proposal.normalized);
+        if proposal.normalized.is_empty() {
+            return Ok(PasteCommit {
+                multiline,
+                projected_bytes: proposal.projected_bytes,
+            });
         }
+        self.insert_atom_at_cursor(Segment::PastedBlock(PastedBlock {
+            raw: proposal.normalized,
+            line_count: proposal.line_count,
+        }))?;
         self.finish_edit();
         Ok(PasteCommit {
             multiline,
@@ -2149,6 +2199,7 @@ fn rope_chunks(rope: RopeSlice<'_>) -> Vec<(&str, usize)> {
 mod tests {
     use super::{
         ComposerDocument, ComposerEditError, DisplayRunKind, QueryKind, REQUEST_HARD_LIMIT_BYTES,
+        SubmittedContent,
     };
     use crate::workspace::WorkspacePath;
     use proptest::prelude::*;
@@ -2296,6 +2347,34 @@ mod tests {
     }
 
     #[test]
+    fn single_line_paste_is_compact_while_editing_and_expands_after_send() {
+        let mut document = ComposerDocument::default();
+        let proposal = document.propose_paste("a long pasted line").unwrap();
+        document.commit_paste(proposal).unwrap();
+
+        assert_eq!(document.visible_text(), "[1 line pasted]");
+        let submitted = document.freeze();
+        assert_eq!(submitted.visible_text(), "a long pasted line");
+        assert_eq!(
+            submitted.display_lines(0)[0].runs[0].text,
+            "a long pasted line"
+        );
+        assert_eq!(submitted.layout(8).total_rows(), 3);
+    }
+
+    #[test]
+    fn multiline_paste_expands_to_its_full_text_after_send() {
+        let mut document = ComposerDocument::default();
+        let proposal = document.propose_paste("alpha\nbeta").unwrap();
+        document.commit_paste(proposal).unwrap();
+
+        let submitted = document.freeze();
+        assert_eq!(submitted.visible_text(), "alpha\nbeta");
+        assert_eq!(submitted.display_lines(0).len(), 2);
+        assert_eq!(submitted.layout(80).total_rows(), 2);
+    }
+
+    #[test]
     fn stale_paste_proposal_does_not_mutate() {
         let mut document = ComposerDocument::default();
         let proposal = document.propose_paste("alpha\nbeta").unwrap();
@@ -2424,6 +2503,17 @@ mod tests {
     }
 
     #[test]
+    fn pointer_position_moves_the_cursor_to_the_closest_visual_column() {
+        let mut document = ComposerDocument::default();
+        document.insert_text("abcdef");
+
+        document.move_to_visual_position(4, 2, 1, 1);
+        document.insert_text("X");
+
+        assert_eq!(document.submission_text(), "abcdeXf");
+    }
+
+    #[test]
     fn seventy_thousand_hard_rows_keep_the_tail_reachable() {
         let mut document = ComposerDocument::default();
         let text = format!("{}TAIL", "x\n".repeat(70_000));
@@ -2501,7 +2591,10 @@ mod tests {
                 prop_assert!(cursor.row < layout.total_rows());
                 prop_assert!(cursor.column <= width);
                 prop_assert_eq!(document.freeze().submission_text(), document.submission_text());
-                prop_assert_eq!(document.freeze().visible_text(), document.visible_text());
+                let submitted_visible = document.freeze().visible_text();
+                let plain_visible =
+                    SubmittedContent::plain(document.submission_text()).visible_text();
+                prop_assert_eq!(submitted_visible, plain_visible);
                 let kinds = document.freeze().segment_kinds();
                 prop_assert!(!kinds.windows(2).any(|pair| pair == ["text", "text"]));
             }
