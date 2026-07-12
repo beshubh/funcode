@@ -3,6 +3,7 @@ use crate::{
     submission::{PreparedAttachment, PreparedRequest},
     tools::{ToolDisplay, ToolEvent, ToolSession},
     transcript::{ToolArtifact, ToolCallId},
+    usage::TokenUsage,
 };
 use futures::StreamExt as _;
 use std::{
@@ -35,6 +36,10 @@ pub enum AgentEvent {
     ReasoningDelta {
         request_id: RequestId,
         summary: String,
+    },
+    Usage {
+        request_id: RequestId,
+        usage: TokenUsage,
     },
     ToolStarted {
         request_id: RequestId,
@@ -211,6 +216,10 @@ enum RequestUpdate {
         request_id: RequestId,
         summary: String,
     },
+    Usage {
+        request_id: RequestId,
+        usage: TokenUsage,
+    },
     ToolStarted {
         request_id: RequestId,
         call_id: ToolCallId,
@@ -328,6 +337,7 @@ async fn run_coordinator_with_updates(
                 let request_id = match &update {
                     RequestUpdate::TextDelta { request_id, .. }
                     | RequestUpdate::ReasoningDelta { request_id, .. }
+                    | RequestUpdate::Usage { request_id, .. }
                     | RequestUpdate::ToolStarted { request_id, .. }
                     | RequestUpdate::ToolOutputDelta { request_id, .. }
                     | RequestUpdate::ToolFinished { request_id, .. }
@@ -344,6 +354,9 @@ async fn run_coordinator_with_updates(
                     }
                     RequestUpdate::ReasoningDelta { request_id, summary } => {
                         AgentEvent::ReasoningDelta { request_id, summary }
+                    }
+                    RequestUpdate::Usage { request_id, usage } => {
+                        AgentEvent::Usage { request_id, usage }
                     }
                     RequestUpdate::ToolStarted { request_id, call_id, name, summary, artifacts } => {
                         AgentEvent::ToolStarted { request_id, call_id, name, summary, artifacts }
@@ -741,6 +754,51 @@ mod tests {
                 ])) as ProviderStream)
             })
         }
+    }
+
+    struct UsageProvider;
+
+    impl Provider for UsageProvider {
+        fn stream(
+            &self,
+            request: ProviderRequest,
+        ) -> BoxFuture<'static, Result<ProviderStream, LlmError>> {
+            Box::pin(async move {
+                let mut history = request.history;
+                history.push(ConversationMessage::User(request.prompt));
+                history.push(ConversationMessage::Assistant("complete".into()));
+                Ok(Box::pin(stream::iter([
+                    Ok(ProviderEvent::Usage(crate::usage::TokenUsage {
+                        input_tokens: 100,
+                        output_tokens: 25,
+                        total_tokens: 125,
+                    })),
+                    Ok(ProviderEvent::Completed(history)),
+                ])) as ProviderStream)
+            })
+        }
+    }
+
+    #[test]
+    fn provider_usage_reaches_the_app_event_stream_before_completion() {
+        let mut runner = AgentTaskRunner::spawn(LlmClient::with_provider(Arc::new(UsageProvider)));
+        submit(&runner, 1, "measure this");
+
+        let mut events = Vec::new();
+        while !events.contains(&AgentEvent::Completed { request_id: 1 }) {
+            events.push(runner.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Usage { request_id: 1, usage }
+                if *usage == crate::usage::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 25,
+                    total_tokens: 125,
+                }
+        )));
+        runner.shutdown();
     }
 
     struct BlockingFirstProvider;
@@ -1229,6 +1287,16 @@ mod tests {
                 text: "stale".into(),
             })
             .unwrap();
+        update_tx
+            .send(RequestUpdate::Usage {
+                request_id: 1,
+                usage: crate::usage::TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    total_tokens: 2,
+                },
+            })
+            .unwrap();
         command_tx
             .send(AgentCommand::Submit {
                 request_id: 2,
@@ -1244,6 +1312,11 @@ mod tests {
             event,
             AgentEvent::TextDelta { request_id: 1, text } if text == "stale"
         )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Usage { request_id: 1, .. }))
+        );
 
         command_tx.send(AgentCommand::Shutdown).unwrap();
         coordinator.join().unwrap();

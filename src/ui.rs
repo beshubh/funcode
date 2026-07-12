@@ -18,10 +18,8 @@ use ratatui::{
     widgets::{Block, Clear, Paragraph, Wrap},
 };
 
-const CHAT_MIN_WIDTH: u16 = 60;
-const CHAT_MIN_HEIGHT: u16 = 20;
-const HOME_MIN_WIDTH: u16 = 40;
-const HOME_MIN_HEIGHT: u16 = 20;
+const FUN_MIN_WIDTH: u16 = 60;
+const FUN_MIN_HEIGHT: u16 = 20;
 const COMPOSER_HORIZONTAL_PADDING: u16 = 2;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
 const COMPOSER_BORDER_HEIGHT: u16 = 2;
@@ -100,51 +98,43 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
         area,
     );
     let mut regions = match app.screen {
-        Screen::Home if area.width < HOME_MIN_WIDTH || area.height < HOME_MIN_HEIGHT => {
-            render_too_small(frame, area, HOME_MIN_WIDTH, HOME_MIN_HEIGHT, theme);
-            UiRegions::default()
-        }
-        Screen::Chat if area.width < CHAT_MIN_WIDTH || area.height < CHAT_MIN_HEIGHT => {
-            render_too_small(frame, area, CHAT_MIN_WIDTH, CHAT_MIN_HEIGHT, theme);
-            UiRegions::default()
-        }
-        Screen::Home => {
-            render_home(frame, area, app, theme);
+        Screen::Chat if area.width < FUN_MIN_WIDTH || area.height < FUN_MIN_HEIGHT => {
+            render_too_small(frame, area, FUN_MIN_WIDTH, FUN_MIN_HEIGHT, theme);
             UiRegions::default()
         }
         Screen::Chat => render_chat(frame, area, app, theme),
     };
 
-    if app.auth_dialog.is_some() && area.width >= HOME_MIN_WIDTH && area.height >= HOME_MIN_HEIGHT {
+    if app.auth_dialog.is_some() && area.width >= FUN_MIN_WIDTH && area.height >= FUN_MIN_HEIGHT {
         regions = UiRegions::default();
         regions.auth_providers = render_auth_dialog(frame, area, app, theme);
     } else if app.message_dialog.is_some()
-        && area.width >= CHAT_MIN_WIDTH
-        && area.height >= CHAT_MIN_HEIGHT
+        && area.width >= FUN_MIN_WIDTH
+        && area.height >= FUN_MIN_HEIGHT
     {
         regions = UiRegions::default();
         regions.message_copy = render_message_dialog(frame, area, app, theme);
     } else if app.theme_dialog.is_some()
-        && area.width >= CHAT_MIN_WIDTH
-        && area.height >= CHAT_MIN_HEIGHT
+        && area.width >= FUN_MIN_WIDTH
+        && area.height >= FUN_MIN_HEIGHT
     {
         regions = UiRegions::default();
         regions.theme_options = render_theme_dialog(frame, area, app, theme);
     } else if app.models_dialog.is_some()
-        && area.width >= CHAT_MIN_WIDTH
-        && area.height >= CHAT_MIN_HEIGHT
+        && area.width >= FUN_MIN_WIDTH
+        && area.height >= FUN_MIN_HEIGHT
     {
         regions = UiRegions::default();
         (regions.models, regions.model_refresh) = render_models_dialog(frame, area, app, theme);
     } else if app.paste_confirmation().is_some()
-        && area.width >= CHAT_MIN_WIDTH
-        && area.height >= CHAT_MIN_HEIGHT
+        && area.width >= FUN_MIN_WIDTH
+        && area.height >= FUN_MIN_HEIGHT
     {
         regions = UiRegions::default();
         render_paste_confirmation(frame, area, app, theme);
     } else if app.pending_submission_view().is_some()
-        && area.width >= CHAT_MIN_WIDTH
-        && area.height >= CHAT_MIN_HEIGHT
+        && area.width >= FUN_MIN_WIDTH
+        && area.height >= FUN_MIN_HEIGHT
     {
         regions = UiRegions::default();
         render_pending_submission(frame, area, app, theme);
@@ -637,12 +627,11 @@ fn render_message_dialog(
     Some(Rect::new(rows[1].x, rows[1].y, copy_width, 1))
 }
 
-fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    let inner = area.inner(Margin::new(2, 1));
+fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let inner = area.inner(Margin::new(2, 0));
     let rows = Layout::vertical([
         Constraint::Length(7),
         Constraint::Length(1),
-        Constraint::Length(10),
         Constraint::Min(0),
     ])
     .split(inner);
@@ -651,8 +640,7 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         rows[0],
     );
 
-    let columns = Layout::horizontal([Constraint::Length(44), Constraint::Min(0)]).split(rows[2]);
-    render_home_help(frame, columns[0], app, theme);
+    render_welcome_help(frame, rows[2], app, theme);
 }
 
 fn fun_logo(theme: &Theme) -> Text<'static> {
@@ -718,7 +706,7 @@ fn fun_logo(theme: &Theme) -> Text<'static> {
     ])
 }
 
-fn render_home_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+fn render_welcome_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     let mut lines = vec![Line::styled(
         "Available commands",
         theme.style(ThemeRole::Text).add_modifier(Modifier::BOLD),
@@ -734,7 +722,7 @@ fn render_home_help(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme)
     }));
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "Enter start  ·  /exit quit",
+        "Type a request below  ·  /exit quit",
         theme.style(ThemeRole::MutedText),
     ));
     let help = Text::from(lines);
@@ -760,10 +748,12 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
     ])
     .split(inner);
 
-    let mut regions = UiRegions {
-        transcript_entries: transcript::render(frame, rows[0], app, theme),
-        ..UiRegions::default()
-    };
+    let mut regions = UiRegions::default();
+    if app.transcript.entries().is_empty() {
+        render_welcome(frame, rows[0], app, theme);
+    } else {
+        regions.transcript_entries = transcript::render(frame, rows[0], app, theme);
+    }
     render_activity(frame, rows[1], app, theme);
     let composer_area = rows[2];
     let suggestion_height =
@@ -776,7 +766,66 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
     );
     regions.suggestions = render_suggestions(frame, suggestion_area, app, &suggestions, theme);
     regions.composer_input = Some(render_composer(frame, composer_area, app, theme));
+    render_session_usage(frame, area, app, theme);
     regions
+}
+
+fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    const WIDGET_WIDTH: u16 = 16;
+    const WIDGET_HEIGHT: u16 = 5;
+
+    // Keep the compact transcript readable at the documented 60-column
+    // minimum. At normal widths the widget sits in the unused top-right area.
+    if area.width < 70 || area.height < WIDGET_HEIGHT + 2 {
+        return;
+    }
+
+    let widget_area = Rect::new(
+        area.x + area.width.saturating_sub(WIDGET_WIDTH + 1),
+        area.y + 1,
+        WIDGET_WIDTH,
+        WIDGET_HEIGHT,
+    );
+    let token_text = app
+        .session_usage
+        .total_tokens()
+        .map(format_token_count)
+        .unwrap_or_else(|| "—".into());
+    let context_text = app
+        .session_usage
+        .context_utilization_percent(app.current_model_context_window())
+        .map(|percent| format!("{percent}%"))
+        .unwrap_or_else(|| "—".into());
+    let block = panel_block(" Session ", theme);
+    let inner = block.inner(widget_area);
+    frame.render_widget(Clear, widget_area);
+    frame.render_widget(block, widget_area);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::styled(
+                format!(" {token_text} tokens"),
+                theme.style(ThemeRole::Text).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                format!(" Context {context_text}"),
+                theme.style(ThemeRole::MutedText),
+            ),
+        ])),
+        inner,
+    );
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    if tokens < 10_000 {
+        return format!("{:.1}K", tokens as f64 / 1_000.0);
+    }
+    if tokens < 1_000_000 {
+        return format!("{}K", tokens / 1_000);
+    }
+    format!("{:.1}M", tokens as f64 / 1_000_000.0)
 }
 
 fn render_suggestions(
@@ -1082,33 +1131,72 @@ mod tests {
     }
 
     #[test]
-    fn home_screen_has_no_app_border_and_one_compact_help_widget() {
-        let (screen, cursor_visible, _, top_left) = render_to_string(&App::new(), 100, 30);
+    fn fun_launch_unifies_logo_help_and_active_composer() {
+        let (screen, cursor_visible, regions, top_left) = render_to_string(&App::new(), 100, 30);
 
         assert!(screen.contains("██████████"));
+        assert!(screen.contains("Help"));
         assert!(screen.contains("/auth"));
         assert!(screen.contains("/exit"));
         assert!(!screen.contains("/sessions"));
         assert!(!screen.contains("/help"));
         assert!(screen.contains("/models"));
+        assert!(screen.contains("Type something"));
+        assert!(!screen.contains("No messages yet"));
         assert!(!screen.contains("Model: not connected"));
+        assert!(regions.transcript_entries.is_empty());
         assert_eq!(top_left, " ");
-        assert!(!cursor_visible);
+        assert!(cursor_visible);
     }
 
     #[test]
     fn idle_chat_has_no_transcript_entry_regions_and_no_app_border() {
-        let mut app = App::new();
-        app.screen = Screen::Chat;
+        let app = App::new();
 
         let (screen, cursor_visible, regions, top_left) = render_to_string(&app, 100, 30);
 
         assert!(!screen.contains("Agent messages"));
-        assert!(screen.contains("No messages yet"));
+        assert!(screen.contains("Type a request below"));
         assert!(screen.contains("Type something"));
         assert!(regions.transcript_entries.is_empty());
         assert_eq!(top_left, " ");
         assert!(cursor_visible);
+    }
+
+    #[test]
+    fn chat_renders_a_rounded_session_widget_with_reported_usage_and_context() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.open_models_dialog();
+        app.set_current_model("gpt-test");
+        app.handle_model_catalog_event(crate::model_catalog::ModelCatalogEvent::Loaded(vec![
+            ProviderModels {
+                provider: "ChatGPT".into(),
+                source: "live provider API".into(),
+                models: vec![ModelInfo {
+                    id: "gpt-test".into(),
+                    display_name: "GPT Test".into(),
+                    context_window: Some(1_000),
+                }],
+            },
+        ]));
+        app.models_dialog = None;
+        app.transcript.submit(1, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::Usage {
+            request_id: 1,
+            usage: crate::usage::TokenUsage {
+                input_tokens: 250,
+                output_tokens: 50,
+                total_tokens: 300,
+            },
+        });
+
+        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("Session"));
+        assert!(screen.contains("300 tokens"));
+        assert!(screen.contains("Context 25%"));
     }
 
     #[test]
@@ -1429,6 +1517,7 @@ mod tests {
             models: vec![ModelInfo {
                 id: "gpt-test".into(),
                 display_name: "GPT Test".into(),
+                context_window: None,
             }],
         }]));
 
@@ -1457,6 +1546,7 @@ mod tests {
                 .map(|index| ModelInfo {
                     id: format!("model-{index}"),
                     display_name: format!("Model {index}"),
+                    context_window: None,
                 })
                 .collect(),
         }]));
@@ -1492,10 +1582,12 @@ mod tests {
                 ModelInfo {
                     id: "model-a".into(),
                     display_name: "Model A".into(),
+                    context_window: None,
                 },
                 ModelInfo {
                     id: "model-b".into(),
                     display_name: "Model B".into(),
+                    context_window: None,
                 },
             ],
         }]));

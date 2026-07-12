@@ -12,6 +12,7 @@ use crate::{
     submission::{DraftId, PreparedRequest, SubmissionEvent},
     theme::ThemeId,
     transcript::{EntryId, EntryKind, ToolArtifact, Transcript, TranscriptEvent},
+    usage::SessionUsage,
     workspace::WorkspacePath,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -28,7 +29,6 @@ pub(crate) const FILE_SUGGESTION_LIMIT: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Screen {
     #[default]
-    Home,
     Chat,
 }
 
@@ -183,7 +183,6 @@ enum InputOwner {
     Models,
     PasteConfirmation,
     PendingSubmission,
-    Home,
     Suggestions,
     Composer,
 }
@@ -226,6 +225,7 @@ pub struct App {
     pub auth_dialog: Option<AuthDialog>,
     pub theme_dialog: Option<ThemeDialog>,
     pub(crate) models_dialog: Option<ModelsDialogPhase>,
+    pub(crate) session_usage: SessionUsage,
     large_paste_confirmation: Option<PasteProposal>,
     pending_submission: Option<PendingSubmission>,
     approved_draft: Option<(DocumentRevision, usize)>,
@@ -242,6 +242,7 @@ pub struct App {
     suggestion_selected: usize,
     models_selected: usize,
     current_model: String,
+    current_model_context_window: Option<u64>,
     composer_width: u16,
     next_request_id: RequestId,
     next_draft_id: DraftId,
@@ -369,12 +370,6 @@ impl App {
             InputOwner::Models => return self.handle_models_dialog_key(key),
             InputOwner::PasteConfirmation => return self.handle_large_paste_key(key),
             InputOwner::PendingSubmission => return self.handle_pending_submission_key(key),
-            InputOwner::Home => {
-                if key.code == KeyCode::Enter {
-                    self.screen = Screen::Chat;
-                }
-                return None;
-            }
             InputOwner::Suggestions | InputOwner::Composer => {}
         }
 
@@ -595,8 +590,7 @@ impl App {
                     InputOwner::Composer => self.scroll_transcript_up(),
                     InputOwner::Message
                     | InputOwner::PasteConfirmation
-                    | InputOwner::PendingSubmission
-                    | InputOwner::Home => {}
+                    | InputOwner::PendingSubmission => {}
                 }
                 None
             }
@@ -609,8 +603,7 @@ impl App {
                     InputOwner::Composer => self.scroll_transcript_down(),
                     InputOwner::Message
                     | InputOwner::PasteConfirmation
-                    | InputOwner::PendingSubmission
-                    | InputOwner::Home => {}
+                    | InputOwner::PendingSubmission => {}
                 }
                 None
             }
@@ -661,8 +654,6 @@ impl App {
             InputOwner::PasteConfirmation
         } else if self.pending_submission.is_some() {
             InputOwner::PendingSubmission
-        } else if self.screen == Screen::Home {
-            InputOwner::Home
         } else if !self.suggestions().is_empty() {
             InputOwner::Suggestions
         } else {
@@ -911,6 +902,13 @@ impl App {
                 },
                 false,
             ),
+            AgentEvent::Usage { request_id, usage } => {
+                if self.transcript.is_queued(request_id) || self.active_request == Some(request_id)
+                {
+                    self.session_usage.record(usage);
+                }
+                return;
+            }
             AgentEvent::ToolStarted {
                 request_id,
                 call_id,
@@ -1223,10 +1221,15 @@ impl App {
 
     pub(crate) fn set_current_model(&mut self, model: impl Into<String>) {
         self.current_model = model.into();
+        self.current_model_context_window = None;
     }
 
     pub(crate) fn current_model(&self) -> &str {
         &self.current_model
+    }
+
+    pub(crate) const fn current_model_context_window(&self) -> Option<u64> {
+        self.current_model_context_window
     }
 
     pub(crate) fn selected_model_index(&self) -> usize {
@@ -1280,14 +1283,14 @@ impl App {
     }
 
     fn select_highlighted_model(&mut self) -> Option<AppAction> {
-        let model = self
-            .available_models()
-            .get(self.selected_model_index())?
-            .id
-            .clone();
-        self.current_model = model.clone();
+        let models = self.available_models();
+        let model = models.get(self.selected_model_index())?;
+        let model_id = model.id.clone();
+        let context_window = model.context_window;
+        self.current_model = model_id.clone();
+        self.current_model_context_window = context_window;
         self.models_dialog = None;
-        Some(AppAction::SelectModel { model })
+        Some(AppAction::SelectModel { model: model_id })
     }
 
     pub(crate) fn scroll_models_up(&mut self) {
@@ -1299,20 +1302,29 @@ impl App {
     }
 
     pub(crate) fn handle_model_catalog_event(&mut self, event: ModelCatalogEvent) {
-        if self.models_dialog.is_none() {
-            return;
-        }
-        self.models_dialog = Some(match event {
+        match event {
             ModelCatalogEvent::Loaded(catalogs) => {
+                self.current_model_context_window = catalogs
+                    .iter()
+                    .flat_map(|catalog| catalog.models.iter())
+                    .find(|model| model.id == self.current_model)
+                    .and_then(|model| model.context_window);
+                if self.models_dialog.is_none() {
+                    return;
+                }
                 self.models_selected = catalogs
                     .iter()
                     .flat_map(|catalog| catalog.models.iter())
                     .position(|model| model.id == self.current_model)
                     .unwrap_or(0);
-                ModelsDialogPhase::Loaded(catalogs)
+                self.models_dialog = Some(ModelsDialogPhase::Loaded(catalogs));
             }
-            ModelCatalogEvent::Failed(message) => ModelsDialogPhase::Failed(message),
-        });
+            ModelCatalogEvent::Failed(message) => {
+                if self.models_dialog.is_some() {
+                    self.models_dialog = Some(ModelsDialogPhase::Failed(message));
+                }
+            }
+        }
     }
 
     pub fn open_auth_dialog(&mut self) {
@@ -1553,6 +1565,8 @@ mod tests {
         agent::AgentEvent,
         auth::AuthEvent,
         commands::Command,
+        llm::ProviderModels,
+        model_catalog::ModelCatalogEvent,
         session::SessionMode,
         theme::ThemeId,
         transcript::{AssistantStatus, EntryKind, ToolArtifact},
@@ -1608,6 +1622,19 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
         assert!(app.auth_dialog.is_some());
         assert!(app.composer.submission_text().is_empty());
+    }
+
+    #[test]
+    fn interactive_app_starts_in_chat_and_accepts_input_immediately() {
+        let mut app = App::new();
+
+        assert_eq!(app.screen, Screen::Chat);
+        assert!(app.composer_cursor_visible());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('h')), Instant::now()),
+            None
+        );
+        assert_eq!(app.composer.submission_text(), "h");
     }
 
     #[test]
@@ -1695,10 +1722,12 @@ mod tests {
                     crate::llm::ModelInfo {
                         id: "model-a".into(),
                         display_name: "Model A".into(),
+                        context_window: None,
                     },
                     crate::llm::ModelInfo {
                         id: "model-b".into(),
                         display_name: "Model B".into(),
+                        context_window: None,
                     },
                 ],
             },
@@ -1731,6 +1760,24 @@ mod tests {
             app.models_dialog,
             Some(super::ModelsDialogPhase::Loading)
         ));
+    }
+
+    #[test]
+    fn background_model_catalog_updates_context_capacity_without_opening_the_picker() {
+        let mut app = App::new();
+        app.set_current_model("model-a");
+        app.handle_model_catalog_event(ModelCatalogEvent::Loaded(vec![ProviderModels {
+            provider: "Test".into(),
+            source: "cached catalog".into(),
+            models: vec![crate::llm::ModelInfo {
+                id: "model-a".into(),
+                display_name: "Model A".into(),
+                context_window: Some(128_000),
+            }],
+        }]));
+
+        assert_eq!(app.current_model_context_window(), Some(128_000));
+        assert!(app.models_dialog.is_none());
     }
 
     #[test]
@@ -2347,7 +2394,6 @@ mod tests {
     #[test]
     fn a_submitted_prompt_is_updated_by_correlated_stream_events() {
         let mut app = App::new();
-        app.handle_key(key(KeyCode::Enter), Instant::now());
         assert_eq!(app.screen, Screen::Chat);
 
         app.composer.insert_text("hello");
@@ -2375,6 +2421,32 @@ mod tests {
             EntryKind::Assistant(message)
                 if message.text == "streamed" && message.status == AssistantStatus::Completed
         ));
+    }
+
+    #[test]
+    fn provider_usage_is_accumulated_only_for_active_or_queued_session_requests() {
+        let mut app = App::new();
+        app.transcript.submit(3, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 3 });
+        app.handle_agent_event(AgentEvent::Usage {
+            request_id: 3,
+            usage: crate::usage::TokenUsage {
+                input_tokens: 120,
+                output_tokens: 30,
+                total_tokens: 150,
+            },
+        });
+        app.handle_agent_event(AgentEvent::Usage {
+            request_id: 99,
+            usage: crate::usage::TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                total_tokens: 2,
+            },
+        });
+
+        assert_eq!(app.session_usage.total_tokens(), Some(150));
+        assert_eq!(app.session_usage.context_tokens(), Some(120));
     }
 
     #[test]

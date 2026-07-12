@@ -5,6 +5,7 @@ use super::super::{
 use crate::{
     auth::AuthStore,
     tools::{AgentTool, ToolSession, ToolSpec},
+    usage::TokenUsage,
 };
 use futures::{Stream, StreamExt, future, future::BoxFuture};
 use rig_core::{
@@ -18,9 +19,19 @@ use rig_core::{
     tool::{ToolDyn, ToolError},
     wasm_compat::WasmBoxedFuture,
 };
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-const SYSTEM_INSTRUCTIONS: &str = "You are Funcode, a helpful and fun coding assistant. Give clear, accurate, practical answers. Build mode provides read_file, search_files, edit_file, and terminal. Inspect before editing, keep changes scoped to the request, and verify changes with relevant commands before answering. Plan mode omits edit_file and permits terminal only for non-mutating inspection.";
+const BUILD_MODE_SYSTEM_INSTRUCTIONS: &str = include_str!("prompts/build.md");
+const PLAN_MODE_SYSTEM_INSTRUCTIONS: &str = include_str!("prompts/plan.md");
+static SYSTEM_INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
+    let build = BUILD_MODE_SYSTEM_INSTRUCTIONS
+        .strip_suffix('\n')
+        .unwrap_or(BUILD_MODE_SYSTEM_INSTRUCTIONS);
+    let plan = PLAN_MODE_SYSTEM_INSTRUCTIONS
+        .strip_suffix('\n')
+        .unwrap_or(PLAN_MODE_SYSTEM_INSTRUCTIONS);
+    format!("{build} {plan}")
+});
 const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 // The backend uses this as a model-catalog schema capability version. Funcode's package is still
 // 0.x, which the backend treats as predating picker-visible catalog entries.
@@ -63,7 +74,7 @@ pub(in crate::llm) fn serialized_request_bytes(
     // Keep this in lockstep with `ChatGptProvider::stream` and Rig's ChatGPT
     // request normalization. This is the exact body passed to `serde_json::to_vec`
     // by the provider before the HTTP request is sent.
-    request.instructions = Some(SYSTEM_INSTRUCTIONS.to_owned());
+    request.instructions = Some(SYSTEM_INSTRUCTIONS.clone());
     request.temperature = None;
     request.max_output_tokens = None;
     request.stream = Some(true);
@@ -103,6 +114,8 @@ struct ChatGptModel {
     slug: String,
     display_name: String,
     visibility: String,
+    #[serde(default)]
+    context_window: Option<u64>,
 }
 
 fn parse_models(body: &[u8]) -> Result<ProviderModels, LlmError> {
@@ -118,6 +131,7 @@ fn parse_models(body: &[u8]) -> Result<ProviderModels, LlmError> {
         .map(|model| ModelInfo {
             id: model.slug,
             display_name: model.display_name,
+            context_window: model.context_window,
         })
         .collect();
     Ok(ProviderModels {
@@ -156,7 +170,7 @@ impl Provider for ChatGptProvider {
                     access_token: credentials.access_token,
                     account_id: credentials.account_id,
                 })
-                .default_instructions(SYSTEM_INSTRUCTIONS)
+                .default_instructions(SYSTEM_INSTRUCTIONS.as_str())
                 .originator("funcode")
                 .user_agent(format!("funcode/{}", env!("CARGO_PKG_VERSION")))
                 .build()
@@ -204,6 +218,13 @@ impl Provider for ChatGptProvider {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
                     StreamedAssistantContent::ReasoningDelta { reasoning, .. },
                 )) => ChatGptStreamEvent::ReasoningSummary(reasoning),
+                Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                    ChatGptStreamEvent::Usage(TokenUsage {
+                        input_tokens: call.usage.input_tokens,
+                        output_tokens: call.usage.output_tokens,
+                        total_tokens: call.usage.total_tokens,
+                    })
+                }
                 Ok(MultiTurnStreamItem::FinalResponse(_)) => ChatGptStreamEvent::Finished,
                 Ok(_) => ChatGptStreamEvent::Ignored,
                 Err(error) => ChatGptStreamEvent::Failed(error.to_string()),
@@ -304,6 +325,7 @@ fn auth_error(error: anyhow::Error) -> LlmError {
 enum ChatGptStreamEvent {
     Text(String),
     ReasoningSummary(String),
+    Usage(TokenUsage),
     Finished,
     Failed(String),
     Ignored,
@@ -339,6 +361,7 @@ impl ConversationAssembler {
             ChatGptStreamEvent::ReasoningSummary(summary) => {
                 Some(Ok(ProviderEvent::ReasoningDelta(summary)))
             }
+            ChatGptStreamEvent::Usage(usage) => Some(Ok(ProviderEvent::Usage(usage))),
             ChatGptStreamEvent::Finished => {
                 self.terminal = true;
                 Some(Ok(ProviderEvent::Completed(completed_history(
@@ -404,7 +427,8 @@ fn chatgpt_stream_error(message: String) -> LlmError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatGptStreamEvent, ConversationAssembler, RigToolAdapter, chatgpt_stream_error,
+        BUILD_MODE_SYSTEM_INSTRUCTIONS, ChatGptStreamEvent, ConversationAssembler,
+        PLAN_MODE_SYSTEM_INSTRUCTIONS, RigToolAdapter, SYSTEM_INSTRUCTIONS, chatgpt_stream_error,
         parse_models, rig_history, serialized_request_bytes, stream_events,
     };
     use crate::llm::{ConversationMessage, LlmError, ProviderEvent};
@@ -415,6 +439,22 @@ mod tests {
     use rig_core::tool::ToolDyn;
     use std::{fs, sync::Arc};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn embedded_mode_system_instructions_preserve_the_existing_prompt() {
+        assert_eq!(
+            BUILD_MODE_SYSTEM_INSTRUCTIONS,
+            "You are Funcode, a helpful and fun coding assistant. Give clear, accurate, practical answers. Build mode provides read_file, search_files, edit_file, and terminal. Inspect before editing, keep changes scoped to the request, and verify changes with relevant commands before answering.\n"
+        );
+        assert_eq!(
+            PLAN_MODE_SYSTEM_INSTRUCTIONS,
+            "Plan mode omits edit_file and permits terminal only for non-mutating inspection.\n"
+        );
+        assert_eq!(
+            SYSTEM_INSTRUCTIONS.as_str(),
+            "You are Funcode, a helpful and fun coding assistant. Give clear, accurate, practical answers. Build mode provides read_file, search_files, edit_file, and terminal. Inspect before editing, keep changes scoped to the request, and verify changes with relevant commands before answering. Plan mode omits edit_file and permits terminal only for non-mutating inspection."
+        );
+    }
 
     #[test]
     fn translates_portable_history_only_inside_the_chatgpt_adapter() {
@@ -540,6 +580,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_completion_usage_before_the_final_conversation_commit() {
+        let usage = crate::usage::TokenUsage {
+            input_tokens: 120,
+            output_tokens: 30,
+            total_tokens: 150,
+        };
+        let events = stream_events(
+            stream::iter([
+                ChatGptStreamEvent::Usage(usage),
+                ChatGptStreamEvent::Finished,
+            ]),
+            ConversationAssembler::new(Vec::new(), "prompt".into()),
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        assert!(matches!(
+            events[0],
+            Ok(ProviderEvent::Usage(reported)) if reported == usage
+        ));
+        assert!(matches!(events[1], Ok(ProviderEvent::Completed(_))));
+    }
+
+    #[tokio::test]
     async fn stream_failures_do_not_emit_a_conversation_commit() {
         let events = stream_events(
             stream::iter([
@@ -629,7 +693,7 @@ mod tests {
         let catalog = parse_models(
             br#"{
                 "models": [
-                    {"slug":"gpt-visible","display_name":"GPT Visible","description":"Recommended","visibility":"list"},
+                    {"slug":"gpt-visible","display_name":"GPT Visible","description":"Recommended","visibility":"list","context_window":128000},
                     {"slug":"gpt-hidden","display_name":"GPT Hidden","description":null,"visibility":"hide"}
                 ]
             }"#,
@@ -640,5 +704,6 @@ mod tests {
         assert_eq!(catalog.models.len(), 1);
         assert_eq!(catalog.models[0].id, "gpt-visible");
         assert_eq!(catalog.models[0].display_name, "GPT Visible");
+        assert_eq!(catalog.models[0].context_window, Some(128_000));
     }
 }

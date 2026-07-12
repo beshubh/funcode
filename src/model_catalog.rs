@@ -237,6 +237,7 @@ mod tests {
                     models: vec![ModelInfo {
                         id: "test-model".into(),
                         display_name: "Test Model".into(),
+                        context_window: None,
                     }],
                 })
             })
@@ -279,6 +280,7 @@ mod tests {
                     models: vec![ModelInfo {
                         id: "test-model".into(),
                         display_name: "Test Model".into(),
+                        context_window: None,
                     }],
                 })
             })
