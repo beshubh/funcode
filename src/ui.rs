@@ -39,6 +39,7 @@ pub struct UiRegions {
     pub suggestions: Vec<Rect>,
     pub message_copy: Option<Rect>,
     pub composer_input: Option<Rect>,
+    pub composer_vertical_scroll: usize,
     pub theme_options: Vec<Rect>,
     pub models: Vec<ModelRegion>,
     pub model_refresh: Option<Rect>,
@@ -84,6 +85,13 @@ impl UiRegions {
             .find(|(_, area)| area.contains(position))
         {
             Some(UiTarget::Theme(index))
+        } else if let Some(input) = self.composer_input.filter(|area| area.contains(position)) {
+            Some(UiTarget::ComposerInput {
+                row: self
+                    .composer_vertical_scroll
+                    .saturating_add(position.y.saturating_sub(input.y) as usize),
+                column: position.x.saturating_sub(input.x) as usize,
+            })
         } else {
             self.transcript_entries
                 .iter()
@@ -775,7 +783,9 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
         suggestion_height,
     );
     regions.suggestions = render_suggestions(frame, suggestion_area, app, &suggestions, theme);
-    regions.composer_input = Some(render_composer(frame, composer_area, app, theme));
+    let composer = render_composer(frame, composer_area, app, theme);
+    regions.composer_input = Some(composer.area);
+    regions.composer_vertical_scroll = composer.vertical_scroll;
     regions
 }
 
@@ -853,7 +863,17 @@ fn activity_text(app: &App) -> String {
     }
 }
 
-fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Rect {
+struct ComposerRenderRegion {
+    area: Rect,
+    vertical_scroll: usize,
+}
+
+fn render_composer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+) -> ComposerRenderRegion {
     let active_mode = app.effective_mode();
     let mode_role = match active_mode {
         SessionMode::Plan => ThemeRole::PlanMode,
@@ -928,7 +948,10 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
             ),
         ));
     }
-    input_area
+    ComposerRenderRegion {
+        area: input_area,
+        vertical_scroll,
+    }
 }
 
 fn composer_height(app: &App, width: u16) -> u16 {
@@ -1019,7 +1042,7 @@ mod tests {
     use ratatui::{
         Terminal,
         backend::TestBackend,
-        layout::Position,
+        layout::{Position, Rect},
         style::{Color, Modifier},
     };
 
@@ -1244,6 +1267,20 @@ mod tests {
         let (screen, _, _, _) = render_to_string(&app, 100, 30);
 
         assert!(screen.contains("Review @src/app.rs"));
+    }
+
+    #[test]
+    fn composer_input_hit_regions_preserve_the_scrolled_display_position() {
+        let regions = UiRegions {
+            composer_input: Some(Rect::new(10, 20, 30, 3)),
+            composer_vertical_scroll: 7,
+            ..UiRegions::default()
+        };
+
+        assert_eq!(
+            regions.target_at(14, 21),
+            Some(UiTarget::ComposerInput { row: 8, column: 4 })
+        );
     }
 
     #[test]

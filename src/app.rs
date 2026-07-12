@@ -148,6 +148,7 @@ pub enum PointerTarget {
     Theme(usize),
     Model(usize),
     ModelRefresh,
+    ComposerInput { row: usize, column: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,6 +443,22 @@ impl App {
                 self.suggestion_selected = 0;
                 None
             }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.composer.move_home();
+                None
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.composer.move_end();
+                None
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.composer.move_word_left();
+                None
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.composer.move_word_right();
+                None
+            }
             KeyCode::Left => {
                 self.composer.move_left();
                 None
@@ -561,6 +578,19 @@ impl App {
                 (InputOwner::Models, Some(PointerTarget::ModelRefresh)) => self.refresh_models(),
                 (InputOwner::Suggestions, Some(PointerTarget::Suggestion(index))) => {
                     self.activate_suggestion(index)
+                }
+                (
+                    InputOwner::Suggestions | InputOwner::Composer,
+                    Some(PointerTarget::ComposerInput { row, column }),
+                ) => {
+                    self.composer.move_to_display_position(
+                        self.composer_width as usize,
+                        row,
+                        column,
+                    );
+                    self.pending_indexed_file_selection = None;
+                    self.suggestion_selected = 0;
+                    None
                 }
                 (InputOwner::Composer, Some(PointerTarget::TranscriptEntry(entry_id))) => {
                     self.activate_transcript_entry(entry_id);
@@ -1896,12 +1926,12 @@ mod tests {
     }
 
     #[test]
-    fn multiline_paste_stays_structural_in_transcript_and_copy_projection() {
+    fn multiline_paste_stays_structural_while_the_transcript_shows_its_text() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.handle_paste("alpha\r\nbeta");
 
-        assert_eq!(app.composer.visible_text(), "[2 lines pasted]");
+        assert_eq!(app.composer.visible_text(), "alpha\nbeta");
         assert_eq!(app.composer.submission_text(), "alpha\nbeta");
         let action = press_and_preflight(&mut app, KeyCode::Enter);
         assert!(matches!(action, Some(AppAction::Submit { .. })));
@@ -1909,9 +1939,9 @@ mod tests {
         let EntryKind::User(message) = &app.transcript.entries()[0].kind else {
             panic!("submission should create a user message");
         };
-        assert_eq!(message.copy_text(), "[2 lines pasted]");
+        assert_eq!(message.copy_text(), "alpha\nbeta");
         assert_eq!(message.content.submission_text(), "alpha\nbeta");
-        assert!(!message.copy_text().contains("alpha"));
+        assert!(message.copy_text().contains("alpha"));
     }
 
     #[test]
@@ -2427,6 +2457,57 @@ mod tests {
         app.handle_key(key(KeyCode::Backspace), Instant::now());
 
         assert_eq!(app.composer.submission_text(), "ab");
+    }
+
+    #[test]
+    fn command_and_option_arrows_follow_macos_composer_navigation() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("first second\nthird fourth");
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER),
+            Instant::now(),
+        );
+        app.composer.insert_text("X");
+        assert_eq!(
+            app.composer.submission_text(),
+            "first second\nXthird fourth"
+        );
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER),
+            Instant::now(),
+        );
+        app.composer.insert_text("Y");
+        assert_eq!(
+            app.composer.submission_text(),
+            "first second\nXthird fourthY"
+        );
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            Instant::now(),
+        );
+        app.composer.insert_text("Z");
+        assert_eq!(
+            app.composer.submission_text(),
+            "first second\nXthird ZfourthY"
+        );
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER),
+            Instant::now(),
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            Instant::now(),
+        );
+        app.composer.insert_text("Q");
+        assert_eq!(
+            app.composer.submission_text(),
+            "first second\nXthirdQ ZfourthY"
+        );
     }
 
     #[test]

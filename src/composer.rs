@@ -85,7 +85,9 @@ impl fmt::Display for ComposerEditError {
             Self::RequestTooLarge { bytes, limit } => {
                 write!(
                     formatter,
-                    "the request is {bytes} bytes; the limit is {limit} bytes"
+                    "the request is {}; the limit is {}",
+                    format_megabytes(*bytes),
+                    format_megabytes(*limit),
                 )
             }
             Self::ProjectionOverflow => formatter.write_str("the request size overflowed"),
@@ -138,13 +140,6 @@ pub struct PasteCommit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PastedBlock {
     raw: Arc<str>,
-    line_count: usize,
-}
-
-impl PastedBlock {
-    fn summary(&self) -> String {
-        format!("[{} lines pasted]", self.line_count)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -272,9 +267,7 @@ impl SubmittedContent {
                     column = column.saturating_add(UnicodeWidthStr::width(display.as_str()));
                 }
                 SubmittedSegment::PastedBlock(block) => {
-                    let summary = block.summary();
-                    projection.push_str(&summary);
-                    column = column.saturating_add(summary.len());
+                    push_safe_text(&mut projection, &block.raw, &mut column);
                 }
             }
         }
@@ -337,7 +330,7 @@ impl SubmittedContent {
                     DisplayRunKind::FileReference,
                 ),
                 SubmittedSegment::PastedBlock(block) => {
-                    builder.push_atom(&block.summary(), DisplayRunKind::PastedBlock)
+                    builder.push_atom(&block.raw, DisplayRunKind::Text)
                 }
             }
         }
@@ -528,13 +521,24 @@ impl LogicalLineLayout {
 
     fn closest_cursor(&self, row: usize, preferred_column: usize) -> Option<CharIndex> {
         let range = self.row_anchor_ranges.get(row)?.clone();
-        self.anchors[range]
+        let anchors = if range.is_empty() {
+            &self.anchors[..]
+        } else {
+            &self.anchors[range]
+        };
+        anchors
             .iter()
             .min_by(|left, right| {
                 left.geometry
-                    .column
-                    .abs_diff(preferred_column)
-                    .cmp(&right.geometry.column.abs_diff(preferred_column))
+                    .row
+                    .abs_diff(row)
+                    .cmp(&right.geometry.row.abs_diff(row))
+                    .then_with(|| {
+                        left.geometry
+                            .column
+                            .abs_diff(preferred_column)
+                            .cmp(&right.geometry.column.abs_diff(preferred_column))
+                    })
                     .then_with(|| right.cursor.0.cmp(&left.cursor.0))
             })
             .map(|anchor| anchor.cursor)
@@ -847,6 +851,28 @@ impl ComposerDocument {
         self.finish_cursor_move(old);
     }
 
+    pub(crate) fn move_word_left(&mut self) {
+        let old = self.cursor;
+        while self.cursor.0 > 0 && !self.previous_cursor_unit_is_word() {
+            self.move_left();
+        }
+        while self.cursor.0 > 0 && self.previous_cursor_unit_is_word() {
+            self.move_left();
+        }
+        self.finish_cursor_move(old);
+    }
+
+    pub(crate) fn move_word_right(&mut self) {
+        let old = self.cursor;
+        while self.cursor.0 < self.semantic_len() && !self.next_cursor_unit_is_word() {
+            self.move_right();
+        }
+        while self.cursor.0 < self.semantic_len() && self.next_cursor_unit_is_word() {
+            self.move_right();
+        }
+        self.finish_cursor_move(old);
+    }
+
     pub fn move_home(&mut self) {
         let old = self.cursor;
         let target = self
@@ -1037,18 +1063,18 @@ impl ComposerDocument {
         {
             return Err(ComposerEditError::StalePaste);
         }
-        let multiline = proposal.is_multiline();
-        if multiline {
+        let pasted_block =
+            proposal.is_multiline() || proposal.projected_bytes > REQUEST_CONFIRM_BYTES;
+        if pasted_block {
             self.insert_atom_at_cursor(Segment::PastedBlock(PastedBlock {
                 raw: proposal.normalized,
-                line_count: proposal.line_count,
             }))?;
         } else {
             self.insert_text_unchecked(&proposal.normalized);
         }
         self.finish_edit();
         Ok(PasteCommit {
-            multiline,
+            multiline: pasted_block,
             projected_bytes: proposal.projected_bytes,
         })
     }
@@ -1094,6 +1120,17 @@ impl ComposerDocument {
             .unwrap_or(CursorGeometry { row: 0, column: 0 })
     }
 
+    pub(crate) fn move_to_display_position(&mut self, width: usize, row: usize, column: usize) {
+        let layout = self.layout(width);
+        let row = row.min(layout.total_rows().saturating_sub(1));
+        let Some(cursor) = layout.closest_cursor(row, column) else {
+            return;
+        };
+        let old = self.cursor;
+        self.cursor = cursor;
+        self.finish_cursor_move(old);
+    }
+
     pub fn submission_bytes(&self) -> Result<usize, ComposerEditError> {
         self.segments.iter().try_fold(0usize, |total, segment| {
             total
@@ -1107,6 +1144,54 @@ impl ComposerDocument {
             .iter()
             .map(Segment::semantic_len)
             .fold(0usize, usize::saturating_add)
+    }
+
+    fn previous_cursor_unit_is_word(&self) -> bool {
+        let mut offset = 0usize;
+        for segment in &self.segments {
+            match segment {
+                Segment::Text(text) => {
+                    let end = offset.saturating_add(text.len_chars());
+                    if self.cursor.0 > offset && self.cursor.0 <= end {
+                        let local = self.cursor.0 - offset;
+                        let start = previous_grapheme_boundary(text, local);
+                        return is_word_grapheme(&text.slice(start..local).to_string());
+                    }
+                    offset = end;
+                }
+                Segment::FileReference(_) | Segment::PastedBlock(_) => {
+                    if self.cursor.0 == offset.saturating_add(1) {
+                        return true;
+                    }
+                    offset = offset.saturating_add(1);
+                }
+            }
+        }
+        false
+    }
+
+    fn next_cursor_unit_is_word(&self) -> bool {
+        let mut offset = 0usize;
+        for segment in &self.segments {
+            match segment {
+                Segment::Text(text) => {
+                    let end = offset.saturating_add(text.len_chars());
+                    if self.cursor.0 >= offset && self.cursor.0 < end {
+                        let local = self.cursor.0 - offset;
+                        let end = next_grapheme_boundary(text, local);
+                        return is_word_grapheme(&text.slice(local..end).to_string());
+                    }
+                    offset = end;
+                }
+                Segment::FileReference(_) | Segment::PastedBlock(_) => {
+                    if self.cursor.0 == offset {
+                        return true;
+                    }
+                    offset = offset.saturating_add(1);
+                }
+            }
+        }
+        false
     }
 
     fn insert_text_unchecked(&mut self, text: &str) {
@@ -1472,12 +1557,7 @@ fn build_logical_line(source: &LogicalLineSource, width: usize) -> LogicalLineLa
             }
             LogicalLineSegment::PastedBlock(block) => {
                 let after = CharIndex(semantic_cursor.0.saturating_add(1));
-                builder.push_atom(
-                    &block.summary(),
-                    DisplayRunKind::PastedBlock,
-                    semantic_cursor,
-                    after,
-                );
+                builder.push_pasted_block(&block.raw, semantic_cursor, after);
                 semantic_cursor = after;
             }
         }
@@ -1726,6 +1806,32 @@ impl LayoutBuilder {
         self.push_rendered_sequence(display, kind, before, after);
     }
 
+    fn push_pasted_block(&mut self, display: &str, before: CharIndex, after: CharIndex) {
+        self.add_anchor(before);
+        for grapheme in display.graphemes(true) {
+            if grapheme == "\n" {
+                if self.soft_boundary {
+                    self.soft_boundary = false;
+                } else {
+                    self.row = self.row.saturating_add(1);
+                    self.column = 0;
+                }
+                self.ensure_row();
+            } else if grapheme == "\t" {
+                let spaces = TAB_WIDTH - self.column % TAB_WIDTH;
+                self.push_rendered_sequence(
+                    &" ".repeat(spaces),
+                    DisplayRunKind::Text,
+                    before,
+                    before,
+                );
+            } else {
+                self.push_piece(safe_grapheme(grapheme).as_ref(), DisplayRunKind::Text);
+            }
+        }
+        self.add_anchor(after);
+    }
+
     fn start_wrapped_group(&mut self) {
         self.row = self.row.saturating_add(1);
         self.column = 0;
@@ -1896,6 +2002,16 @@ fn safe_grapheme(grapheme: &str) -> Cow<'_, str> {
         }
     }
     Cow::Owned(safe)
+}
+
+fn format_megabytes(bytes: usize) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn is_word_grapheme(grapheme: &str) -> bool {
+    grapheme
+        .chars()
+        .any(|character| character.is_alphanumeric() || character == '_')
 }
 
 fn push_safe_text(output: &mut String, text: &str, column: &mut usize) {
@@ -2148,7 +2264,8 @@ fn rope_chunks(rope: RopeSlice<'_>) -> Vec<(&str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerDocument, ComposerEditError, DisplayRunKind, QueryKind, REQUEST_HARD_LIMIT_BYTES,
+        ComposerDocument, ComposerEditError, DisplayRunKind, QueryKind, REQUEST_CONFIRM_BYTES,
+        REQUEST_HARD_LIMIT_BYTES,
     };
     use crate::workspace::WorkspacePath;
     use proptest::prelude::*;
@@ -2280,19 +2397,79 @@ mod tests {
     }
 
     #[test]
-    fn crlf_multiline_paste_is_one_atom() {
+    fn crlf_multiline_paste_is_one_atom_with_its_text_visible() {
         let mut document = ComposerDocument::default();
         let proposal = document.propose_paste("alpha\r\nbeta").unwrap();
         assert_eq!(proposal.line_count(), 2);
         document.commit_paste(proposal).unwrap();
 
-        assert_eq!(document.visible_text(), "[2 lines pasted]");
+        assert_eq!(document.visible_text(), "alpha\nbeta");
         assert_eq!(document.submission_text(), "alpha\nbeta");
         assert_eq!(document.freeze().segment_kinds(), ["paste"]);
+        let layout = document.layout(20);
+        assert_eq!(layout.total_rows(), 2);
+        assert_eq!(layout.visible_rows(0, 2)[0].runs[0].text, "alpha");
+        assert_eq!(layout.visible_rows(0, 2)[1].runs[0].text, "beta");
 
         document.move_left();
         document.delete();
         assert!(document.is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_huge_single_line_paste_is_stored_as_one_atom() {
+        let mut document = ComposerDocument::default();
+        let proposal = document
+            .propose_paste(&"x".repeat(REQUEST_CONFIRM_BYTES + 1))
+            .unwrap();
+        assert_eq!(proposal.line_count(), 1);
+        assert!(proposal.requires_confirmation());
+
+        let commit = document.commit_paste(proposal).unwrap();
+
+        assert!(commit.multiline);
+        assert_eq!(document.freeze().segment_kinds(), ["paste"]);
+    }
+
+    #[test]
+    fn request_size_errors_are_formatted_in_megabytes() {
+        assert_eq!(
+            ComposerEditError::RequestTooLarge {
+                bytes: 1_572_864,
+                limit: 104_857_600,
+            }
+            .to_string(),
+            "the request is 1.5 MB; the limit is 100.0 MB"
+        );
+    }
+
+    #[test]
+    fn option_word_navigation_stops_at_word_ends() {
+        let mut document = ComposerDocument::default();
+        document.insert_text("first, second third");
+
+        document.move_home();
+        document.move_word_right();
+        document.insert_text("X");
+        assert_eq!(document.submission_text(), "firstX, second third");
+
+        document.move_word_right();
+        document.insert_text("Y");
+        assert_eq!(document.submission_text(), "firstX, secondY third");
+    }
+
+    #[test]
+    fn mouse_positions_choose_the_nearest_cursor_on_the_clicked_display_row() {
+        let mut document = ComposerDocument::default();
+        document.insert_text("alpha\nbeta");
+
+        document.move_to_display_position(20, 0, 2);
+        document.insert_text("X");
+        assert_eq!(document.submission_text(), "alXpha\nbeta");
+
+        document.move_to_display_position(20, 1, 1);
+        document.insert_text("Y");
+        assert_eq!(document.submission_text(), "alXpha\nbYeta");
     }
 
     #[test]
