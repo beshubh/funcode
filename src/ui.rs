@@ -784,8 +784,9 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
 }
 
 fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
-    const WIDGET_WIDTH: u16 = 24;
-    const WIDGET_HEIGHT: u16 = 3;
+    const WIDGET_WIDTH: u16 = 14;
+    const WIDGET_HEIGHT: u16 = 6;
+    const BAR_WIDTH: usize = 10;
 
     // Keep the compact transcript readable at the documented 60-column
     // minimum. At normal widths the widget sits in the unused top-right area.
@@ -813,25 +814,42 @@ fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
         .map(|percent| format!("{percent}%"))
         .unwrap_or_else(|| "—".into());
     let block = Block::bordered()
+        .title(" Context ")
         .border_set(theme.border_set())
         .border_style(theme.style(ThemeRole::MutedText));
     let inner = block.inner(widget_area);
     frame.render_widget(Clear, widget_area);
     frame.render_widget(block, widget_area);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {token_text} tok"),
-                theme.style(ThemeRole::Text).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  ·  ", theme.style(ThemeRole::MutedText)),
-            Span::styled(
-                format!("{context_text} ctx"),
+        Paragraph::new(Text::from(vec![
+            Line::styled(
+                format!("{context_text} used"),
                 theme.style(ThemeRole::Accent).add_modifier(Modifier::BOLD),
-            ),
+            )
+            .alignment(Alignment::Center),
+            context_bar(context_percent, BAR_WIDTH, theme).alignment(Alignment::Center),
+            Line::styled(
+                format!("{token_text} tok"),
+                theme.style(ThemeRole::MutedText),
+            )
+            .alignment(Alignment::Center),
         ])),
         inner,
     );
+}
+
+fn context_bar(percent: Option<u8>, width: usize, theme: &Theme) -> Line<'static> {
+    let filled = percent
+        .map(|percent| usize::from(percent).saturating_mul(width).div_ceil(100))
+        .unwrap_or_default()
+        .min(width);
+    Line::from(vec![
+        Span::styled("█".repeat(filled), theme.style(ThemeRole::Accent)),
+        Span::styled(
+            "░".repeat(width.saturating_sub(filled)),
+            theme.style(ThemeRole::MutedText),
+        ),
+    ])
 }
 
 fn format_token_count(tokens: u64) -> String {
@@ -1194,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_renders_a_rounded_session_widget_with_reported_usage_and_context() {
+    fn chat_renders_a_rounded_context_card_with_reported_usage() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.open_models_dialog();
@@ -1224,9 +1242,10 @@ mod tests {
 
         let (screen, _, _, _) = render_to_string(&app, 100, 30);
 
-        assert!(!screen.contains("Session"));
+        assert!(screen.contains("Context"));
         assert!(screen.contains("300 tok"));
-        assert!(screen.contains("25% ctx"));
+        assert!(screen.contains("25% used"));
+        assert!(screen.contains("███░░░░░░░"));
     }
 
     #[test]
