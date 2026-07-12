@@ -22,7 +22,7 @@ impl AgentTool for ReadFileTool {
     fn spec(&self, _mode: SessionMode) -> ToolSpec {
         ToolSpec {
             name: "read_file",
-            description: "Read a UTF-8 file inside the opened workspace, optionally selecting an inclusive line range.".into(),
+            description: "Read a UTF-8 file inside the opened workspace, optionally selecting an inclusive line range. Requested bounds beyond the file are clamped to its available lines.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -86,14 +86,8 @@ fn read_file(arguments: String, context: ToolExecutionContext) -> Result<ToolRes
     })?;
     let lines = content.lines().collect::<Vec<_>>();
     let total = lines.len().max(1) as u32;
-    let start = args.start_line.unwrap_or(1);
-    let end = args.end_line.unwrap_or(total);
-    if start == 0 || end == 0 || start > end || start > total || end > total {
-        return Err(ToolFailure::new(format!(
-            "invalid line range {start}-{end}; '{}' has {total} line(s)",
-            display_path
-        )));
-    }
+    let start = args.start_line.unwrap_or(1).clamp(1, total);
+    let end = args.end_line.unwrap_or(total).clamp(start, total);
     let selected = if lines.is_empty() {
         String::new()
     } else {
