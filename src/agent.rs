@@ -1366,6 +1366,14 @@ mod tests {
                 },
             })
             .unwrap();
+        update_tx
+            .send(RequestUpdate::Retrying {
+                request_id: 1,
+                attempt: 1,
+                max_retries: MAX_PROVIDER_RETRIES,
+                message: "stale retry".into(),
+            })
+            .unwrap();
         command_tx
             .send(AgentCommand::Submit {
                 request_id: 2,
@@ -1385,6 +1393,11 @@ mod tests {
             !events
                 .iter()
                 .any(|event| matches!(event, AgentEvent::Usage { request_id: 1, .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Retrying { request_id: 1, .. }))
         );
 
         command_tx.send(AgentCommand::Shutdown).unwrap();

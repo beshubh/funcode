@@ -446,6 +446,14 @@ impl App {
                 self.composer.move_end();
                 None
             }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.composer.move_word_left();
+                None
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.composer.move_word_right();
+                None
+            }
             KeyCode::Left => {
                 self.composer.move_left();
                 None
@@ -2511,6 +2519,24 @@ mod tests {
     }
 
     #[test]
+    fn late_provider_retry_after_completion_is_ignored() {
+        let mut app = App::new();
+        app.transcript.submit(3, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 3 });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 3 });
+        let entries_before = app.transcript.entries().len();
+
+        app.handle_agent_event(AgentEvent::Retrying {
+            request_id: 3,
+            attempt: 1,
+            max_retries: 20,
+            message: "late failure".into(),
+        });
+
+        assert_eq!(app.transcript.entries().len(), entries_before);
+    }
+
+    #[test]
     fn two_escape_presses_within_500ms_cancel_only_the_active_request() {
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -2579,6 +2605,25 @@ mod tests {
         app.composer.insert_text("|");
 
         assert_eq!(app.composer.submission_text(), "first\n|second|");
+    }
+
+    #[test]
+    fn option_arrows_move_across_words() {
+        let mut app = App::new();
+        app.composer.insert_text("one two");
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            Instant::now(),
+        );
+        app.composer.insert_text("|");
+        app.handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            Instant::now(),
+        );
+        app.composer.insert_text("|");
+
+        assert_eq!(app.composer.submission_text(), "one |two|");
     }
 
     #[test]

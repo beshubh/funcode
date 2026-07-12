@@ -49,11 +49,13 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - Type `/` at the start of the composer: browse registered commands
 - Type `@` at the start of a token: insert a highlighted workspace-file reference in place
 - Unmatched `@text` stays plain text
-- Multiline bracketed paste: insert one atomic `[N lines pasted]` block; Left/Right skip it and
-  Backspace/Delete removes the whole block
+- Bracketed paste: insert one atomic `[1 line pasted]` or `[N lines pasted]` block while editing;
+  sent messages show the full pasted text, Left/Right skip the block, and Backspace/Delete removes it
 - Pasted CRLF and bare CR are normalized to LF. Tabs and other controls remain intact for the model
   but are rendered safely in the terminal
 - Move the mouse over a suggestion to highlight it; click to activate it
+- Click inside the composer to place the cursor; Cmd+Left/Right moves to line boundaries and
+  Option+Left/Right moves by word
 - Drag across terminal text to select and automatically copy it to the clipboard
 - Click a sent message: open a modal and copy its text and attached paths
 - Click a Thinking or tool block: expand its persistent activity summary

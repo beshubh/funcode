@@ -872,6 +872,33 @@ impl ComposerDocument {
         self.finish_cursor_move(old);
     }
 
+    pub fn move_word_left(&mut self) {
+        while self
+            .character_before_cursor()
+            .is_some_and(char::is_whitespace)
+        {
+            self.move_left();
+        }
+        while self
+            .character_before_cursor()
+            .is_some_and(|character| !character.is_whitespace())
+        {
+            self.move_left();
+        }
+    }
+
+    pub fn move_word_right(&mut self) {
+        while self.character_at_cursor().is_some_and(char::is_whitespace) {
+            self.move_right();
+        }
+        while self
+            .character_at_cursor()
+            .is_some_and(|character| !character.is_whitespace())
+        {
+            self.move_right();
+        }
+    }
+
     pub fn move_home(&mut self) {
         let old = self.cursor;
         let target = self
@@ -1314,6 +1341,50 @@ impl ComposerDocument {
                 }
                 Segment::FileReference(_) | Segment::PastedBlock(_) => {
                     offset = offset.saturating_add(1)
+                }
+            }
+        }
+        None
+    }
+
+    fn character_before_cursor(&self) -> Option<char> {
+        let mut offset = 0usize;
+        for segment in &self.segments {
+            match segment {
+                Segment::Text(text) => {
+                    let end = offset.saturating_add(text.len_chars());
+                    if self.cursor.0 > offset && self.cursor.0 <= end {
+                        return Some(text.char(self.cursor.0 - offset - 1));
+                    }
+                    offset = end;
+                }
+                Segment::FileReference(_) | Segment::PastedBlock(_) => {
+                    if self.cursor.0 == offset.saturating_add(1) {
+                        return Some('\u{fffc}');
+                    }
+                    offset = offset.saturating_add(1);
+                }
+            }
+        }
+        None
+    }
+
+    fn character_at_cursor(&self) -> Option<char> {
+        let mut offset = 0usize;
+        for segment in &self.segments {
+            match segment {
+                Segment::Text(text) => {
+                    let end = offset.saturating_add(text.len_chars());
+                    if self.cursor.0 >= offset && self.cursor.0 < end {
+                        return Some(text.char(self.cursor.0 - offset));
+                    }
+                    offset = end;
+                }
+                Segment::FileReference(_) | Segment::PastedBlock(_) => {
+                    if self.cursor.0 == offset {
+                        return Some('\u{fffc}');
+                    }
+                    offset = offset.saturating_add(1);
                 }
             }
         }
