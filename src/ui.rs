@@ -13,7 +13,7 @@ use crate::{
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
-    style::Modifier,
+    style::{Modifier, Stylize},
     text::{Line, Span, Text},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
@@ -40,6 +40,7 @@ pub struct UiRegions {
     pub theme_options: Vec<Rect>,
     pub models: Vec<ModelRegion>,
     pub model_refresh: Option<Rect>,
+    pub context_usage: Option<Rect>,
 }
 
 impl UiRegions {
@@ -62,6 +63,14 @@ impl UiRegions {
             .is_some_and(|area| area.contains(position))
         {
             Some(UiTarget::ModelRefresh)
+        } else if self
+            .context_usage
+            .is_some_and(|area| area.contains(position))
+        {
+            self.context_usage.map(|area| UiTarget::ContextUsage {
+                column: column.saturating_sub(area.x),
+                row: row.saturating_sub(area.y),
+            })
         } else if let Some(region) = self
             .models
             .iter()
@@ -779,11 +788,16 @@ fn render_chat(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> U
     );
     regions.suggestions = render_suggestions(frame, suggestion_area, app, &suggestions, theme);
     regions.composer_input = Some(render_composer(frame, composer_area, app, theme));
-    render_session_usage(frame, area, app, theme);
+    regions.context_usage = render_session_usage(frame, area, app, theme);
     regions
 }
 
-fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+fn render_session_usage(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+) -> Option<Rect> {
     const WIDGET_WIDTH: u16 = 14;
     const WIDGET_HEIGHT: u16 = 6;
     const BAR_WIDTH: usize = 10;
@@ -791,7 +805,7 @@ fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
     // Keep the compact transcript readable at the documented 60-column
     // minimum. At normal widths the widget sits in the unused top-right area.
     if area.width < 70 || area.height < WIDGET_HEIGHT + 2 {
-        return;
+        return None;
     }
 
     let total_tokens = app.session_usage.total_tokens();
@@ -799,7 +813,7 @@ fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
         .session_usage
         .context_utilization_percent(app.current_model_context_window());
     if total_tokens.is_none() && context_percent.is_none() {
-        return;
+        return None;
     }
     let widget_area = Rect::new(
         area.x + area.width.saturating_sub(WIDGET_WIDTH + 1),
@@ -810,13 +824,14 @@ fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
     let token_text = total_tokens
         .map(format_token_count)
         .unwrap_or_else(|| "—".into());
+    // BUG: this is always showing as "- used"
     let context_text = context_percent
         .map(|percent| format!("{percent}%"))
         .unwrap_or_else(|| "—".into());
     let block = Block::bordered()
-        .title(" Context ")
+        .title(" context ")
         .border_set(theme.border_set())
-        .border_style(theme.style(ThemeRole::MutedText));
+        .border_style(theme.style(ThemeRole::Accent));
     let inner = block.inner(widget_area);
     frame.render_widget(Clear, widget_area);
     frame.render_widget(block, widget_area);
@@ -836,6 +851,34 @@ fn render_session_usage(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Th
         ])),
         inner,
     );
+    render_context_usage_pop(frame, widget_area, app, theme);
+    Some(widget_area)
+}
+
+fn render_context_usage_pop(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let symbol = match app.context_usage_pop_frames() {
+        5 => "·",
+        4 => "▪",
+        3 => "◆",
+        2 => "✦",
+        1 => "✹",
+        _ => return,
+    };
+    let Some((column, row)) = app.context_usage_pop_origin() else {
+        return;
+    };
+    let bubble_area = Rect::new(
+        area.x + column.min(area.width.saturating_sub(1)),
+        area.y + row.min(area.height.saturating_sub(1)),
+        1,
+        1,
+    );
+    frame.buffer_mut().set_string(
+        bubble_area.x,
+        bubble_area.y,
+        symbol,
+        theme.style(ThemeRole::Accent).add_modifier(Modifier::BOLD),
+    );
 }
 
 fn context_bar(percent: Option<u8>, width: usize, theme: &Theme) -> Line<'static> {
@@ -844,7 +887,8 @@ fn context_bar(percent: Option<u8>, width: usize, theme: &Theme) -> Line<'static
         .unwrap_or_default()
         .min(width);
     Line::from(vec![
-        Span::styled("█".repeat(filled), theme.style(ThemeRole::Accent)),
+        Span::styled("░".repeat(filled), theme.style(ThemeRole::Accent))
+            .add_modifier(Modifier::BOLD),
         Span::styled(
             "░".repeat(width.saturating_sub(filled)),
             theme.style(ThemeRole::MutedText),
@@ -876,11 +920,10 @@ fn render_suggestions(
         return Vec::new();
     }
 
-    let title = match suggestions[0].kind {
-        SuggestionKind::Command => " Commands ",
-        SuggestionKind::File => " Files ",
+    let block = match suggestions[0].kind {
+        SuggestionKind::Command => panel_block("", theme),
+        SuggestionKind::File => panel_block(" Files ", theme),
     };
-    let block = panel_block(title, theme);
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -888,24 +931,24 @@ fn render_suggestions(
     let mut regions = Vec::with_capacity(suggestions.len());
     for (index, suggestion) in suggestions.iter().enumerate() {
         let row = Rect::new(inner.x, inner.y + index as u16, inner.width, 1);
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {}", suggestion.label),
-                theme.style(ThemeRole::Accent),
-            ),
-            Span::styled(
-                format!("  {}", suggestion.description),
-                theme.style(ThemeRole::MutedText),
-            ),
-        ]);
-        let style = if index == app.selected_suggestion() {
+        let selected = index == app.selected_suggestion();
+        let style = if selected {
             theme
-                .style(ThemeRole::Text)
+                .style(ThemeRole::Accent)
                 .add_modifier(Modifier::REVERSED)
         } else {
             theme.style(ThemeRole::Text)
         };
-        frame.render_widget(Paragraph::new(line).style(style), row);
+        let label_style = if selected {
+            style
+        } else {
+            theme.style(ThemeRole::Accent)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(format!(" {}", suggestion.label), label_style))
+                .style(style),
+            row,
+        );
         regions.push(row);
     }
     regions
@@ -943,13 +986,13 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
     let active_mode = app.effective_mode();
     let mode_role = match active_mode {
         SessionMode::Plan => ThemeRole::PlanMode,
-        SessionMode::Build => ThemeRole::BuildMode,
+        SessionMode::Build => ThemeRole::Accent,
     };
     let mode_style = theme.style(mode_role).add_modifier(Modifier::BOLD);
     let title = Line::from(vec![
         Span::raw(" "),
         Span::styled(
-            "[ Plan ]",
+            ":: plan",
             if active_mode == SessionMode::Plan {
                 mode_style
             } else {
@@ -958,7 +1001,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
         ),
         Span::raw(" "),
         Span::styled(
-            "[ Build ]",
+            ":: build",
             if active_mode == SessionMode::Build {
                 mode_style
             } else {
@@ -1240,12 +1283,44 @@ mod tests {
             },
         });
 
-        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+        let (screen, _, regions, _) = render_to_string(&app, 100, 30);
 
-        assert!(screen.contains("Context"));
+        assert!(screen.contains("context"));
         assert!(screen.contains("300 tok"));
         assert!(screen.contains("25% used"));
-        assert!(screen.contains("███░░░░░░░"));
+        assert!(screen.contains("░░░░░░░░░░"));
+        let context_usage = regions.context_usage.unwrap();
+        assert_eq!(
+            regions.target_at(context_usage.x + 9, context_usage.y + 3),
+            Some(UiTarget::ContextUsage { column: 9, row: 3 })
+        );
+
+        app.handle_pointer(crate::app::PointerEvent::Activate(Some(
+            UiTarget::ContextUsage { column: 9, row: 3 },
+        )));
+        assert_eq!(app.context_usage_pop_origin(), Some((9, 3)));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, &app, &Theme::default());
+            })
+            .unwrap();
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell(Position::new(context_usage.x + 9, context_usage.y + 3))
+                .unwrap()
+                .symbol(),
+            "·"
+        );
+
+        for _ in 0..5 {
+            app.tick();
+        }
+        assert_eq!(app.context_usage_pop_frames(), 0);
+        assert_eq!(app.context_usage_pop_origin(), None);
     }
 
     #[test]
@@ -1285,7 +1360,7 @@ mod tests {
                 cell.style().bg == theme.style(crate::theme::ThemeRole::Surface).bg
             })
         );
-        let build = position_of(&terminal, "[ Build ]");
+        let build = position_of(&terminal, ":: build");
         assert!(regions.composer_input.is_some());
         assert_eq!(
             terminal
@@ -1295,7 +1370,7 @@ mod tests {
                 .unwrap()
                 .style()
                 .fg,
-            theme.style(crate::theme::ThemeRole::BuildMode).fg
+            theme.style(crate::theme::ThemeRole::Accent).fg
         );
         let composer_border = terminal
             .backend()
@@ -1303,10 +1378,7 @@ mod tests {
             .cell(Position::new(build.x.saturating_sub(11), build.y))
             .unwrap()
             .style();
-        assert_eq!(
-            composer_border.fg,
-            theme.style(crate::theme::ThemeRole::BuildMode).fg
-        );
+        assert_eq!(composer_border.fg, theme.style(crate::theme::ThemeRole::Text).fg);
     }
 
     #[test]
@@ -1468,7 +1540,7 @@ mod tests {
 
         let first = position_of(&terminal, "LINE01");
         let last = position_of(&terminal, "LINE18");
-        let composer_top = position_of(&terminal, "[ Plan ]").y;
+        let composer_top = position_of(&terminal, ":: plan").y;
         assert!(first.x >= 4, "text should have left padding");
         assert!(first.y >= composer_top + 2, "text should have top padding");
         assert_eq!(last.y, first.y + 17);
@@ -1488,8 +1560,8 @@ mod tests {
             .draw(|frame| regions = render(frame, &app, &Theme::default()))
             .unwrap();
 
-        let plan = position_of(&terminal, "[ Plan ]");
-        let build = position_of(&terminal, "[ Build ]");
+        let plan = position_of(&terminal, ":: plan");
+        let build = position_of(&terminal, ":: build");
         assert_eq!(regions.target_at(plan.x + 2, plan.y), None);
         assert_eq!(regions.target_at(build.x + 2, build.y), None);
     }
@@ -1525,31 +1597,42 @@ mod tests {
     }
 
     #[test]
-    fn selected_suggestion_has_visible_reverse_highlighting() {
-        let mut app = App::with_files(["src/app.rs", "src/main.rs"]);
+    fn selected_suggestion_fills_the_row_with_accent_and_hides_help_text() {
+        let mut app = App::new();
         app.screen = Screen::Chat;
-        app.composer.insert_text("@src/");
-        app.set_suggestion_selection(1);
+        app.composer.insert_text("/a");
+        let theme = Theme::default();
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut regions = UiRegions::default();
 
         terminal
-            .draw(|frame| regions = render(frame, &app, &Theme::default()))
+            .draw(|frame| regions = render(frame, &app, &theme))
             .unwrap();
 
-        let selected = regions.suggestions[1];
-        let style = terminal
-            .backend()
-            .buffer()
-            .cell(Position::new(selected.x, selected.y))
-            .unwrap()
-            .style();
-        assert!(
-            style
-                .add_modifier
-                .contains(ratatui::style::Modifier::REVERSED)
-        );
+        let selected = regions.suggestions[0];
+        let buffer = terminal.backend().buffer();
+        let accent = theme.style(ThemeRole::Accent).fg;
+        for column in [selected.x, selected.right().saturating_sub(1)] {
+            let style = buffer
+                .cell(Position::new(column, selected.y))
+                .unwrap()
+                .style();
+            assert_eq!(style.fg, accent);
+            assert!(style.add_modifier.contains(Modifier::REVERSED));
+        }
+        let selected_text =
+            (selected.x..selected.right()).fold(String::new(), |mut text, column| {
+                text.push_str(
+                    buffer
+                        .cell(Position::new(column, selected.y))
+                        .unwrap()
+                        .symbol(),
+                );
+                text
+            });
+        assert_eq!(selected_text.trim(), "/auth");
+        assert!(!terminal.backend().to_string().contains("Commands"));
     }
 
     #[test]

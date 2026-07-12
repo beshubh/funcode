@@ -910,6 +910,26 @@ mod tests {
     }
 
     #[test]
+    fn mouse_click_on_context_usage_starts_the_pop_feedback() {
+        let mut app = App::new();
+        let regions = UiRegions {
+            context_usage: Some(Rect::new(80, 1, 14, 6)),
+            ..UiRegions::default()
+        };
+
+        assert_eq!(
+            handle_mouse_event(
+                &mut app,
+                &regions,
+                mouse(MouseEventKind::Up(MouseButton::Left), 82, 3)
+            ),
+            None
+        );
+        assert_eq!(app.context_usage_pop_frames(), 5);
+        assert_eq!(app.context_usage_pop_origin(), Some((2, 2)));
+    }
+
+    #[test]
     fn mouse_hover_and_wheel_choose_suggestions() {
         let mut app = App::with_files(["src/app.rs", "src/main.rs"]);
         app.screen = Screen::Chat;

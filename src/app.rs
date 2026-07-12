@@ -24,6 +24,7 @@ use std::{
 
 const INTERRUPT_WINDOW: Duration = Duration::from_millis(500);
 const SCROLL_STEP: usize = 5;
+const CONTEXT_USAGE_POP_FRAMES: u8 = 5;
 pub(crate) const FILE_SUGGESTION_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -148,6 +149,7 @@ pub enum PointerTarget {
     Theme(usize),
     Model(usize),
     ModelRefresh,
+    ContextUsage { column: u16, row: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +229,8 @@ pub struct App {
     pub theme_dialog: Option<ThemeDialog>,
     pub(crate) models_dialog: Option<ModelsDialogPhase>,
     pub(crate) session_usage: SessionUsage,
+    context_usage_pop_frames: u8,
+    context_usage_pop_origin: Option<(u16, u16)>,
     large_paste_confirmation: Option<PasteProposal>,
     pending_submission: Option<PendingSubmission>,
     approved_draft: Option<(DocumentRevision, usize)>,
@@ -588,6 +592,14 @@ impl App {
                 (InputOwner::Models, Some(PointerTarget::ModelRefresh)) => self.refresh_models(),
                 (InputOwner::Suggestions, Some(PointerTarget::Suggestion(index))) => {
                     self.activate_suggestion(index)
+                }
+                (
+                    InputOwner::Composer | InputOwner::Suggestions,
+                    Some(PointerTarget::ContextUsage { column, row }),
+                ) => {
+                    self.context_usage_pop_frames = CONTEXT_USAGE_POP_FRAMES;
+                    self.context_usage_pop_origin = Some((column, row));
+                    None
                 }
                 (InputOwner::Composer, Some(PointerTarget::TranscriptEntry(entry_id))) => {
                     self.activate_transcript_entry(entry_id);
@@ -1117,10 +1129,15 @@ impl App {
     }
 
     pub fn tick(&mut self) -> bool {
-        let animation_visible = self.active_request.is_some();
+        let request_animation_visible = self.active_request.is_some();
         let previous_frame = self.animation_frame;
-        if animation_visible {
+        if request_animation_visible {
             self.animation_frame = self.animation_frame.wrapping_add(1);
+        }
+        let context_pop_visible = self.context_usage_pop_frames != 0;
+        self.context_usage_pop_frames = self.context_usage_pop_frames.saturating_sub(1);
+        if self.context_usage_pop_frames == 0 {
+            self.context_usage_pop_origin = None;
         }
         if self
             .last_escape
@@ -1128,9 +1145,18 @@ impl App {
         {
             self.last_escape = None;
         }
-        animation_visible
-            && (previous_frame / 2 != self.animation_frame / 2
-                || previous_frame / 5 != self.animation_frame / 5)
+        context_pop_visible
+            || (request_animation_visible
+                && (previous_frame / 2 != self.animation_frame / 2
+                    || previous_frame / 5 != self.animation_frame / 5))
+    }
+
+    pub(crate) const fn context_usage_pop_frames(&self) -> u8 {
+        self.context_usage_pop_frames
+    }
+
+    pub(crate) const fn context_usage_pop_origin(&self) -> Option<(u16, u16)> {
+        self.context_usage_pop_origin
     }
 
     pub fn toggle_entry(&mut self, entry_id: EntryId) {
