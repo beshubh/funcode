@@ -180,7 +180,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     let mut last_workspace_search: Option<(crate::composer::QueryId, Instant)> = None;
     let mut workspace_search_ready = false;
     let mut redraw = RedrawScheduler::default();
-    let mut deferred_preflight = None;
+    let mut preflight_scheduler = PreflightScheduler::default();
 
     while !should_quit {
         if let Some(workspace_runner) = workspace_runner.as_ref() {
@@ -206,8 +206,8 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                 redraw.mark_dirty();
             }
         }
-        if runner.as_ref().is_some_and(AgentTaskRunner::is_idle)
-            && let Some(preflight) = deferred_preflight.take()
+        if let Some(preflight) =
+            preflight_scheduler.take_if_idle(runner.as_ref().is_some_and(AgentTaskRunner::is_idle))
             && let Some(submission_runner) = submission_runner.as_ref()
         {
             start_preflight(&mut app, submission_runner, preflight);
@@ -227,7 +227,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                             auth_runner: &auth_runner,
                             clipboard: &clipboard,
                             theme_runner: theme_runner.as_ref(),
-                            deferred_preflight: &mut deferred_preflight,
+                            preflight_scheduler: &mut preflight_scheduler,
                         },
                     );
                 }
@@ -316,7 +316,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                                 auth_runner: &auth_runner,
                                 clipboard: &clipboard,
                                 theme_runner: theme_runner.as_ref(),
-                                deferred_preflight: &mut deferred_preflight,
+                                preflight_scheduler: &mut preflight_scheduler,
                             },
                         );
                     }
@@ -345,7 +345,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                                         auth_runner: &auth_runner,
                                         clipboard: &clipboard,
                                         theme_runner: theme_runner.as_ref(),
-                                        deferred_preflight: &mut deferred_preflight,
+                                        preflight_scheduler: &mut preflight_scheduler,
                                     },
                                 );
                             }
@@ -440,6 +440,43 @@ struct DeferredPreflight {
     mode: SessionMode,
 }
 
+#[derive(Default)]
+struct PreflightScheduler {
+    deferred: Option<DeferredPreflight>,
+}
+
+impl PreflightScheduler {
+    fn schedule(
+        &mut self,
+        agent_idle: bool,
+        preflight: DeferredPreflight,
+    ) -> Option<DeferredPreflight> {
+        if agent_idle {
+            Some(preflight)
+        } else {
+            self.deferred = Some(preflight);
+            None
+        }
+    }
+
+    fn take_if_idle(&mut self, agent_idle: bool) -> Option<DeferredPreflight> {
+        agent_idle.then(|| self.deferred.take()).flatten()
+    }
+
+    fn cancel(&mut self, draft_id: DraftId) -> bool {
+        if self
+            .deferred
+            .as_ref()
+            .is_some_and(|preflight| preflight.draft_id == draft_id)
+        {
+            self.deferred = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn start_preflight(
     app: &mut App,
     submission_runner: &SubmissionTaskRunner,
@@ -463,7 +500,7 @@ struct DispatchContext<'a> {
     auth_runner: &'a AuthTaskRunner,
     clipboard: &'a ClipboardTaskRunner,
     theme_runner: Option<&'a ThemeConfigTaskRunner>,
-    deferred_preflight: &'a mut Option<DeferredPreflight>,
+    preflight_scheduler: &'a mut PreflightScheduler,
 }
 
 fn dispatch(action: AppAction, context: DispatchContext<'_>) -> bool {
@@ -475,7 +512,7 @@ fn dispatch(action: AppAction, context: DispatchContext<'_>) -> bool {
         auth_runner,
         clipboard,
         theme_runner,
-        deferred_preflight,
+        preflight_scheduler,
     } = context;
     match action {
         AppAction::Preflight {
@@ -491,31 +528,23 @@ fn dispatch(action: AppAction, context: DispatchContext<'_>) -> bool {
                             .into(),
                     });
                 }
-                (Some(runner), Some(_)) if !runner.is_idle() => {
-                    *deferred_preflight = Some(DeferredPreflight {
+                (runner, Some(submission_runner)) => {
+                    let preflight = DeferredPreflight {
                         draft_id,
                         content,
                         mode,
-                    });
+                    };
+                    if let Some(preflight) = preflight_scheduler
+                        .schedule(runner.is_none_or(AgentTaskRunner::is_idle), preflight)
+                    {
+                        start_preflight(app, submission_runner, preflight);
+                    }
                 }
-                (_, Some(submission_runner)) => start_preflight(
-                    app,
-                    submission_runner,
-                    DeferredPreflight {
-                        draft_id,
-                        content,
-                        mode,
-                    },
-                ),
             }
             false
         }
         AppAction::CancelPreflight { draft_id } => {
-            if deferred_preflight
-                .as_ref()
-                .is_some_and(|preflight| preflight.draft_id == draft_id)
-            {
-                *deferred_preflight = None;
+            if preflight_scheduler.cancel(draft_id) {
                 let _ = app.handle_submission_event(SubmissionEvent::Cancelled { draft_id });
                 return false;
             }
@@ -743,8 +772,9 @@ fn install_restoring_panic_hook(keyboard_enhancement: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DispatchContext, LaunchMode, RedrawScheduler, SelectionMouseEvent, dispatch,
-        handle_clipboard_event, handle_mouse_event, handle_selection_mouse_event,
+        DeferredPreflight, DispatchContext, LaunchMode, PreflightScheduler, RedrawScheduler,
+        SelectionMouseEvent, dispatch, handle_clipboard_event, handle_mouse_event,
+        handle_selection_mouse_event,
     };
     use crate::{
         app::{App, AppAction, Screen},
@@ -767,6 +797,34 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    fn preflight(draft_id: u64) -> DeferredPreflight {
+        DeferredPreflight {
+            draft_id,
+            content: crate::composer::SubmittedContent::plain("draft"),
+            mode: crate::session::SessionMode::Build,
+        }
+    }
+
+    #[test]
+    fn deferred_preflight_starts_once_after_the_agent_becomes_idle() {
+        let mut scheduler = PreflightScheduler::default();
+
+        assert!(scheduler.schedule(false, preflight(7)).is_none());
+        assert!(scheduler.take_if_idle(false).is_none());
+        assert_eq!(scheduler.take_if_idle(true).unwrap().draft_id, 7);
+        assert!(scheduler.take_if_idle(true).is_none());
+    }
+
+    #[test]
+    fn cancelling_a_deferred_preflight_prevents_a_late_start() {
+        let mut scheduler = PreflightScheduler::default();
+        assert!(scheduler.schedule(false, preflight(9)).is_none());
+
+        assert!(scheduler.cancel(9));
+        assert!(!scheduler.cancel(9));
+        assert!(scheduler.take_if_idle(true).is_none());
     }
 
     #[test]
@@ -1071,7 +1129,7 @@ mod tests {
         let mut app = App::new();
         let mut auth_runner = AuthTaskRunner::spawn();
         let mut clipboard = ClipboardTaskRunner::spawn_with(RecordingClipboard);
-        let mut deferred_preflight = None;
+        let mut preflight_scheduler = PreflightScheduler::default();
 
         assert!(!dispatch(
             AppAction::CopyToClipboard {
@@ -1085,7 +1143,7 @@ mod tests {
                 auth_runner: &auth_runner,
                 clipboard: &clipboard,
                 theme_runner: None,
-                deferred_preflight: &mut deferred_preflight,
+                preflight_scheduler: &mut preflight_scheduler,
             },
         ));
         handle_clipboard_event(

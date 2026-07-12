@@ -1,7 +1,7 @@
 use super::{
     AgentTool, ToolDisplay, ToolExecutionContext, ToolFailure, ToolInvocation, ToolResult, ToolSpec,
 };
-use crate::session::SessionMode;
+use crate::{session::SessionMode, workspace::WorkspacePath};
 use futures::future::BoxFuture;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -122,7 +122,7 @@ fn search_files(
         match args.mode {
             SearchMode::Path => {
                 if expression.is_match(&relative) {
-                    matches.push(relative);
+                    matches.push(WorkspacePath::from_raw(relative).display());
                 }
             }
             SearchMode::Content => search_content(
@@ -174,14 +174,15 @@ fn search_content(
     limit: usize,
     matches: &mut Vec<String>,
 ) -> Result<(), ToolFailure> {
+    let display_relative = WorkspacePath::from_raw(relative).display();
     let metadata = fs::metadata(path).map_err(|error| {
-        ToolFailure::infrastructure(format!("could not inspect '{relative}': {error}"))
+        ToolFailure::infrastructure(format!("could not inspect '{display_relative}': {error}"))
     })?;
     if metadata.len() > MAX_SEARCH_FILE_BYTES {
         return Ok(());
     }
     let bytes = fs::read(path).map_err(|error| {
-        ToolFailure::infrastructure(format!("could not read '{relative}': {error}"))
+        ToolFailure::infrastructure(format!("could not read '{display_relative}': {error}"))
     })?;
     if bytes.contains(&0) {
         return Ok(());
@@ -202,7 +203,7 @@ fn search_content(
             .map(|(context_index, context)| {
                 let line_number = from + context_index + 1;
                 let marker = if line_number == index + 1 { ':' } else { '-' };
-                format!("{relative}{marker}{line_number}{marker}{context}")
+                format!("{display_relative}{marker}{line_number}{marker}{context}")
             })
             .collect::<Vec<_>>()
             .join("\n");

@@ -515,6 +515,31 @@ mod tests {
         assert!(!output.contains("hidden_marker"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_results_escape_control_bearing_paths_reversibly() {
+        let root = tempfile::tempdir().expect("temporary workspace should be created");
+        fs::write(root.path().join("line\nbreak.txt"), "match\n")
+            .expect("control-bearing fixture should be written");
+
+        let (output, _) = execute(
+            root.path(),
+            SessionMode::Build,
+            "search_files",
+            json!({ "mode": "path", "query": "line" }),
+        )
+        .await;
+
+        assert!(output.contains(r"line\nbreak.txt"));
+        assert!(!output.contains("line\nbreak.txt"));
+        assert_eq!(
+            crate::workspace::WorkspacePath::from_display(r"line\nbreak.txt")
+                .unwrap()
+                .raw(),
+            "line\nbreak.txt"
+        );
+    }
+
     #[tokio::test]
     async fn search_limit_counts_matches_and_keeps_each_context_snippet_whole() {
         let root = tempfile::tempdir().expect("temporary workspace should be created");

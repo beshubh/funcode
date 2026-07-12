@@ -1841,6 +1841,37 @@ mod tests {
     }
 
     #[test]
+    fn prepared_result_after_preflight_cancellation_is_ignored() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("keep this draft");
+        let before = app.composer.freeze();
+        let Some(AppAction::Preflight {
+            draft_id,
+            content,
+            mode,
+        }) = app.handle_key(key(KeyCode::Enter), Instant::now())
+        else {
+            panic!("Enter should start preflight");
+        };
+        let request = crate::submission::PreparedRequest::for_test(content, mode);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc), Instant::now()),
+            Some(AppAction::CancelPreflight { draft_id })
+        );
+
+        assert_eq!(
+            app.handle_submission_event(crate::submission::SubmissionEvent::Prepared {
+                draft_id,
+                request,
+            }),
+            None
+        );
+        assert_eq!(app.composer.freeze(), before);
+        assert!(app.transcript.entries().is_empty());
+    }
+
+    #[test]
     fn failed_preflight_restores_the_draft_without_a_transcript_entry() {
         let mut app = App::new();
         app.screen = Screen::Chat;
