@@ -1,15 +1,18 @@
 use crate::{
-    composer::SessionMode,
     llm::{ConversationCommit, LlmClient, LlmEvent},
-    tools::{ReadFile, ToolDisplay, ToolEvent, ToolSession, WorkspaceFileReader},
-    transcript::{Attachment, ToolArtifact, ToolCallId},
+    submission::{PreparedAttachment, PreparedRequest},
+    tools::{ToolDisplay, ToolEvent, ToolSession},
+    transcript::{ToolArtifact, ToolCallId},
 };
 use futures::StreamExt as _;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     fmt,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     thread::{self, JoinHandle},
 };
 use tokio::{sync::mpsc as async_mpsc, task::JoinHandle as AsyncJoinHandle};
@@ -68,9 +71,7 @@ pub enum AgentEvent {
 enum AgentCommand {
     Submit {
         request_id: RequestId,
-        prompt: String,
-        attachments: Vec<Attachment>,
-        mode: SessionMode,
+        request: Arc<PreparedRequest>,
     },
     Cancel {
         request_id: RequestId,
@@ -108,13 +109,11 @@ impl AgentTaskRunner {
         let (command_tx, command_rx) = async_mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
-            let workspace_reader = WorkspaceFileReader::new(workspace_root)
-                .expect("failed to configure the workspace file reader");
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to create the LLM runtime");
-            runtime.block_on(run_coordinator(command_rx, event_tx, llm, workspace_reader));
+            runtime.block_on(run_coordinator(command_rx, event_tx, llm, workspace_root));
         });
 
         Self {
@@ -124,32 +123,15 @@ impl AgentTaskRunner {
         }
     }
 
-    pub fn submit(&self, request_id: RequestId, prompt: String) -> Result<(), RunnerUnavailable> {
-        self.submit_with_attachments(request_id, prompt, Vec::new())
-    }
-
-    pub fn submit_with_attachments(
+    pub fn submit_prepared(
         &self,
         request_id: RequestId,
-        prompt: String,
-        attachments: Vec<Attachment>,
-    ) -> Result<(), RunnerUnavailable> {
-        self.submit_with_attachments_and_mode(request_id, prompt, attachments, SessionMode::Build)
-    }
-
-    pub fn submit_with_attachments_and_mode(
-        &self,
-        request_id: RequestId,
-        prompt: String,
-        attachments: Vec<Attachment>,
-        mode: SessionMode,
+        request: Arc<PreparedRequest>,
     ) -> Result<(), RunnerUnavailable> {
         self.commands
             .send(AgentCommand::Submit {
                 request_id,
-                prompt,
-                attachments,
-                mode,
+                request,
             })
             .map_err(|_| RunnerUnavailable)
     }
@@ -189,9 +171,7 @@ impl Drop for AgentTaskRunner {
 #[derive(Debug)]
 struct PendingRequest {
     request_id: RequestId,
-    prompt: String,
-    attachments: Vec<Attachment>,
-    mode: SessionMode,
+    request: Arc<PreparedRequest>,
 }
 
 struct ActiveRequest {
@@ -246,25 +226,17 @@ async fn run_coordinator(
     commands: async_mpsc::UnboundedReceiver<AgentCommand>,
     events: Sender<AgentEvent>,
     llm: LlmClient,
-    workspace_reader: WorkspaceFileReader,
+    workspace_root: PathBuf,
 ) {
     let (update_tx, update_rx) = async_mpsc::unbounded_channel();
-    run_coordinator_with_updates(
-        commands,
-        events,
-        llm,
-        workspace_reader,
-        update_tx,
-        update_rx,
-    )
-    .await;
+    run_coordinator_with_updates(commands, events, llm, workspace_root, update_tx, update_rx).await;
 }
 
 async fn run_coordinator_with_updates(
     mut commands: async_mpsc::UnboundedReceiver<AgentCommand>,
     events: Sender<AgentEvent>,
     llm: LlmClient,
-    workspace_reader: WorkspaceFileReader,
+    workspace_root: PathBuf,
     update_tx: async_mpsc::UnboundedSender<RequestUpdate>,
     mut update_rx: async_mpsc::UnboundedReceiver<RequestUpdate>,
 ) {
@@ -287,7 +259,7 @@ async fn run_coordinator_with_updates(
             let task = tokio::spawn(run_request(
                 request,
                 llm.clone(),
-                workspace_reader.clone(),
+                workspace_root.clone(),
                 update_tx.clone(),
             ));
             active = Some(ActiveRequest { request_id, task });
@@ -295,8 +267,8 @@ async fn run_coordinator_with_updates(
 
         tokio::select! {
             command = commands.recv() => match command {
-                Some(AgentCommand::Submit { request_id, prompt, attachments, mode }) => {
-                    pending.push_back(PendingRequest { request_id, prompt, attachments, mode });
+                Some(AgentCommand::Submit { request_id, request }) => {
+                    pending.push_back(PendingRequest { request_id, request });
                 }
                 Some(AgentCommand::Cancel { request_id }) => {
                     if active.as_ref().map(|request| request.request_id) == Some(request_id) {
@@ -382,30 +354,18 @@ async fn run_coordinator_with_updates(
 async fn run_request(
     request: PendingRequest,
     llm: LlmClient,
-    workspace_reader: WorkspaceFileReader,
+    workspace_root: PathBuf,
     updates: async_mpsc::UnboundedSender<RequestUpdate>,
 ) {
     let request_id = request.request_id;
-    let files = match read_attachments(
-        request_id,
-        &request.attachments,
-        &workspace_reader,
-        &updates,
-    ) {
-        Ok(files) => files,
-        Err(message) => {
-            let _ = updates.send(RequestUpdate::Failed {
-                request_id,
-                message,
-            });
-            return;
-        }
-    };
-    let prompt = prompt_with_attachments(request.prompt.clone(), &files);
+    if emit_prepared_attachment_events(request_id, request.request.attachments(), &updates).is_err()
+    {
+        return;
+    }
     let (tool_events_tx, mut tool_events_rx) = async_mpsc::unbounded_channel();
     let tools = match ToolSession::new(
-        workspace_reader.root(),
-        request.mode,
+        workspace_root,
+        request.request.mode(),
         tool_events_tx,
         request_id,
     ) {
@@ -419,7 +379,11 @@ async fn run_request(
         }
     };
     let mut stream = match llm
-        .stream_with_tools(prompt, request.prompt, request.mode, Some(tools))
+        .stream_prepared_with_tools(
+            request.request.model_prompt().to_owned(),
+            request.request.history_prompt().to_owned(),
+            Some(tools),
+        )
         .await
     {
         Ok(stream) => stream,
@@ -536,7 +500,7 @@ fn display_to_artifact(display: ToolDisplay) -> ToolArtifact {
             end_line,
             content,
         } => ToolArtifact::CodeRange {
-            path,
+            path: path.into(),
             start_line,
             end_line,
             preview: Some(content),
@@ -544,7 +508,10 @@ fn display_to_artifact(display: ToolDisplay) -> ToolArtifact {
         ToolDisplay::SearchResults { query, matches } => {
             ToolArtifact::SearchResults { query, matches }
         }
-        ToolDisplay::Patch { path, diff } => ToolArtifact::Patch { path, diff },
+        ToolDisplay::Patch { path, diff } => ToolArtifact::Patch {
+            path: path.into(),
+            diff,
+        },
         ToolDisplay::Terminal {
             description,
             command,
@@ -559,94 +526,58 @@ fn display_to_artifact(display: ToolDisplay) -> ToolArtifact {
     }
 }
 
-fn read_attachments(
+fn emit_prepared_attachment_events(
     request_id: RequestId,
-    attachments: &[Attachment],
-    reader: &WorkspaceFileReader,
+    attachments: &[PreparedAttachment],
     updates: &async_mpsc::UnboundedSender<RequestUpdate>,
-) -> Result<Vec<ReadFile>, String> {
-    let mut paths = HashSet::new();
-    attachments
-        .iter()
-        .filter(|attachment| paths.insert(attachment.path.as_str()))
-        .enumerate()
-        .map(|(index, attachment)| {
-            let call_id = attachment_call_id(request_id, index);
-            updates
-                .send(RequestUpdate::ToolStarted {
-                    request_id,
-                    call_id,
-                    name: "read_workspace_file".into(),
-                    summary: format!("Reading {}", attachment.path),
-                    artifacts: Vec::new(),
-                })
-                .map_err(|_| "the agent updates channel is unavailable".to_owned())?;
-            match reader.read(&attachment.path) {
-                Ok(file) => {
-                    updates
-                        .send(RequestUpdate::ToolFinished {
-                            request_id,
-                            call_id,
-                            summary: None,
-                            artifacts: vec![ToolArtifact::CodeRange {
-                                path: file.path.clone(),
-                                start_line: 1,
-                                end_line: file.line_count,
-                                preview: Some(file.preview.clone()),
-                            }],
-                        })
-                        .map_err(|_| "the agent updates channel is unavailable".to_owned())?;
-                    Ok(file)
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    let _ = updates.send(RequestUpdate::ToolFailed {
-                        request_id,
-                        call_id,
-                        message: message.clone(),
-                    });
-                    Err(message)
-                }
-            }
-        })
-        .collect()
+) -> Result<(), ()> {
+    for (index, attachment) in attachments.iter().enumerate() {
+        let call_id = attachment_call_id(request_id, index);
+        let display_path = attachment.path().display();
+        updates
+            .send(RequestUpdate::ToolStarted {
+                request_id,
+                call_id,
+                name: "read_workspace_file".into(),
+                summary: format!("Reading {display_path}"),
+                artifacts: Vec::new(),
+            })
+            .map_err(|_| ())?;
+        updates
+            .send(RequestUpdate::ToolFinished {
+                request_id,
+                call_id,
+                summary: None,
+                artifacts: vec![ToolArtifact::CodeRange {
+                    path: attachment.path().clone(),
+                    start_line: 1,
+                    end_line: attachment.line_count(),
+                    preview: Some(attachment.preview().to_owned()),
+                }],
+            })
+            .map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 fn attachment_call_id(request_id: RequestId, index: usize) -> ToolCallId {
     request_id.wrapping_shl(32).wrapping_add(index as u64)
 }
 
-fn prompt_with_attachments(prompt: String, files: &[ReadFile]) -> String {
-    if files.is_empty() {
-        return prompt;
-    }
-
-    let content = files
-        .iter()
-        .map(|file| {
-            format!(
-                "<attached-file path=\"{}\">\n{}\n</attached-file>",
-                file.path, file.content
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    format!("{prompt}\n\nThe user explicitly attached these workspace files:\n\n{content}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCommand, AgentEvent, AgentTaskRunner, RequestUpdate, prompt_with_attachments,
-        read_attachments, run_coordinator_with_updates,
+        AgentCommand, AgentEvent, AgentTaskRunner, RequestUpdate, run_coordinator_with_updates,
     };
-    use crate::composer::SessionMode;
+    use crate::composer::SubmittedContent;
     use crate::llm::{
         ConversationMessage, LlmClient, LlmError, Provider, ProviderEvent, ProviderRequest,
         ProviderStream,
     };
-    use crate::tools::{ReadFile, WorkspaceFileReader};
+    use crate::session::SessionMode;
+    use crate::submission::{PreparedRequest, SubmissionEvent, SubmissionTaskRunner};
     use crate::transcript::ToolArtifact;
+    use crate::workspace::Attachment;
     use futures::{StreamExt as _, future::BoxFuture, stream};
     use std::{
         fs,
@@ -655,39 +586,14 @@ mod tests {
         time::Duration,
     };
 
-    #[test]
-    fn loaded_attachment_contents_are_provided_to_the_model() {
-        let prompt = prompt_with_attachments(
-            "Review this".into(),
-            &[ReadFile {
-                path: "src/app.rs".into(),
-                content: "fn main() {}".into(),
-                line_count: 1,
-                preview: "fn main() {}".into(),
-            }],
-        );
-
-        assert!(prompt.contains("src/app.rs"));
-        assert!(prompt.contains("fn main() {}"));
+    fn prepared(prompt: &str) -> Arc<PreparedRequest> {
+        PreparedRequest::for_test(SubmittedContent::plain(prompt), SessionMode::Build)
     }
 
-    #[test]
-    fn duplicate_attachment_paths_are_read_once_in_first_mention_order() {
-        let reader = WorkspaceFileReader::from_current_dir().unwrap();
-        let (updates, _update_rx) = tokio::sync::mpsc::unbounded_channel();
-        let files = read_attachments(
-            1,
-            &[
-                crate::transcript::Attachment::workspace_file("Cargo.toml"),
-                crate::transcript::Attachment::workspace_file("Cargo.toml"),
-            ],
-            &reader,
-            &updates,
-        )
-        .unwrap();
-
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "Cargo.toml");
+    fn submit(runner: &AgentTaskRunner, request_id: u64, prompt: &str) {
+        runner
+            .submit_prepared(request_id, prepared(prompt))
+            .unwrap();
     }
 
     #[test]
@@ -696,13 +602,29 @@ mod tests {
         fs::write(workspace.path().join("project.txt"), "selected workspace").unwrap();
         let client = LlmClient::with_provider(Arc::new(EchoProvider));
         let mut runner = AgentTaskRunner::spawn_in(client, workspace.path().to_owned());
-        runner
-            .submit_with_attachments(
+        let preflight = SubmissionTaskRunner::spawn(workspace.path().to_owned());
+        preflight
+            .request(
                 3,
-                "Review this".into(),
-                vec![crate::transcript::Attachment::workspace_file("project.txt")],
+                SubmittedContent::with_attachments(
+                    "Review this",
+                    &[Attachment::workspace_file("project.txt")],
+                ),
+                SessionMode::Build,
             )
             .unwrap();
+        let request = loop {
+            if let Some(SubmissionEvent::Prepared { request, .. }) = preflight.try_event() {
+                break request;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        fs::write(
+            workspace.path().join("project.txt"),
+            "changed after preflight",
+        )
+        .unwrap();
+        runner.submit_prepared(3, request).unwrap();
 
         let mut events = Vec::new();
         while !events.contains(&AgentEvent::Completed { request_id: 3 }) {
@@ -713,6 +635,12 @@ mod tests {
             event,
             AgentEvent::ToolStarted { request_id: 3, name, .. }
                 if name == "read_workspace_file"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta { text, .. }
+                if text.contains("selected workspace")
+                    && !text.contains("changed after preflight")
         )));
         assert!(events.iter().any(|event| matches!(
             event,
@@ -851,8 +779,8 @@ mod tests {
     fn queued_requests_stream_to_completion_in_fifo_order() {
         let client = LlmClient::with_provider(Arc::new(EchoProvider));
         let mut runner = AgentTaskRunner::spawn(client);
-        runner.submit(1, "first".into()).unwrap();
-        runner.submit(2, "second".into()).unwrap();
+        submit(&runner, 1, "first");
+        submit(&runner, 2, "second");
 
         let mut events = Vec::new();
         while !events.contains(&AgentEvent::Completed { request_id: 2 }) {
@@ -883,7 +811,7 @@ mod tests {
     fn tool_failure_can_retry_across_rounds_with_text_before_and_after() {
         let client = LlmClient::with_provider(Arc::new(MultiRoundToolProvider));
         let mut runner = AgentTaskRunner::spawn(client);
-        runner.submit(21, "inspect".into()).unwrap();
+        submit(&runner, 21, "inspect");
 
         let mut events = Vec::new();
         while !events.contains(&AgentEvent::Completed { request_id: 21 }) {
@@ -923,8 +851,8 @@ mod tests {
     fn interrupting_the_active_request_continues_with_the_next_queued_request() {
         let client = LlmClient::with_provider(Arc::new(BlockingFirstProvider));
         let mut runner = AgentTaskRunner::spawn(client);
-        runner.submit(1, "first".into()).unwrap();
-        runner.submit(2, "second".into()).unwrap();
+        submit(&runner, 1, "first");
+        submit(&runner, 2, "second");
 
         assert_eq!(
             runner.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -956,8 +884,8 @@ mod tests {
     fn provider_failure_only_fails_the_active_request() {
         let client = LlmClient::with_provider(Arc::new(FailingFirstProvider));
         let mut runner = AgentTaskRunner::spawn(client);
-        runner.submit(1, "first".into()).unwrap();
-        runner.submit(2, "second".into()).unwrap();
+        submit(&runner, 1, "first");
+        submit(&runner, 2, "second");
 
         let mut events = Vec::new();
         while !events.contains(&AgentEvent::Completed { request_id: 2 }) {
@@ -984,7 +912,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
         let coordinator_update_tx = update_tx.clone();
-        let workspace_reader = WorkspaceFileReader::from_current_dir().unwrap();
+        let workspace_root = std::env::current_dir().unwrap();
         let coordinator = thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -994,7 +922,7 @@ mod tests {
                     command_rx,
                     event_tx,
                     client,
-                    workspace_reader,
+                    workspace_root,
                     coordinator_update_tx,
                     update_rx,
                 ));
@@ -1003,9 +931,7 @@ mod tests {
         command_tx
             .send(AgentCommand::Submit {
                 request_id: 1,
-                prompt: "first".into(),
-                attachments: Vec::new(),
-                mode: SessionMode::Build,
+                request: prepared("first"),
             })
             .unwrap();
         assert_eq!(
@@ -1029,9 +955,7 @@ mod tests {
         command_tx
             .send(AgentCommand::Submit {
                 request_id: 2,
-                prompt: "second".into(),
-                attachments: Vec::new(),
-                mode: SessionMode::Build,
+                request: prepared("second"),
             })
             .unwrap();
 

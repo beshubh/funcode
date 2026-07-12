@@ -1,5 +1,6 @@
 use crate::{
     app::App,
+    composer::DisplayRunKind,
     theme::{Theme, ThemeRole},
     transcript::{ActivityStatus, AssistantStatus, Entry, EntryId, EntryKind, ToolArtifact},
 };
@@ -7,8 +8,11 @@ use ratatui::{
     Frame,
     layout::{Margin, Rect},
     text::{Line, Span, Text},
-    widgets::{Paragraph, Wrap},
+    widgets::Paragraph,
 };
+use std::sync::Arc;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntryRegion {
@@ -34,24 +38,29 @@ pub(super) fn render(
         return Vec::new();
     }
 
-    let width = content_area.width.max(1);
-    let mut lines = Vec::new();
-    let mut spans = Vec::new();
+    let width = content_area.width.max(1) as usize;
+    let mut measured = Vec::with_capacity(app.transcript.entries().len());
     let mut next_line = 0usize;
 
     for entry in app.transcript.entries() {
-        let entry_lines = entry_lines(entry, app, theme);
-        let height = wrapped_height(&entry_lines, width);
+        let user_layout = match &entry.kind {
+            EntryKind::User(message) => {
+                Some(message.content.layout(width.saturating_sub(4).max(1)))
+            }
+            _ => None,
+        };
+        let height = user_layout.as_ref().map_or_else(
+            || wrapped_height(&entry_lines(entry, app, theme), width),
+            |layout| layout.total_rows().saturating_add(2),
+        );
         let start = next_line;
         next_line += height;
-        let interactive = matches!(
-            entry.kind,
-            EntryKind::User(_) | EntryKind::Reasoning(_) | EntryKind::Tool(_)
-        );
-        if interactive {
-            spans.push((entry.id, start, next_line));
-        }
-        lines.extend(entry_lines);
+        measured.push(MeasuredEntry {
+            entry,
+            start,
+            end: next_line,
+            user_layout,
+        });
     }
 
     let viewport_area = if app.follow_output {
@@ -71,43 +80,154 @@ pub(super) fn render(
             content_area.height.saturating_sub(1),
         )
     };
-    let text = Text::from(lines);
-    let line_count = wrapped_height(&text.lines, width);
+    let line_count = next_line;
     let viewport_height = viewport_area.height as usize;
     let maximum_top = line_count.saturating_sub(viewport_height);
     let from_bottom = app.scroll_from_bottom.min(maximum_top);
     let top = maximum_top.saturating_sub(from_bottom);
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .scroll((top.min(u16::MAX as usize) as u16, 0)),
-        viewport_area,
-    );
-
-    spans
-        .into_iter()
-        .filter_map(|(id, start, end)| visible_region(id, start, end, top, viewport_area))
-        .collect()
+    let mut regions = Vec::new();
+    for measured in measured {
+        let visible_start = measured.start.max(top);
+        let visible_end = measured
+            .end
+            .min(top.saturating_add(viewport_area.height as usize));
+        if visible_start >= visible_end {
+            continue;
+        }
+        let local = visible_start.saturating_sub(measured.start)
+            ..visible_end.saturating_sub(measured.start);
+        let area = Rect::new(
+            viewport_area.x,
+            viewport_area
+                .y
+                .saturating_add((visible_start - top).min(u16::MAX as usize) as u16),
+            viewport_area.width,
+            (visible_end - visible_start).min(u16::MAX as usize) as u16,
+        );
+        let lines = if let (EntryKind::User(message), Some(layout)) =
+            (&measured.entry.kind, measured.user_layout.as_ref())
+        {
+            visible_user_lines(message, layout, local, theme)
+        } else {
+            visible_wrapped_lines(&entry_lines(measured.entry, app, theme), width, local)
+        };
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        if matches!(
+            measured.entry.kind,
+            EntryKind::User(_) | EntryKind::Reasoning(_) | EntryKind::Tool(_)
+        ) {
+            regions.push(EntryRegion {
+                id: measured.entry.id,
+                area,
+            });
+        }
+    }
+    regions
 }
 
-fn visible_region(
-    id: EntryId,
+struct MeasuredEntry<'a> {
+    entry: &'a Entry,
     start: usize,
     end: usize,
-    top: usize,
-    area: Rect,
-) -> Option<EntryRegion> {
-    let visible_start = start.max(top);
-    let visible_end = end.min(top + area.height as usize);
-    (visible_start < visible_end).then(|| EntryRegion {
-        id,
-        area: Rect::new(
-            area.x,
-            area.y + (visible_start - top).min(u16::MAX as usize) as u16,
-            area.width,
-            (visible_end - visible_start).min(u16::MAX as usize) as u16,
-        ),
-    })
+    user_layout: Option<Arc<crate::composer::ComposerLayout>>,
+}
+
+fn visible_user_lines(
+    _message: &crate::transcript::UserMessage,
+    layout: &crate::composer::ComposerLayout,
+    range: std::ops::Range<usize>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let content_rows = layout.total_rows();
+    let visible_start = range.start.max(1).saturating_sub(1).min(content_rows);
+    let visible_end = range
+        .end
+        .min(content_rows.saturating_add(1))
+        .saturating_sub(1)
+        .max(visible_start);
+    let mut visible = layout
+        .visible_rows(visible_start, visible_end.saturating_sub(visible_start))
+        .into_iter();
+    range
+        .filter_map(|row| {
+            if row == 0 {
+                Some(Line::from(vec![
+                    Span::styled(
+                        "┌─ you",
+                        theme
+                            .style(ThemeRole::User)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                    Span::styled(" · click to open", theme.style(ThemeRole::MutedText)),
+                ]))
+            } else if row <= content_rows {
+                let line = visible.next()?;
+                let mut spans = vec![Span::styled("│ ", theme.style(ThemeRole::MutedText))];
+                spans.extend(line.runs.into_iter().map(|run| {
+                    let style = match run.kind {
+                        DisplayRunKind::Text => theme.style(ThemeRole::Text),
+                        DisplayRunKind::FileReference | DisplayRunKind::PastedBlock => {
+                            theme.accent_badge()
+                        }
+                    };
+                    Span::styled(run.text, style)
+                }));
+                Some(Line::from(spans))
+            } else if row == content_rows.saturating_add(1) {
+                Some(Line::styled(
+                    "└",
+                    theme
+                        .style(ThemeRole::User)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+fn visible_wrapped_lines(
+    lines: &[Line<'static>],
+    width: usize,
+    range: std::ops::Range<usize>,
+) -> Vec<Line<'static>> {
+    let mut output = Vec::with_capacity(range.len());
+    let mut wrapped_row = 0usize;
+    'lines: for line in lines {
+        let mut spans = Vec::new();
+        let mut column = 0usize;
+        for span in &line.spans {
+            for grapheme in span.content.graphemes(true) {
+                let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+                if column > 0 && column.saturating_add(grapheme_width) > width {
+                    if range.contains(&wrapped_row) {
+                        output.push(Line::from(std::mem::take(&mut spans)));
+                    } else {
+                        spans.clear();
+                    }
+                    wrapped_row = wrapped_row.saturating_add(1);
+                    column = 0;
+                    if wrapped_row >= range.end {
+                        break 'lines;
+                    }
+                }
+                spans.push(Span::styled(
+                    grapheme.to_owned(),
+                    line.style.patch(span.style),
+                ));
+                column = column.saturating_add(grapheme_width);
+            }
+        }
+        if range.contains(&wrapped_row) {
+            output.push(Line::from(spans));
+        }
+        wrapped_row = wrapped_row.saturating_add(1);
+        if wrapped_row >= range.end {
+            break;
+        }
+    }
+    output
 }
 
 fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
@@ -122,17 +242,19 @@ fn entry_lines(entry: &Entry, app: &App, theme: &Theme) -> Vec<Line<'static>> {
                 ),
                 Span::styled(" · click to open", theme.style(ThemeRole::MutedText)),
             ])];
-            lines.extend(
-                message
-                    .content
-                    .lines(theme.style(ThemeRole::Text), theme.accent_badge())
-                    .into_iter()
-                    .map(|line| {
-                        let mut spans = vec![Span::styled("│ ", theme.style(ThemeRole::MutedText))];
-                        spans.extend(line.spans);
-                        Line::from(spans)
-                    }),
-            );
+            lines.extend(message.content.display_lines(2).into_iter().map(|line| {
+                let mut spans = vec![Span::styled("│ ", theme.style(ThemeRole::MutedText))];
+                spans.extend(line.runs.into_iter().map(|run| {
+                    let style = match run.kind {
+                        DisplayRunKind::Text => theme.style(ThemeRole::Text),
+                        DisplayRunKind::FileReference | DisplayRunKind::PastedBlock => {
+                            theme.accent_badge()
+                        }
+                    };
+                    Span::styled(run.text, style)
+                }));
+                Line::from(spans)
+            }));
             lines.push(Line::styled(
                 "└",
                 theme
@@ -269,8 +391,18 @@ fn message_lines(text: &str, style: ratatui::style::Style) -> Vec<Line<'static>>
     if text.is_empty() {
         vec![Line::styled("│", style)]
     } else {
-        text.split('\n')
-            .map(|line| Line::styled(format!("│ {line}"), style))
+        crate::composer::SubmittedContent::plain(text)
+            .display_lines(2)
+            .into_iter()
+            .map(|line| {
+                let mut spans = vec![Span::styled("│ ", style)];
+                spans.extend(
+                    line.runs
+                        .into_iter()
+                        .map(|run| Span::styled(run.text, style)),
+                );
+                Line::from(spans)
+            })
             .collect()
     }
 }
@@ -284,7 +416,7 @@ fn artifact_lines(artifact: &ToolArtifact, theme: &Theme) -> Vec<Line<'static>> 
             preview,
         } => {
             let mut lines = vec![Line::styled(
-                format!("│ Read {path}:{start_line}-{end_line}"),
+                format!("│ Read {}:{start_line}-{end_line}", path.display()),
                 theme.style(ThemeRole::Accent),
             )];
             if let Some(preview) = preview {
@@ -294,7 +426,7 @@ fn artifact_lines(artifact: &ToolArtifact, theme: &Theme) -> Vec<Line<'static>> 
         }
         ToolArtifact::Patch { path, diff } => {
             let mut lines = vec![Line::styled(
-                format!("│ Edited {path}"),
+                format!("│ Edited {}", path.display()),
                 theme.style(ThemeRole::Accent),
             )];
             lines.extend(diff.lines().map(|line| {
@@ -348,7 +480,7 @@ fn artifact_lines(artifact: &ToolArtifact, theme: &Theme) -> Vec<Line<'static>> 
         ToolArtifact::TextDetail(text) => message_lines(text, theme.style(ThemeRole::MutedText)),
         ToolArtifact::FileReference(path) => {
             vec![Line::styled(
-                format!("│ File {path}"),
+                format!("│ File {}", path.display()),
                 theme.style(ThemeRole::Accent),
             )]
         }
@@ -363,8 +495,8 @@ fn spinner(frame: usize) -> &'static str {
     ["|", "/", "-", "\\"][(frame / 2) % 4]
 }
 
-fn wrapped_height(lines: &[Line<'_>], width: u16) -> usize {
-    let width = width.max(1) as usize;
+fn wrapped_height(lines: &[Line<'_>], width: usize) -> usize {
+    let width = width.max(1);
     lines
         .iter()
         .map(|line| line.width().div_ceil(width).max(1))

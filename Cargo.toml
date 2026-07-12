@@ -20,6 +20,7 @@ ratatui = "0.30.2"
 regex = "1.12.2"
 reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rig-core = "0.39.0"
+ropey = "1.6.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.10.9"
@@ -28,3 +29,12 @@ tempfile = "3.27.0"
 tokio = { version = "1.52.0", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 url = "2.5.8"
 unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+criterion = "0.5.1"
+proptest = "1.9.0"
+
+[[bench]]
+name = "composer"
+harness = false

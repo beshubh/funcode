@@ -1,14 +1,157 @@
+use crate::composer::QueryId;
 use crossbeam::channel::{Receiver, Sender, TryRecvError, TrySendError, bounded, unbounded};
 use fff_search::{
     FFFMode, FilePicker, FilePickerOptions, FuzzySearchOptions, PaginationArgs, QueryParser,
     SharedFilePicker, SharedFrecency,
 };
 use std::{
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkspacePath {
+    raw: String,
+}
+
+impl WorkspacePath {
+    pub fn from_raw(path: impl Into<String>) -> Self {
+        Self { raw: path.into() }
+    }
+
+    pub fn from_display(display: &str) -> Result<Self, PathEscapeError> {
+        unescape_path(display).map(Self::from_raw)
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn display(&self) -> String {
+        escape_path(&self.raw)
+    }
+
+    pub fn json_string(&self) -> String {
+        serde_json::to_string(&self.raw).expect("serializing a UTF-8 workspace path cannot fail")
+    }
+}
+
+impl fmt::Debug for WorkspacePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("WorkspacePath")
+            .field(&self.display())
+            .finish()
+    }
+}
+
+impl fmt::Display for WorkspacePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.display())
+    }
+}
+
+impl From<String> for WorkspacePath {
+    fn from(path: String) -> Self {
+        Self::from_raw(path)
+    }
+}
+
+impl From<&str> for WorkspacePath {
+    fn from(path: &str) -> Self {
+        Self::from_raw(path)
+    }
+}
+
+impl PartialEq<str> for WorkspacePath {
+    fn eq(&self, other: &str) -> bool {
+        self.raw == other
+    }
+}
+
+impl PartialEq<&str> for WorkspacePath {
+    fn eq(&self, other: &&str) -> bool {
+        self.raw == *other
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    path: WorkspacePath,
+}
+
+impl Attachment {
+    pub fn workspace_file(path: impl Into<WorkspacePath>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &WorkspacePath {
+        &self.path
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathEscapeError;
+
+impl fmt::Display for PathEscapeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the workspace path contains an invalid display escape")
+    }
+}
+
+impl std::error::Error for PathEscapeError {}
+
+fn escape_path(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{{{:X}}}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn unescape_path(display: &str) -> Result<String, PathEscapeError> {
+    let mut raw = String::with_capacity(display.len());
+    let mut characters = display.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            raw.push(character);
+            continue;
+        }
+        match characters.next().ok_or(PathEscapeError)? {
+            '\\' => raw.push('\\'),
+            'n' => raw.push('\n'),
+            'r' => raw.push('\r'),
+            't' => raw.push('\t'),
+            'u' if characters.next() == Some('{') => {
+                let mut hexadecimal = String::new();
+                loop {
+                    match characters.next() {
+                        Some('}') if !hexadecimal.is_empty() => break,
+                        Some(value) if value.is_ascii_hexdigit() => hexadecimal.push(value),
+                        _ => return Err(PathEscapeError),
+                    }
+                }
+                let codepoint =
+                    u32::from_str_radix(&hexadecimal, 16).map_err(|_| PathEscapeError)?;
+                raw.push(char::from_u32(codepoint).ok_or(PathEscapeError)?);
+            }
+            _ => return Err(PathEscapeError),
+        }
+    }
+    Ok(raw)
+}
 
 const INDEX_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const INDEX_READY_POLL: Duration = Duration::from_millis(25);
@@ -113,13 +256,22 @@ impl WorkspaceSearch {
 
 #[derive(Debug)]
 enum WorkspaceCommand {
-    Search { query: String, limit: usize },
+    Search {
+        query_id: QueryId,
+        query: String,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceEvent {
-    Ready { warning: Option<String> },
-    Suggestions { query: String, paths: Vec<String> },
+    Ready {
+        warning: Option<String>,
+    },
+    Suggestions {
+        query_id: QueryId,
+        paths: Vec<WorkspacePath>,
+    },
 }
 
 pub struct WorkspaceTaskRunner {
@@ -160,8 +312,12 @@ impl WorkspaceTaskRunner {
                 .unwrap_or_else(Instant::now);
             while !search.wait_until_ready(INDEX_READY_POLL) {
                 match command_rx.try_recv() {
-                    Ok(WorkspaceCommand::Search { query, limit }) => {
-                        pending_search = Some((query, limit));
+                    Ok(WorkspaceCommand::Search {
+                        query_id,
+                        query,
+                        limit,
+                    }) => {
+                        pending_search = Some((query_id, query, limit));
                     }
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => return,
@@ -176,15 +332,26 @@ impl WorkspaceTaskRunner {
             if event_tx.send(WorkspaceEvent::Ready { warning }).is_err() {
                 return;
             }
-            if let Some((query, limit)) = pending_search
-                && !send_suggestions(&search, &event_tx, query, limit, &mut last_rescan)
+            if let Some((query_id, query, limit)) = pending_search
+                && !send_suggestions(&search, &event_tx, query_id, query, limit, &mut last_rescan)
             {
                 return;
             }
             while let Ok(command) = command_rx.recv() {
                 match command {
-                    WorkspaceCommand::Search { query, limit } => {
-                        if !send_suggestions(&search, &event_tx, query, limit, &mut last_rescan) {
+                    WorkspaceCommand::Search {
+                        query_id,
+                        query,
+                        limit,
+                    } => {
+                        if !send_suggestions(
+                            &search,
+                            &event_tx,
+                            query_id,
+                            query,
+                            limit,
+                            &mut last_rescan,
+                        ) {
                             break;
                         }
                     }
@@ -198,11 +365,17 @@ impl WorkspaceTaskRunner {
         }
     }
 
-    pub(crate) fn request_suggestions(&self, query: String, limit: usize) -> bool {
-        match self
-            .commands
-            .try_send(WorkspaceCommand::Search { query, limit })
-        {
+    pub(crate) fn request_suggestions(
+        &self,
+        query_id: QueryId,
+        query: String,
+        limit: usize,
+    ) -> bool {
+        match self.commands.try_send(WorkspaceCommand::Search {
+            query_id,
+            query,
+            limit,
+        }) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
         }
@@ -224,6 +397,7 @@ fn normalize_relative_path(path: &str) -> String {
 fn send_suggestions(
     search: &WorkspaceSearch,
     events: &Sender<WorkspaceEvent>,
+    query_id: QueryId,
     query: String,
     limit: usize,
     last_rescan: &mut Instant,
@@ -232,9 +406,13 @@ fn send_suggestions(
         search.refresh();
         *last_rescan = Instant::now();
     }
-    let paths = search.suggestions(&query, limit);
+    let paths = search
+        .suggestions(&query, limit)
+        .into_iter()
+        .map(WorkspacePath::from_raw)
+        .collect();
     events
-        .send(WorkspaceEvent::Suggestions { query, paths })
+        .send(WorkspaceEvent::Suggestions { query_id, paths })
         .is_ok()
 }
 
@@ -287,20 +465,49 @@ mod tests {
         WorkspaceEvent, WorkspaceSearch, WorkspaceTaskRunner, discover_files,
         normalize_relative_path,
     };
+    use crate::composer::ComposerDocument;
+    use crate::tools::WorkspaceFileReader;
     use crossbeam::channel::unbounded;
     use std::{
         fs, thread,
         time::{Duration, Instant, SystemTime},
     };
 
+    #[test]
+    fn workspace_path_controls_round_trip_without_entering_the_display() {
+        let path = super::WorkspacePath::from_raw("src/line\n\t\\name.rs");
+        let display = path.display();
+
+        assert!(!display.chars().any(char::is_control));
+        assert_eq!(super::WorkspacePath::from_display(&display).unwrap(), path);
+        assert_eq!(
+            serde_json::from_str::<String>(&path.json_string()).unwrap(),
+            path.raw()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_reader_uses_the_exact_raw_control_bearing_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = super::WorkspacePath::from_raw("line\nbreak.txt");
+        fs::write(root.path().join(path.raw()), "exact path").unwrap();
+        let reader = WorkspaceFileReader::new(root.path().to_owned()).unwrap();
+
+        assert_eq!(reader.read(path.raw()).unwrap().content, "exact path");
+    }
+
     fn receive_suggestions(
         runner: &WorkspaceTaskRunner,
         query: &str,
         timeout: Duration,
-    ) -> Vec<String> {
+    ) -> Vec<super::WorkspacePath> {
+        let mut document = ComposerDocument::default();
+        document.insert_text(&format!("@{query}"));
+        let query_id = document.active_query().unwrap().id();
         let deadline = Instant::now() + timeout;
         loop {
-            let _ = runner.request_suggestions(query.to_owned(), 8);
+            let _ = runner.request_suggestions(query_id, query.to_owned(), 8);
             if let Ok(WorkspaceEvent::Suggestions { paths, .. }) =
                 runner.events.recv_timeout(Duration::from_millis(50))
                 && !paths.is_empty()

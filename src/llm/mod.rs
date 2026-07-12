@@ -1,4 +1,6 @@
-use crate::{composer::SessionMode, tools::ToolSession};
+#[cfg(test)]
+use crate::session::SessionMode;
+use crate::tools::ToolSession;
 use futures::{
     StreamExt,
     future::BoxFuture,
@@ -192,11 +194,22 @@ impl LlmClient {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn stream_with_tools(
         &self,
         prompt: String,
         history_prompt: String,
         mode: SessionMode,
+        tools: Option<ToolSession>,
+    ) -> Result<LlmStream, LlmError> {
+        self.stream_prepared_with_tools(mode.apply_to_prompt(prompt), history_prompt, tools)
+            .await
+    }
+
+    pub(crate) async fn stream_prepared_with_tools(
+        &self,
+        model_prompt: String,
+        history_prompt: String,
         tools: Option<ToolSession>,
     ) -> Result<LlmStream, LlmError> {
         let history = self
@@ -205,7 +218,6 @@ impl LlmClient {
             .map_err(|_| LlmError::Internal("the LLM conversation is unavailable".into()))?
             .clone();
         let model = self.current_model()?;
-        let model_prompt = prompt_with_mode(prompt, mode);
         let stream = self
             .provider
             .stream(ProviderRequest {
@@ -245,15 +257,6 @@ impl LlmClient {
             .list_models()
             .await
             .map(|catalog| vec![catalog])
-    }
-}
-
-fn prompt_with_mode(prompt: String, mode: SessionMode) -> String {
-    match mode {
-        SessionMode::Build => prompt,
-        SessionMode::Plan => format!(
-            "Plan mode is active. Produce a decision-complete implementation plan and do not modify files. You may use read_file and search_files, plus terminal only for non-mutating inspection commands.\n\n{prompt}"
-        ),
     }
 }
 
@@ -406,7 +409,7 @@ mod tests {
             .stream_with_mode(
                 "review the architecture".into(),
                 "review the architecture".into(),
-                crate::composer::SessionMode::Plan,
+                crate::session::SessionMode::Plan,
             )
             .await
             .unwrap()

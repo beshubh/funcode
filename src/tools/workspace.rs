@@ -175,13 +175,6 @@ pub struct WorkspaceFileReader {
 }
 
 impl WorkspaceFileReader {
-    #[cfg(test)]
-    pub fn from_current_dir() -> Result<Self, FileReadError> {
-        let root = std::env::current_dir()
-            .map_err(|error| FileReadError(format!("could not locate the workspace: {error}")))?;
-        Self::new(root)
-    }
-
     pub fn new(root: PathBuf) -> Result<Self, FileReadError> {
         Workspace::new(root)
             .map(|workspace| Self { workspace })
@@ -218,10 +211,6 @@ impl WorkspaceFileReader {
             line_count,
             preview,
         })
-    }
-
-    pub(crate) fn root(&self) -> PathBuf {
-        self.workspace.root().to_owned()
     }
 }
 

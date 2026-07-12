@@ -338,8 +338,8 @@ mod tests {
         ChatGptStreamEvent, ConversationAssembler, RigToolAdapter, chatgpt_stream_error,
         parse_models, rig_history, stream_events,
     };
-    use crate::composer::SessionMode;
     use crate::llm::{ConversationMessage, LlmError, ProviderEvent};
+    use crate::session::SessionMode;
     use crate::tools::ToolSession;
     use futures::{StreamExt, stream};
     use rig_core::completion::Message;

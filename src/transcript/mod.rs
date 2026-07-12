@@ -1,5 +1,5 @@
-pub use crate::composer::Attachment;
-use crate::composer::ComposerContent;
+use crate::composer::SubmittedContent;
+use crate::workspace::{Attachment, WorkspacePath};
 use std::fmt;
 
 pub type EntryId = u64;
@@ -8,14 +8,16 @@ pub type ToolCallId = u64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserMessage {
-    pub text: String,
-    pub attachments: Vec<Attachment>,
-    pub content: ComposerContent,
+    pub content: SubmittedContent,
 }
 
 impl UserMessage {
     pub fn copy_text(&self) -> String {
-        self.content.text().to_owned()
+        self.content.visible_text()
+    }
+
+    pub fn attachments(&self) -> Vec<Attachment> {
+        self.content.attachments()
     }
 }
 
@@ -52,14 +54,14 @@ pub struct Reasoning {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolArtifact {
     CodeRange {
-        path: String,
+        path: WorkspacePath,
         // start_line and end_line needs to be Optional using Option<u32>
         start_line: u32,
         end_line: u32,
         preview: Option<String>,
     },
     Patch {
-        path: String,
+        path: WorkspacePath,
         diff: String,
     },
     SearchResults {
@@ -73,7 +75,7 @@ pub enum ToolArtifact {
         exit_code: Option<i32>,
     },
     TextDetail(String),
-    FileReference(String),
+    FileReference(WorkspacePath),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,30 +175,16 @@ impl Transcript {
     }
 
     pub fn submit(&mut self, turn_id: TurnId, text: String, attachments: Vec<Attachment>) {
-        let content = ComposerContent::with_attachments(text, &attachments);
-        self.push_submission(turn_id, content, attachments);
+        let content = SubmittedContent::with_attachments(text, &attachments);
+        self.push_submission(turn_id, content);
     }
 
-    pub fn submit_content(&mut self, turn_id: TurnId, content: ComposerContent) {
-        let attachments = content.attachments();
-        self.push_submission(turn_id, content, attachments);
+    pub fn submit_content(&mut self, turn_id: TurnId, content: SubmittedContent) {
+        self.push_submission(turn_id, content);
     }
 
-    fn push_submission(
-        &mut self,
-        turn_id: TurnId,
-        content: ComposerContent,
-        attachments: Vec<Attachment>,
-    ) {
-        let text = content.prompt_text();
-        self.push(
-            turn_id,
-            EntryKind::User(UserMessage {
-                text,
-                attachments,
-                content,
-            }),
-        );
+    fn push_submission(&mut self, turn_id: TurnId, content: SubmittedContent) {
+        self.push(turn_id, EntryKind::User(UserMessage { content }));
         self.push(
             turn_id,
             EntryKind::Assistant(AssistantMessage {
@@ -447,9 +435,9 @@ impl fmt::Display for ActivityStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityStatus, AssistantStatus, Attachment, EntryKind, ToolArtifact, Transcript,
-        TranscriptEvent,
+        ActivityStatus, AssistantStatus, EntryKind, ToolArtifact, Transcript, TranscriptEvent,
     };
+    use crate::workspace::Attachment;
 
     #[test]
     fn submission_creates_a_user_block_with_file_badges_and_a_queued_response() {
@@ -466,7 +454,7 @@ mod tests {
         assert!(matches!(
             &transcript.entries()[0].kind,
             EntryKind::User(message)
-                if message.attachments == vec![Attachment::workspace_file("src/app.rs")]
+                if message.attachments() == vec![Attachment::workspace_file("src/app.rs")]
         ));
         assert!(matches!(
             &transcript.entries()[1].kind,
@@ -665,9 +653,7 @@ mod tests {
     #[test]
     fn copied_user_message_preserves_inline_content() {
         let message = super::UserMessage {
-            text: "Please inspect this".into(),
-            attachments: vec![Attachment::workspace_file("src/lib.rs")],
-            content: crate::composer::ComposerContent::plain("Please inspect this"),
+            content: crate::composer::SubmittedContent::plain("Please inspect this"),
         };
 
         assert_eq!(message.copy_text(), "Please inspect this");

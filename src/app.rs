@@ -2,14 +2,24 @@ use crate::{
     agent::{AgentEvent, RequestId},
     auth::AuthEvent,
     commands::{Command, CommandRegistry},
-    composer::{ComposerDocument, SessionMode},
+    composer::{
+        ComposerDocument, DocumentRevision, PasteProposal, QueryId, QueryKind, QueryView,
+        REQUEST_CONFIRM_BYTES, SubmittedContent,
+    },
     llm::ProviderModels,
     model_catalog::ModelCatalogEvent,
+    session::SessionMode,
+    submission::{DraftId, PreparedRequest, SubmissionEvent},
     theme::ThemeId,
-    transcript::{Attachment, EntryId, EntryKind, ToolArtifact, Transcript, TranscriptEvent},
+    transcript::{EntryId, EntryKind, ToolArtifact, Transcript, TranscriptEvent},
+    workspace::WorkspacePath,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::time::{Duration, Instant};
+use std::{
+    cell::{Cell, RefCell},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 const INTERRUPT_WINDOW: Duration = Duration::from_millis(500);
 const SCROLL_STEP: usize = 5;
@@ -88,11 +98,17 @@ impl Default for AuthDialog {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
+    Preflight {
+        draft_id: DraftId,
+        content: SubmittedContent,
+        mode: SessionMode,
+    },
+    CancelPreflight {
+        draft_id: DraftId,
+    },
     Submit {
         request_id: RequestId,
-        prompt: String,
-        attachments: Vec<Attachment>,
-        mode: SessionMode,
+        request: Arc<PreparedRequest>,
     },
     Cancel {
         request_id: RequestId,
@@ -123,14 +139,75 @@ pub enum SuggestionKind {
     File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerTarget {
+    TranscriptEntry(EntryId),
+    AuthProvider(usize),
+    Suggestion(usize),
+    MessageCopy,
+    Theme(usize),
+    Model(usize),
+    ModelRefresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PointerEvent {
+    Activate(Option<PointerTarget>),
+    Hover(Option<PointerTarget>),
+    ScrollUp,
+    ScrollDown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Suggestion {
     pub label: String,
     pub description: String,
     pub kind: SuggestionKind,
+    file_path: Option<WorkspacePath>,
+}
+
+#[derive(Debug, Clone)]
+struct SuggestionCache {
+    query_id: Option<QueryId>,
+    source_revision: u64,
+    suggestions: Arc<[Suggestion]>,
 }
 
 pub type Composer = ComposerDocument;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputOwner {
+    Auth,
+    Message,
+    Theme,
+    Models,
+    PasteConfirmation,
+    PendingSubmission,
+    Home,
+    Suggestions,
+    Composer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingSubmissionPhase {
+    Preflighting,
+    Confirming(Arc<PreparedRequest>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSubmission {
+    draft_id: DraftId,
+    content: SubmittedContent,
+    mode: SessionMode,
+    approved_bytes: Option<usize>,
+    phase: PendingSubmissionPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingSubmissionView {
+    Preflighting,
+    Confirming { bytes: usize },
+}
 
 #[derive(Debug, Default)]
 pub struct App {
@@ -149,18 +226,25 @@ pub struct App {
     pub auth_dialog: Option<AuthDialog>,
     pub theme_dialog: Option<ThemeDialog>,
     pub(crate) models_dialog: Option<ModelsDialogPhase>,
+    large_paste_confirmation: Option<PasteProposal>,
+    pending_submission: Option<PendingSubmission>,
+    approved_draft: Option<(DocumentRevision, usize)>,
     active_theme: ThemeId,
     commands: CommandRegistry,
-    workspace_files: Vec<String>,
+    workspace_files: Vec<WorkspacePath>,
     indexed_workspace_search: bool,
-    indexed_suggestion_query: Option<String>,
-    indexed_file_suggestions: Vec<String>,
-    pending_indexed_file_selection: Option<String>,
+    indexed_suggestion_query: Option<QueryId>,
+    indexed_file_suggestions: Vec<WorkspacePath>,
+    pending_indexed_file_selection: Option<QueryId>,
+    suggestion_source_revision: u64,
+    suggestion_cache: RefCell<Option<SuggestionCache>>,
+    suggestion_builds: Cell<usize>,
     suggestion_selected: usize,
     models_selected: usize,
     current_model: String,
     composer_width: u16,
     next_request_id: RequestId,
+    next_draft_id: DraftId,
     last_escape: Option<Instant>,
     cancellation_requested: bool,
     auth_only: bool,
@@ -172,6 +256,7 @@ impl App {
             follow_output: true,
             composer_width: u16::MAX,
             next_request_id: 1,
+            next_draft_id: 1,
             commands: CommandRegistry::with_builtins(),
             ..Self::default()
         }
@@ -192,13 +277,17 @@ impl App {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.workspace_files = files.into_iter().map(Into::into).collect();
+        self.workspace_files = files
+            .into_iter()
+            .map(|path| WorkspacePath::from_raw(path.into()))
+            .collect();
         self.workspace_files.sort();
         self.indexed_workspace_search = false;
         self.indexed_suggestion_query = None;
         self.indexed_file_suggestions.clear();
         self.pending_indexed_file_selection = None;
         self.suggestion_selected = 0;
+        self.invalidate_suggestions();
     }
 
     pub(crate) fn use_indexed_workspace_search(&mut self) {
@@ -207,24 +296,27 @@ impl App {
         self.indexed_file_suggestions.clear();
         self.pending_indexed_file_selection = None;
         self.suggestion_selected = 0;
+        self.invalidate_suggestions();
     }
 
-    pub(crate) fn workspace_file_query(&self) -> Option<String> {
-        self.composer
-            .active_file_query()
-            .map(|(_, query)| query.to_owned())
+    pub(crate) fn workspace_file_query(&self) -> Option<(QueryId, String)> {
+        let query = self.composer.active_query()?;
+        (query.kind() == QueryKind::FileReference).then(|| (query.id(), query.text().to_owned()))
     }
 
-    pub(crate) fn set_indexed_file_suggestions(&mut self, query: String, paths: Vec<String>) {
-        if self.workspace_file_query().as_deref() != Some(query.as_str()) {
-            if self.pending_indexed_file_selection.as_deref() == Some(query.as_str()) {
+    pub(crate) fn set_indexed_file_suggestions(
+        &mut self,
+        query_id: QueryId,
+        paths: Vec<WorkspacePath>,
+    ) {
+        if self.workspace_file_query().map(|(id, _)| id) != Some(query_id) {
+            if self.pending_indexed_file_selection == Some(query_id) {
                 self.pending_indexed_file_selection = None;
             }
             return;
         }
-        let same_query = self.indexed_suggestion_query.as_deref() == Some(query.as_str());
-        let complete_pending_selection =
-            self.pending_indexed_file_selection.as_deref() == Some(query.as_str());
+        let same_query = self.indexed_suggestion_query == Some(query_id);
+        let complete_pending_selection = self.pending_indexed_file_selection == Some(query_id);
         if same_query && self.indexed_file_suggestions == paths {
             return;
         }
@@ -236,8 +328,9 @@ impl App {
             None
         };
         let previous_selection = self.suggestion_selected;
-        self.indexed_suggestion_query = Some(query);
+        self.indexed_suggestion_query = Some(query_id);
         self.indexed_file_suggestions = paths;
+        self.invalidate_suggestions();
         self.suggestion_selected = if same_query {
             selected_path
                 .and_then(|selected| {
@@ -253,10 +346,8 @@ impl App {
         };
         if complete_pending_selection {
             self.pending_indexed_file_selection = None;
-            if let Some(path) = self.indexed_file_suggestions.first().cloned()
-                && let Some((range, _)) = self.composer.active_file_query()
-            {
-                self.composer.insert_file_reference(range, path);
+            if let Some(path) = self.indexed_file_suggestions.first().cloned() {
+                let _ = self.composer.complete_file_reference(query_id, path);
             }
         }
     }
@@ -271,27 +362,20 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, now: Instant) -> Option<AppAction> {
-        if self.auth_dialog.is_some() {
-            return self.handle_auth_key(key);
-        }
-
-        if self.message_dialog.is_some() {
-            return self.handle_message_dialog_key(key);
-        }
-
-        if self.theme_dialog.is_some() {
-            return self.handle_theme_dialog_key(key);
-        }
-
-        if self.models_dialog.is_some() {
-            return self.handle_models_dialog_key(key);
-        }
-
-        if self.screen == Screen::Home {
-            if key.code == KeyCode::Enter {
-                self.screen = Screen::Chat;
+        match self.input_owner() {
+            InputOwner::Auth => return self.handle_auth_key(key),
+            InputOwner::Message => return self.handle_message_dialog_key(key),
+            InputOwner::Theme => return self.handle_theme_dialog_key(key),
+            InputOwner::Models => return self.handle_models_dialog_key(key),
+            InputOwner::PasteConfirmation => return self.handle_large_paste_key(key),
+            InputOwner::PendingSubmission => return self.handle_pending_submission_key(key),
+            InputOwner::Home => {
+                if key.code == KeyCode::Enter {
+                    self.screen = Screen::Chat;
+                }
+                return None;
             }
-            return None;
+            InputOwner::Suggestions | InputOwner::Composer => {}
         }
 
         if key.code == KeyCode::Esc {
@@ -304,15 +388,16 @@ impl App {
 
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.composer.clear();
+            self.approved_draft = None;
             self.pending_indexed_file_selection = None;
             self.suggestion_selected = 0;
             return None;
         }
 
         if key.code == KeyCode::Enter
-            && let Some(query) = self.pending_indexed_file_query()
+            && let Some((query_id, _)) = self.pending_indexed_file_query()
         {
-            self.pending_indexed_file_selection = Some(query);
+            self.pending_indexed_file_selection = Some(query_id);
             return None;
         }
 
@@ -366,11 +451,11 @@ impl App {
                 None
             }
             KeyCode::Up => {
-                self.composer.move_up(self.composer_width);
+                self.composer.move_up(self.composer_width as usize);
                 None
             }
             KeyCode::Down => {
-                self.composer.move_down(self.composer_width);
+                self.composer.move_down(self.composer_width as usize);
                 None
             }
             KeyCode::Home => {
@@ -411,12 +496,124 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        if self.screen == Screen::Chat && self.auth_dialog.is_none() {
-            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            self.composer.insert_text(&normalized);
-            self.pending_indexed_file_selection = None;
-            self.suggestion_selected = 0;
-            self.last_escape = None;
+        if !matches!(
+            self.input_owner(),
+            InputOwner::Composer | InputOwner::Suggestions
+        ) {
+            return;
+        }
+        match self.composer.propose_paste(text) {
+            Ok(proposal) if proposal.requires_confirmation() => {
+                self.large_paste_confirmation = Some(proposal);
+            }
+            Ok(proposal) => {
+                if let Err(error) = self.composer.commit_paste(proposal) {
+                    self.notice = Some(error.to_string());
+                }
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+        self.pending_indexed_file_selection = None;
+        self.suggestion_selected = 0;
+        self.last_escape = None;
+    }
+
+    pub(crate) fn composer_cursor_visible(&self) -> bool {
+        matches!(
+            self.input_owner(),
+            InputOwner::Composer | InputOwner::Suggestions
+        )
+    }
+
+    pub(crate) fn paste_confirmation(&self) -> Option<&PasteProposal> {
+        self.large_paste_confirmation.as_ref()
+    }
+
+    pub(crate) fn pending_submission_view(&self) -> Option<PendingSubmissionView> {
+        self.pending_submission
+            .as_ref()
+            .map(|pending| match &pending.phase {
+                PendingSubmissionPhase::Preflighting => PendingSubmissionView::Preflighting,
+                PendingSubmissionPhase::Confirming(request) => PendingSubmissionView::Confirming {
+                    bytes: request.serialized_bytes(),
+                },
+            })
+    }
+
+    pub(crate) fn handle_pointer(&mut self, event: PointerEvent) -> Option<AppAction> {
+        let owner = self.input_owner();
+        match event {
+            PointerEvent::Activate(target) => match (owner, target) {
+                (InputOwner::Auth, Some(PointerTarget::AuthProvider(index))) => {
+                    self.set_auth_selection(index);
+                    self.select_auth_provider()
+                }
+                (InputOwner::Message, Some(PointerTarget::MessageCopy)) => {
+                    self.copy_message_dialog()
+                }
+                (InputOwner::Theme, Some(PointerTarget::Theme(index))) => {
+                    self.set_theme_selection(index);
+                    self.commit_theme_selection()
+                }
+                (InputOwner::Models, Some(PointerTarget::Model(index))) => {
+                    self.activate_model(index)
+                }
+                (InputOwner::Models, Some(PointerTarget::ModelRefresh)) => self.refresh_models(),
+                (InputOwner::Suggestions, Some(PointerTarget::Suggestion(index))) => {
+                    self.activate_suggestion(index)
+                }
+                (InputOwner::Composer, Some(PointerTarget::TranscriptEntry(entry_id))) => {
+                    self.activate_transcript_entry(entry_id);
+                    None
+                }
+                _ => None,
+            },
+            PointerEvent::Hover(target) => {
+                match (owner, target) {
+                    (InputOwner::Auth, Some(PointerTarget::AuthProvider(index))) => {
+                        self.set_auth_selection(index)
+                    }
+                    (InputOwner::Theme, Some(PointerTarget::Theme(index))) => {
+                        self.set_theme_selection(index)
+                    }
+                    (InputOwner::Models, Some(PointerTarget::Model(index))) => {
+                        self.set_model_selection(index)
+                    }
+                    (InputOwner::Suggestions, Some(PointerTarget::Suggestion(index))) => {
+                        self.set_suggestion_selection(index)
+                    }
+                    _ => {}
+                }
+                None
+            }
+            PointerEvent::ScrollUp => {
+                match owner {
+                    InputOwner::Auth => self.move_auth_selection(-1),
+                    InputOwner::Theme => self.move_theme_selection(-1),
+                    InputOwner::Models => self.scroll_models_up(),
+                    InputOwner::Suggestions => self.move_suggestion_selection(-1),
+                    InputOwner::Composer => self.scroll_transcript_up(),
+                    InputOwner::Message
+                    | InputOwner::PasteConfirmation
+                    | InputOwner::PendingSubmission
+                    | InputOwner::Home => {}
+                }
+                None
+            }
+            PointerEvent::ScrollDown => {
+                match owner {
+                    InputOwner::Auth => self.move_auth_selection(1),
+                    InputOwner::Theme => self.move_theme_selection(1),
+                    InputOwner::Models => self.scroll_models_down(),
+                    InputOwner::Suggestions => self.move_suggestion_selection(1),
+                    InputOwner::Composer => self.scroll_transcript_down(),
+                    InputOwner::Message
+                    | InputOwner::PasteConfirmation
+                    | InputOwner::PendingSubmission
+                    | InputOwner::Home => {}
+                }
+                None
+            }
         }
     }
 
@@ -451,66 +648,167 @@ impl App {
         self.select_mode(mode);
     }
 
-    pub fn register_command(&mut self, command: impl Command + 'static) {
-        self.commands.register(command);
+    fn input_owner(&self) -> InputOwner {
+        if self.auth_dialog.is_some() {
+            InputOwner::Auth
+        } else if self.message_dialog.is_some() {
+            InputOwner::Message
+        } else if self.theme_dialog.is_some() {
+            InputOwner::Theme
+        } else if self.models_dialog.is_some() {
+            InputOwner::Models
+        } else if self.large_paste_confirmation.is_some() {
+            InputOwner::PasteConfirmation
+        } else if self.pending_submission.is_some() {
+            InputOwner::PendingSubmission
+        } else if self.screen == Screen::Home {
+            InputOwner::Home
+        } else if !self.suggestions().is_empty() {
+            InputOwner::Suggestions
+        } else {
+            InputOwner::Composer
+        }
     }
 
-    fn pending_indexed_file_query(&self) -> Option<String> {
+    fn handle_large_paste_key(&mut self, key: KeyEvent) -> Option<AppAction> {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                if let Some(proposal) = self.large_paste_confirmation.take() {
+                    match self.composer.commit_paste(proposal) {
+                        Ok(commit) => {
+                            self.approved_draft =
+                                Some((self.composer.revision(), commit.projected_bytes));
+                        }
+                        Err(error) => self.notice = Some(error.to_string()),
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n') => self.large_paste_confirmation = None,
+            _ => {}
+        }
+        None
+    }
+
+    fn handle_pending_submission_key(&mut self, key: KeyEvent) -> Option<AppAction> {
+        let pending = self.pending_submission.as_ref()?;
+        match (&pending.phase, key.code) {
+            (PendingSubmissionPhase::Preflighting, KeyCode::Esc) => {
+                let draft_id = pending.draft_id;
+                self.pending_submission = None;
+                Some(AppAction::CancelPreflight { draft_id })
+            }
+            (PendingSubmissionPhase::Confirming(_), KeyCode::Enter | KeyCode::Char('y')) => {
+                let PendingSubmissionPhase::Confirming(request) =
+                    &self.pending_submission.as_ref()?.phase
+                else {
+                    return None;
+                };
+                self.accept_prepared_request(request.clone())
+            }
+            (PendingSubmissionPhase::Confirming(_), KeyCode::Esc | KeyCode::Char('n')) => {
+                self.pending_submission = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub fn register_command(&mut self, command: impl Command + 'static) {
+        self.commands.register(command);
+        self.invalidate_suggestions();
+    }
+
+    fn pending_indexed_file_query(&self) -> Option<(QueryId, String)> {
         if !self.indexed_workspace_search {
             return None;
         }
         let query = self.workspace_file_query()?;
-        (self.indexed_suggestion_query.as_deref() != Some(query.as_str())).then_some(query)
+        (self.indexed_suggestion_query != Some(query.0)).then_some(query)
     }
 
-    pub fn suggestions(&self) -> Vec<Suggestion> {
-        if let Some((range, query)) = self.composer.active_command_query() {
-            let standalone =
-                range.start == 0 && self.composer.cursor() == self.composer.text().len();
-            if standalone {
-                let commands: Vec<_> = self
-                    .commands
-                    .matching(query)
-                    .map(|command| Suggestion {
-                        label: format!("/{}", command.name()),
-                        description: command.description().to_owned(),
-                        kind: SuggestionKind::Command,
-                    })
-                    .collect();
-                if !commands.is_empty() {
-                    return commands;
-                }
+    pub fn suggestions(&self) -> Arc<[Suggestion]> {
+        let query = self.composer.active_query();
+        let query_id = query.as_ref().map(QueryView::id);
+        if let Some(cache) = self.suggestion_cache.borrow().as_ref()
+            && cache.query_id == query_id
+            && cache.source_revision == self.suggestion_source_revision
+        {
+            return cache.suggestions.clone();
+        }
+        let suggestions: Arc<[Suggestion]> = self.compute_suggestions(query.as_ref()).into();
+        self.suggestion_builds
+            .set(self.suggestion_builds.get().saturating_add(1));
+        *self.suggestion_cache.borrow_mut() = Some(SuggestionCache {
+            query_id,
+            source_revision: self.suggestion_source_revision,
+            suggestions: suggestions.clone(),
+        });
+        suggestions
+    }
+
+    fn compute_suggestions(&self, query: Option<&QueryView>) -> Vec<Suggestion> {
+        if let Some(query) = query
+            && query.kind() == QueryKind::Command
+            && query.is_standalone()
+        {
+            let commands: Vec<_> = self
+                .commands
+                .matching(query.text())
+                .map(|command| Suggestion {
+                    label: format!("/{}", command.name()),
+                    description: command.description().to_owned(),
+                    kind: SuggestionKind::Command,
+                    file_path: None,
+                })
+                .collect();
+            if !commands.is_empty() {
+                return commands;
             }
         }
 
-        let Some((_, query)) = self.composer.active_file_query() else {
+        let Some(query) = query else {
             return Vec::new();
         };
+        if query.kind() != QueryKind::FileReference {
+            return Vec::new();
+        }
         if self.indexed_workspace_search {
-            if self.indexed_suggestion_query.as_deref() != Some(query) {
+            if self.indexed_suggestion_query != Some(query.id()) {
                 return Vec::new();
             }
             return self
                 .indexed_file_suggestions
                 .iter()
                 .map(|path| Suggestion {
-                    label: path.clone(),
+                    label: path.display(),
                     description: "File".to_owned(),
                     kind: SuggestionKind::File,
+                    file_path: Some(path.clone()),
                 })
                 .collect();
         }
-        let query = query.to_lowercase();
+        let query = query.text().to_lowercase();
         self.workspace_files
             .iter()
-            .filter(|path| path.to_lowercase().contains(&query))
+            .filter(|path| path.display().to_lowercase().contains(&query))
             .take(FILE_SUGGESTION_LIMIT)
             .map(|path| Suggestion {
-                label: path.clone(),
+                label: path.display(),
                 description: "File".to_owned(),
                 kind: SuggestionKind::File,
+                file_path: Some(path.clone()),
             })
             .collect()
+    }
+
+    fn invalidate_suggestions(&mut self) {
+        self.suggestion_source_revision = self.suggestion_source_revision.wrapping_add(1);
+        *self.suggestion_cache.borrow_mut() = None;
+    }
+
+    #[cfg(test)]
+    fn suggestion_build_count(&self) -> usize {
+        self.suggestion_builds.get()
     }
 
     pub fn available_commands(&self) -> Vec<Suggestion> {
@@ -524,6 +822,7 @@ impl App {
                 label: format!("/{}", command.name()),
                 description: command.description().to_owned(),
                 kind: SuggestionKind::Command,
+                file_path: None,
             })
             .collect()
     }
@@ -535,16 +834,19 @@ impl App {
                 let command = self
                     .commands
                     .find(suggestion.label.trim_start_matches('/'))?;
-                let (range, _) = self.composer.active_command_query()?;
-                if range.start != 0 || self.composer.cursor() != self.composer.text().len() {
+                let query = self.composer.active_query()?;
+                if query.kind() != QueryKind::Command || !query.is_standalone() {
                     return None;
                 }
-                self.composer.take_submission();
+                self.composer.discard_active_command(query.id()).ok()?;
                 command.execute(self)
             }
             SuggestionKind::File => {
-                let (range, _) = self.composer.active_file_query()?;
-                self.composer.insert_file_reference(range, suggestion.label);
+                let query = self.composer.active_query()?;
+                let path = suggestion.file_path?;
+                self.composer
+                    .complete_file_reference(query.id(), path)
+                    .ok()?;
                 self.suggestion_selected = 0;
                 None
             }
@@ -699,6 +1001,52 @@ impl App {
         }
     }
 
+    pub fn handle_submission_event(&mut self, event: SubmissionEvent) -> Option<AppAction> {
+        match event {
+            SubmissionEvent::Prepared { draft_id, request } => {
+                let pending = self.pending_submission.as_mut()?;
+                if pending.draft_id != draft_id
+                    || request.content() != &pending.content
+                    || request.mode() != pending.mode
+                {
+                    return None;
+                }
+                if request.serialized_bytes() > REQUEST_CONFIRM_BYTES
+                    && pending
+                        .approved_bytes
+                        .is_none_or(|approved| request.serialized_bytes() > approved)
+                {
+                    pending.phase = PendingSubmissionPhase::Confirming(request);
+                    None
+                } else {
+                    self.accept_prepared_request(request)
+                }
+            }
+            SubmissionEvent::Failed { draft_id, message } => {
+                if self
+                    .pending_submission
+                    .as_ref()
+                    .is_some_and(|pending| pending.draft_id == draft_id)
+                {
+                    self.pending_submission = None;
+                    self.notice = Some(message);
+                }
+                None
+            }
+            SubmissionEvent::Cancelled { draft_id } => {
+                if self
+                    .pending_submission
+                    .as_ref()
+                    .is_some_and(|pending| pending.draft_id == draft_id)
+                {
+                    self.pending_submission = None;
+                    self.notice = Some("Submission cancelled".into());
+                }
+                None
+            }
+        }
+    }
+
     pub fn handle_auth_event(&mut self, event: AuthEvent) {
         let Some(dialog) = self.auth_dialog.as_mut() else {
             return;
@@ -723,14 +1071,21 @@ impl App {
         }
     }
 
-    pub fn tick(&mut self) {
-        self.animation_frame = self.animation_frame.wrapping_add(1);
+    pub fn tick(&mut self) -> bool {
+        let animation_visible = self.active_request.is_some();
+        let previous_frame = self.animation_frame;
+        if animation_visible {
+            self.animation_frame = self.animation_frame.wrapping_add(1);
+        }
         if self
             .last_escape
             .is_some_and(|pressed| pressed.elapsed() > INTERRUPT_WINDOW)
         {
             self.last_escape = None;
         }
+        animation_visible
+            && (previous_frame / 2 != self.animation_frame / 2
+                || previous_frame / 5 != self.animation_frame / 5)
     }
 
     pub fn toggle_entry(&mut self, entry_id: EntryId) {
@@ -1124,37 +1479,61 @@ impl App {
     }
 
     fn submit_composer(&mut self) -> Option<AppAction> {
-        if self.composer.content().tokens().is_empty()
-            && let Some(command) = self
-                .composer
-                .text()
+        let command_text = self.composer.submission_text();
+        if !self.composer.has_structural_atoms()
+            && let Some(command) = command_text
                 .strip_prefix('/')
                 .and_then(|name| self.commands.find(name))
         {
-            self.composer.take_submission();
+            self.composer.clear();
             return command.execute(self);
         }
-        let content = self.composer.content();
-        if content.prompt_text().trim().is_empty() {
+        let content = self.composer.freeze();
+        if content.is_effectively_empty() {
             return None;
         }
 
-        let content = self.composer.take_submission();
         let mode = self.session_mode;
-        let prompt = content.prompt_text();
-        let attachments = content.attachments();
+        let draft_id = self.next_draft_id;
+        self.next_draft_id = self.next_draft_id.wrapping_add(1);
+        let approved_bytes = self
+            .approved_draft
+            .filter(|(revision, _)| *revision == self.composer.revision())
+            .map(|(_, bytes)| bytes);
+        self.pending_submission = Some(PendingSubmission {
+            draft_id,
+            content: content.clone(),
+            mode,
+            approved_bytes,
+            phase: PendingSubmissionPhase::Preflighting,
+        });
+        Some(AppAction::Preflight {
+            draft_id,
+            content,
+            mode,
+        })
+    }
+
+    fn accept_prepared_request(&mut self, request: Arc<PreparedRequest>) -> Option<AppAction> {
+        let pending = self.pending_submission.as_ref()?;
+        if request.content() != &pending.content || self.composer.freeze() != pending.content {
+            self.pending_submission = None;
+            self.notice = Some("The pending draft changed before submission".into());
+            return None;
+        }
+        self.composer.clear();
+        self.approved_draft = None;
+        self.pending_submission = None;
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
-        self.transcript.submit_content(request_id, content);
+        self.transcript
+            .submit_content(request_id, request.content().clone());
         if self.follow_output {
             self.scroll_from_bottom = 0;
         }
-
         Some(AppAction::Submit {
             request_id,
-            prompt,
-            attachments,
-            mode,
+            request,
         })
     }
 
@@ -1174,7 +1553,7 @@ mod tests {
         agent::AgentEvent,
         auth::AuthEvent,
         commands::Command,
-        composer::SessionMode,
+        session::SessionMode,
         theme::ThemeId,
         transcript::{AssistantStatus, EntryKind, ToolArtifact},
     };
@@ -1183,6 +1562,36 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn set_indexed_files(app: &mut App, paths: &[&str]) {
+        let query_id = app.workspace_file_query().unwrap().0;
+        app.set_indexed_file_suggestions(
+            query_id,
+            paths
+                .iter()
+                .map(|path| crate::workspace::WorkspacePath::from_raw(*path))
+                .collect(),
+        );
+    }
+
+    fn resolve_preflight(app: &mut App, action: Option<AppAction>) -> Option<AppAction> {
+        match action {
+            Some(AppAction::Preflight {
+                draft_id,
+                content,
+                mode,
+            }) => app.handle_submission_event(crate::submission::SubmissionEvent::Prepared {
+                draft_id,
+                request: crate::submission::PreparedRequest::for_test(content, mode),
+            }),
+            action => action,
+        }
+    }
+
+    fn press_and_preflight(app: &mut App, code: KeyCode) -> Option<AppAction> {
+        let action = app.handle_key(key(code), Instant::now());
+        resolve_preflight(app, action)
     }
 
     #[test]
@@ -1198,7 +1607,7 @@ mod tests {
 
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
         assert!(app.auth_dialog.is_some());
-        assert!(app.composer.text().is_empty());
+        assert!(app.composer.submission_text().is_empty());
     }
 
     #[test]
@@ -1338,7 +1747,182 @@ mod tests {
             None
         );
         assert_eq!(app.screen, Screen::Chat);
-        assert!(app.composer.text().is_empty());
+        assert!(app.composer.submission_text().is_empty());
+    }
+
+    #[test]
+    fn paste_is_consumed_by_every_non_composer_owner() {
+        let mut apps = Vec::new();
+
+        let mut auth = App::new();
+        auth.open_auth_dialog();
+        apps.push(auth);
+
+        let mut message = App::new();
+        message.transcript.submit(1, "sent".into(), Vec::new());
+        message.open_message_dialog(message.transcript.entries()[0].id);
+        apps.push(message);
+
+        let mut theme = App::new();
+        theme.open_theme_dialog();
+        apps.push(theme);
+
+        let mut models = App::new();
+        models.open_models_dialog();
+        apps.push(models);
+
+        for app in &mut apps {
+            app.screen = Screen::Chat;
+            app.composer.insert_text("unchanged");
+            let before = app.composer.freeze();
+            app.handle_paste("hidden paste");
+            assert_eq!(app.composer.freeze(), before);
+        }
+    }
+
+    #[test]
+    fn pending_preflight_freezes_and_restores_the_unchanged_draft_on_cancel() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("keep this draft");
+        let before = app.composer.freeze();
+
+        let Some(AppAction::Preflight { draft_id, .. }) =
+            app.handle_key(key(KeyCode::Enter), Instant::now())
+        else {
+            panic!("Enter should start preflight");
+        };
+        assert_eq!(app.composer.freeze(), before);
+        assert!(!app.composer_cursor_visible());
+
+        app.handle_paste("hidden");
+        app.handle_key(key(KeyCode::Char('x')), Instant::now());
+        assert_eq!(app.composer.freeze(), before);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc), Instant::now()),
+            Some(AppAction::CancelPreflight { draft_id })
+        );
+        assert_eq!(app.composer.freeze(), before);
+        assert!(app.composer_cursor_visible());
+    }
+
+    #[test]
+    fn failed_preflight_restores_the_draft_without_a_transcript_entry() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("keep this draft");
+        let before = app.composer.freeze();
+        let Some(AppAction::Preflight { draft_id, .. }) =
+            app.handle_key(key(KeyCode::Enter), Instant::now())
+        else {
+            panic!("Enter should start preflight");
+        };
+
+        assert_eq!(
+            app.handle_submission_event(crate::submission::SubmissionEvent::Failed {
+                draft_id,
+                message: "attachment disappeared".into(),
+            }),
+            None
+        );
+        assert_eq!(app.composer.freeze(), before);
+        assert!(app.transcript.entries().is_empty());
+        assert_eq!(app.notice.as_deref(), Some("attachment disappeared"));
+    }
+
+    #[test]
+    fn multiline_paste_stays_structural_in_transcript_and_copy_projection() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.handle_paste("alpha\r\nbeta");
+
+        assert_eq!(app.composer.visible_text(), "[2 lines pasted]");
+        assert_eq!(app.composer.submission_text(), "alpha\nbeta");
+        let action = press_and_preflight(&mut app, KeyCode::Enter);
+        assert!(matches!(action, Some(AppAction::Submit { .. })));
+
+        let EntryKind::User(message) = &app.transcript.entries()[0].kind else {
+            panic!("submission should create a user message");
+        };
+        assert_eq!(message.copy_text(), "[2 lines pasted]");
+        assert_eq!(message.content.submission_text(), "alpha\nbeta");
+        assert!(!message.copy_text().contains("alpha"));
+    }
+
+    #[test]
+    fn prepared_request_above_the_soft_limit_waits_for_confirmation() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer
+            .insert_text(&"x".repeat(crate::composer::REQUEST_CONFIRM_BYTES + 1));
+        let action = app.handle_key(key(KeyCode::Enter), Instant::now());
+        let Some(AppAction::Preflight {
+            draft_id,
+            content,
+            mode,
+        }) = action
+        else {
+            panic!("Enter should start preflight");
+        };
+        let request = crate::submission::PreparedRequest::for_test(content, mode);
+
+        assert_eq!(
+            app.handle_submission_event(crate::submission::SubmissionEvent::Prepared {
+                draft_id,
+                request,
+            }),
+            None
+        );
+        assert!(matches!(
+            app.pending_submission_view(),
+            Some(super::PendingSubmissionView::Confirming { .. })
+        ));
+        assert!(!app.composer.is_empty());
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter), Instant::now()),
+            Some(AppAction::Submit { .. })
+        ));
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
+    fn attachment_bytes_require_a_new_confirmation_after_large_paste_approval() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), "attachment bytes").unwrap();
+        let mut app = App::with_files(["note.txt"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("@note");
+        app.activate_suggestion(0);
+        app.handle_paste(&"x".repeat(crate::composer::REQUEST_CONFIRM_BYTES + 1));
+        assert!(app.paste_confirmation().is_some());
+        app.handle_key(key(KeyCode::Enter), Instant::now());
+        assert!(app.paste_confirmation().is_none());
+
+        let Some(AppAction::Preflight {
+            draft_id,
+            content,
+            mode,
+        }) = app.handle_key(key(KeyCode::Enter), Instant::now())
+        else {
+            panic!("Enter should start preflight");
+        };
+        let mut runner = crate::submission::SubmissionTaskRunner::spawn(root.path().to_owned());
+        runner.request(draft_id, content, mode).unwrap();
+        let event = loop {
+            if let Some(event) = runner.try_event() {
+                break event;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(app.handle_submission_event(event), None);
+        assert!(matches!(
+            app.pending_submission_view(),
+            Some(super::PendingSubmissionView::Confirming { .. })
+        ));
+        assert!(!app.composer.is_empty());
+        runner.shutdown();
     }
 
     #[test]
@@ -1353,8 +1937,28 @@ mod tests {
         assert_eq!(suggestions[0].kind, SuggestionKind::File);
 
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
-        assert_eq!(app.composer.text(), "please inspect @src/main.rs");
-        assert_eq!(app.composer.attachments()[0].path, "src/main.rs");
+        assert_eq!(
+            app.composer.submission_text(),
+            "please inspect @src/main.rs"
+        );
+        assert_eq!(app.composer.attachments()[0].path().raw(), "src/main.rs");
+    }
+
+    #[test]
+    fn suggestions_are_built_once_per_query_revision() {
+        let mut app = App::with_files(["src/app.rs", "src/runtime.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("@src");
+
+        for _ in 0..20 {
+            assert_eq!(app.suggestions().len(), 2);
+            let _ = app.selected_suggestion();
+        }
+        assert_eq!(app.suggestion_build_count(), 1);
+
+        app.composer.insert_text("/app");
+        assert_eq!(app.suggestions().len(), 1);
+        assert_eq!(app.suggestion_build_count(), 2);
     }
 
     #[test]
@@ -1363,12 +1967,15 @@ mod tests {
         app.screen = Screen::Chat;
         app.use_indexed_workspace_search();
         app.composer.insert_text("please inspect @src/maim");
-        app.set_indexed_file_suggestions("src/maim".into(), vec!["src/main.rs".into()]);
+        set_indexed_files(&mut app, &["src/main.rs"]);
 
         assert_eq!(app.suggestions()[0].label, "src/main.rs");
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
-        assert_eq!(app.composer.text(), "please inspect @src/main.rs");
-        assert_eq!(app.composer.attachments()[0].path, "src/main.rs");
+        assert_eq!(
+            app.composer.submission_text(),
+            "please inspect @src/main.rs"
+        );
+        assert_eq!(app.composer.attachments()[0].path().raw(), "src/main.rs");
     }
 
     #[test]
@@ -1380,13 +1987,16 @@ mod tests {
         assert!(app.suggestions().is_empty());
 
         assert_eq!(app.handle_key(key(KeyCode::Enter), Instant::now()), None);
-        assert_eq!(app.composer.text(), "please inspect @src/maim");
+        assert_eq!(app.composer.submission_text(), "please inspect @src/maim");
         assert!(app.composer.attachments().is_empty());
 
-        app.set_indexed_file_suggestions("src/maim".into(), vec!["src/main.rs".into()]);
+        set_indexed_files(&mut app, &["src/main.rs"]);
 
-        assert_eq!(app.composer.text(), "please inspect @src/main.rs");
-        assert_eq!(app.composer.attachments()[0].path, "src/main.rs");
+        assert_eq!(
+            app.composer.submission_text(),
+            "please inspect @src/main.rs"
+        );
+        assert_eq!(app.composer.attachments()[0].path().raw(), "src/main.rs");
     }
 
     #[test]
@@ -1395,12 +2005,16 @@ mod tests {
         app.screen = Screen::Chat;
         app.use_indexed_workspace_search();
         app.composer.insert_text("@src/main");
-        app.set_indexed_file_suggestions("src/main".into(), vec!["src/main.rs".into()]);
+        let stale_query_id = app.workspace_file_query().unwrap().0;
+        set_indexed_files(&mut app, &["src/main.rs"]);
         assert_eq!(app.suggestions()[0].label, "src/main.rs");
 
-        app.composer.take_submission();
+        app.composer.clear();
         app.composer.insert_text("@src/runtime");
-        app.set_indexed_file_suggestions("src/main".into(), vec!["src/main.rs".into()]);
+        app.set_indexed_file_suggestions(
+            stale_query_id,
+            vec![crate::workspace::WorkspacePath::from_raw("src/main.rs")],
+        );
 
         assert!(app.suggestions().is_empty());
     }
@@ -1411,16 +2025,10 @@ mod tests {
         app.screen = Screen::Chat;
         app.use_indexed_workspace_search();
         app.composer.insert_text("@src");
-        app.set_indexed_file_suggestions(
-            "src".into(),
-            vec!["src/app.rs".into(), "src/runtime.rs".into()],
-        );
+        set_indexed_files(&mut app, &["src/app.rs", "src/runtime.rs"]);
         app.set_suggestion_selection(1);
 
-        app.set_indexed_file_suggestions(
-            "src".into(),
-            vec!["src/runtime.rs".into(), "src/app.rs".into()],
-        );
+        set_indexed_files(&mut app, &["src/runtime.rs", "src/app.rs"]);
 
         assert_eq!(app.selected_suggestion(), 0);
         assert_eq!(app.suggestions()[0].label, "src/runtime.rs");
@@ -1432,17 +2040,11 @@ mod tests {
         app.screen = Screen::Chat;
         app.use_indexed_workspace_search();
         app.composer.insert_text("@src");
-        app.set_indexed_file_suggestions(
-            "src".into(),
-            vec!["src/app.rs".into(), "src/runtime.rs".into()],
-        );
+        set_indexed_files(&mut app, &["src/app.rs", "src/runtime.rs"]);
         app.set_suggestion_selection(1);
 
         app.composer.insert_text("m");
-        app.set_indexed_file_suggestions(
-            "srcm".into(),
-            vec!["src/runtime.rs".into(), "src/main.rs".into()],
-        );
+        set_indexed_files(&mut app, &["src/runtime.rs", "src/main.rs"]);
 
         assert_eq!(app.selected_suggestion(), 0);
         assert_eq!(app.suggestions()[0].label, "src/runtime.rs");
@@ -1465,7 +2067,7 @@ mod tests {
         app.composer.insert_text("@src/ma");
         assert_eq!(app.suggestions()[0].label, "src/main.rs");
 
-        app.composer.take_submission();
+        app.composer.clear();
         app.composer.insert_text("inspect @src/ma");
         assert_eq!(app.suggestions()[0].label, "src/main.rs");
     }
@@ -1478,8 +2080,9 @@ mod tests {
 
         assert!(app.suggestions().is_empty());
         assert!(matches!(
-            app.handle_key(key(KeyCode::Enter), Instant::now()),
-            Some(AppAction::Submit { prompt, .. }) if prompt == "please inspect @somebf here"
+            press_and_preflight(&mut app, KeyCode::Enter),
+            Some(AppAction::Submit { request, .. })
+                if request.history_prompt() == "please inspect @somebf here"
         ));
     }
 
@@ -1499,8 +2102,8 @@ mod tests {
         app.composer.insert_text("/auth later");
         assert!(app.suggestions().is_empty());
         assert!(matches!(
-            app.handle_key(key(KeyCode::Enter), Instant::now()),
-            Some(AppAction::Submit { prompt, .. }) if prompt == "/auth later"
+            press_and_preflight(&mut app, KeyCode::Enter),
+            Some(AppAction::Submit { request, .. }) if request.history_prompt() == "/auth later"
         ));
     }
 
@@ -1512,22 +2115,16 @@ mod tests {
         app.handle_key(key(KeyCode::Tab), Instant::now());
 
         assert!(matches!(
-            app.handle_key(key(KeyCode::Enter), Instant::now()),
-            Some(AppAction::Submit {
-                mode: SessionMode::Plan,
-                ..
-            })
+            press_and_preflight(&mut app, KeyCode::Enter),
+            Some(AppAction::Submit { request, .. }) if request.mode() == SessionMode::Plan
         ));
         assert_eq!(app.session_mode, SessionMode::Plan);
 
         app.composer.insert_text("make it now");
         app.handle_key(key(KeyCode::Tab), Instant::now());
         assert!(matches!(
-            app.handle_key(key(KeyCode::Enter), Instant::now()),
-            Some(AppAction::Submit {
-                mode: SessionMode::Build,
-                ..
-            })
+            press_and_preflight(&mut app, KeyCode::Enter),
+            Some(AppAction::Submit { request, .. }) if request.mode() == SessionMode::Build
         ));
         assert_eq!(app.session_mode, SessionMode::Build);
     }
@@ -1541,14 +2138,14 @@ mod tests {
 
         assert_eq!(app.effective_mode(), SessionMode::Build);
         app.select_mode(SessionMode::Build);
-        assert_eq!(app.composer.text(), "keep @src/");
+        assert_eq!(app.composer.submission_text(), "keep @src/");
         assert_eq!(app.handle_key(key(KeyCode::Tab), Instant::now()), None);
         assert_eq!(app.effective_mode(), SessionMode::Plan);
-        assert_eq!(app.composer.text(), "keep @src/");
+        assert_eq!(app.composer.submission_text(), "keep @src/");
 
         assert_eq!(app.handle_key(key(KeyCode::Tab), Instant::now()), None);
         assert_eq!(app.effective_mode(), SessionMode::Build);
-        assert_eq!(app.composer.text(), "keep @src/");
+        assert_eq!(app.composer.submission_text(), "keep @src/");
     }
 
     #[test]
@@ -1559,8 +2156,8 @@ mod tests {
 
         let labels: Vec<_> = app
             .suggestions()
-            .into_iter()
-            .map(|suggestion| suggestion.label)
+            .iter()
+            .map(|suggestion| suggestion.label.clone())
             .collect();
         assert!(!labels.contains(&"/plan".to_owned()));
         assert!(!labels.contains(&"/build".to_owned()));
@@ -1594,7 +2191,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter), Instant::now());
 
         assert_eq!(app.notice.as_deref(), Some("command executed"));
-        assert!(app.composer.text().is_empty());
+        assert!(app.composer.submission_text().is_empty());
     }
 
     #[test]
@@ -1689,16 +2286,13 @@ mod tests {
         assert_eq!(app.screen, Screen::Chat);
 
         app.composer.insert_text("hello");
-        let action = app.handle_key(key(KeyCode::Enter), Instant::now());
-        assert_eq!(
+        let action = press_and_preflight(&mut app, KeyCode::Enter);
+        assert!(matches!(
             action,
-            Some(AppAction::Submit {
-                request_id: 1,
-                prompt: "hello".into(),
-                attachments: Vec::new(),
-                mode: SessionMode::Build,
-            })
-        );
+            Some(AppAction::Submit { request_id: 1, request })
+                if request.history_prompt() == "hello"
+                    && request.mode() == SessionMode::Build
+        ));
         assert!(matches!(
             &app.transcript.entries()[1].kind,
             EntryKind::Assistant(message) if message.status == AssistantStatus::Queued
@@ -1756,7 +2350,7 @@ mod tests {
         );
         app.composer.insert_text("three");
 
-        assert_eq!(app.composer.text(), "one\ntwo\nthree");
+        assert_eq!(app.composer.submission_text(), "one\ntwo\nthree");
     }
 
     #[test]
@@ -1767,7 +2361,7 @@ mod tests {
         app.handle_key(key(KeyCode::Left), Instant::now());
         app.handle_key(key(KeyCode::Backspace), Instant::now());
 
-        assert_eq!(app.composer.text(), "ab");
+        assert_eq!(app.composer.submission_text(), "ab");
     }
 
     #[test]
@@ -1779,11 +2373,11 @@ mod tests {
 
         app.handle_key(key(KeyCode::Up), Instant::now());
         app.handle_key(key(KeyCode::Char('X')), Instant::now());
-        assert_eq!(app.composer.text(), "abcdXefghij-END");
+        assert_eq!(app.composer.submission_text(), "abcdXefghij-END");
 
         app.handle_key(key(KeyCode::Down), Instant::now());
         app.handle_key(key(KeyCode::Char('Y')), Instant::now());
-        assert_eq!(app.composer.text(), "abcdXefghij-ENDY");
+        assert_eq!(app.composer.submission_text(), "abcdXefghij-ENDY");
     }
 
     #[test]
@@ -1964,7 +2558,7 @@ mod tests {
         app.screen = Screen::Chat;
         app.composer.insert_text("Review @src/lib.rs");
         app.activate_suggestion(0);
-        let _ = app.handle_key(key(KeyCode::Enter), Instant::now());
+        let _ = press_and_preflight(&mut app, KeyCode::Enter);
         let user_entry = app.transcript.entries()[0].id;
 
         app.activate_transcript_entry(user_entry);

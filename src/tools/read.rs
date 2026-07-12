@@ -1,7 +1,7 @@
 use super::{
     AgentTool, ToolDisplay, ToolExecutionContext, ToolFailure, ToolInvocation, ToolResult, ToolSpec,
 };
-use crate::composer::SessionMode;
+use crate::session::SessionMode;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::json;

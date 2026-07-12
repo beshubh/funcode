@@ -1,15 +1,19 @@
 pub mod transcript;
 
+pub use crate::app::PointerTarget as UiTarget;
 use crate::{
-    app::{App, AuthProvider, ModelsDialogPhase, Screen, Suggestion, SuggestionKind},
-    composer::{SessionMode, layout_composer},
+    app::{
+        App, AuthProvider, ModelsDialogPhase, PendingSubmissionView, Screen, Suggestion,
+        SuggestionKind,
+    },
+    composer::{DisplayLine, DisplayRunKind},
+    session::SessionMode,
     theme::{Theme, ThemeId, ThemeRole},
-    transcript::EntryId,
 };
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Margin, Position, Rect},
-    style::{Modifier, Style},
+    style::Modifier,
     text::{Line, Span, Text},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
@@ -21,17 +25,6 @@ const HOME_MIN_HEIGHT: u16 = 20;
 const COMPOSER_HORIZONTAL_PADDING: u16 = 2;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
 const COMPOSER_BORDER_HEIGHT: u16 = 2;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UiTarget {
-    TranscriptEntry(EntryId),
-    AuthProvider(usize),
-    Suggestion(usize),
-    MessageCopy,
-    Theme(usize),
-    Model(usize),
-    ModelRefresh,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelRegion {
@@ -123,24 +116,120 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
     };
 
     if app.auth_dialog.is_some() && area.width >= HOME_MIN_WIDTH && area.height >= HOME_MIN_HEIGHT {
+        regions = UiRegions::default();
         regions.auth_providers = render_auth_dialog(frame, area, app, theme);
     } else if app.message_dialog.is_some()
         && area.width >= CHAT_MIN_WIDTH
         && area.height >= CHAT_MIN_HEIGHT
     {
+        regions = UiRegions::default();
         regions.message_copy = render_message_dialog(frame, area, app, theme);
     } else if app.theme_dialog.is_some()
         && area.width >= CHAT_MIN_WIDTH
         && area.height >= CHAT_MIN_HEIGHT
     {
+        regions = UiRegions::default();
         regions.theme_options = render_theme_dialog(frame, area, app, theme);
     } else if app.models_dialog.is_some()
         && area.width >= CHAT_MIN_WIDTH
         && area.height >= CHAT_MIN_HEIGHT
     {
+        regions = UiRegions::default();
         (regions.models, regions.model_refresh) = render_models_dialog(frame, area, app, theme);
+    } else if app.paste_confirmation().is_some()
+        && area.width >= CHAT_MIN_WIDTH
+        && area.height >= CHAT_MIN_HEIGHT
+    {
+        regions = UiRegions::default();
+        render_paste_confirmation(frame, area, app, theme);
+    } else if app.pending_submission_view().is_some()
+        && area.width >= CHAT_MIN_WIDTH
+        && area.height >= CHAT_MIN_HEIGHT
+    {
+        regions = UiRegions::default();
+        render_pending_submission(frame, area, app, theme);
     }
     regions
+}
+
+fn render_pending_submission(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let Some(pending) = app.pending_submission_view() else {
+        return;
+    };
+    let width = area.width.saturating_sub(8).min(62);
+    let height = 7.min(area.height.saturating_sub(4));
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, dialog_area);
+    let (title, lines) = match pending {
+        PendingSubmissionView::Preflighting => (
+            " Preparing request ",
+            vec![
+                Line::styled(
+                    "Reading attachments and measuring the final request…",
+                    theme.style(ThemeRole::Text),
+                ),
+                Line::raw(""),
+                Line::styled("Esc cancel", theme.style(ThemeRole::MutedText)),
+            ],
+        ),
+        PendingSubmissionView::Confirming { bytes } => (
+            " Large request ",
+            vec![
+                Line::styled(
+                    format!("Send the prepared {} KiB request?", bytes.div_ceil(1024)),
+                    theme.style(ThemeRole::Text),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    "Enter/y confirm · Esc/n keep editing",
+                    theme.style(ThemeRole::MutedText),
+                ),
+            ],
+        ),
+    };
+    let block = panel_block(title, theme);
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn render_paste_confirmation(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let Some(proposal) = app.paste_confirmation() else {
+        return;
+    };
+    let width = area.width.saturating_sub(8).min(58);
+    let height = 7.min(area.height.saturating_sub(4));
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, dialog_area);
+    let block = panel_block(" Large paste ", theme);
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+    let content = Text::from(vec![
+        Line::styled(
+            format!(
+                "Paste {} lines ({} KiB)?",
+                proposal.line_count(),
+                proposal.projected_bytes().div_ceil(1024)
+            ),
+            theme.style(ThemeRole::Text),
+        ),
+        Line::raw(""),
+        Line::styled(
+            "Enter/y confirm · Esc/n cancel",
+            theme.style(ThemeRole::MutedText),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(content), inner);
 }
 
 fn render_theme_dialog(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) -> Vec<Rect> {
@@ -525,13 +614,12 @@ fn render_message_dialog(
     frame.render_widget(block, dialog_area);
 
     let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).split(inner);
-    let lines = message
-        .content
-        .lines(theme.style(ThemeRole::Text), theme.accent_badge());
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
-        rows[0],
+    let message_layout = message.content.layout(rows[0].width.max(1) as usize);
+    let lines = display_lines(
+        &message_layout.visible_rows(0, rows[0].height as usize),
+        theme,
     );
+    frame.render_widget(Paragraph::new(Text::from(lines)), rows[0]);
     let action_line = Line::from(vec![
         Span::styled(
             " Copy ",
@@ -809,40 +897,35 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
         COMPOSER_HORIZONTAL_PADDING,
         COMPOSER_VERTICAL_PADDING,
     ));
-    let layout = layout_composer(
-        app.composer.text(),
-        app.composer.cursor(),
-        app.composer
-            .content()
-            .lines(theme.style(ThemeRole::Text), theme.accent_badge()),
-        input_area.width.max(1),
-    );
-    let (cursor_column, cursor_row) = layout.cursor;
-    let vertical_scroll = cursor_row.saturating_sub(input_area.height.saturating_sub(1));
-    let content = if app.composer.text().is_empty() {
+    let layout = app.composer.layout(input_area.width.max(1) as usize);
+    let cursor = app.composer.cursor_geometry(&layout);
+    let viewport_height = input_area.height as usize;
+    let vertical_scroll = cursor.row.saturating_sub(viewport_height.saturating_sub(1));
+    let content = if app.composer.is_empty() {
         Text::from(Line::styled(
             "Type something…",
             theme.style(ThemeRole::MutedText),
         ))
     } else {
-        Text::from(layout.lines)
+        Text::from(display_lines(
+            &layout.visible_rows(vertical_scroll, viewport_height),
+            theme,
+        ))
     };
 
     frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(content).scroll((vertical_scroll, 0)),
-        input_area,
-    );
-    if app.auth_dialog.is_none()
-        && app.message_dialog.is_none()
-        && app.theme_dialog.is_none()
-        && app.models_dialog.is_none()
-    {
+    frame.render_widget(Paragraph::new(content), input_area);
+    if app.composer_cursor_visible() {
         frame.set_cursor_position((
-            input_area.x.saturating_add(cursor_column),
             input_area
-                .y
-                .saturating_add(cursor_row.saturating_sub(vertical_scroll)),
+                .x
+                .saturating_add(cursor.column.min(u16::MAX as usize) as u16),
+            input_area.y.saturating_add(
+                cursor
+                    .row
+                    .saturating_sub(vertical_scroll)
+                    .min(u16::MAX as usize) as u16,
+            ),
         ));
     }
     input_area
@@ -850,23 +933,37 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) 
 
 fn composer_height(app: &App, width: u16) -> u16 {
     let content_width = composer_content_width(width);
-    let lines = app
+    let line_count = app
         .composer
-        .content()
-        .lines(Style::default(), Style::default());
-    let line_count = layout_composer(
-        app.composer.text(),
-        app.composer.text().len(),
-        lines,
-        content_width,
-    )
-    .lines
-    .len()
-    .min(u16::MAX as usize) as u16;
+        .layout(content_width as usize)
+        .total_rows()
+        .min(u16::MAX as usize) as u16;
     line_count
         .saturating_add(COMPOSER_BORDER_HEIGHT)
         .saturating_add(COMPOSER_VERTICAL_PADDING.saturating_mul(2))
         .max(5)
+}
+
+fn display_lines(lines: &[DisplayLine], theme: &Theme) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .map(|line| {
+            Line::from(
+                line.runs
+                    .iter()
+                    .map(|run| {
+                        let style = match run.kind {
+                            DisplayRunKind::Text => theme.style(ThemeRole::Text),
+                            DisplayRunKind::FileReference | DisplayRunKind::PastedBlock => {
+                                theme.accent_badge()
+                            }
+                        };
+                        Span::styled(run.text.clone(), style)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
 }
 
 fn composer_content_width(width: u16) -> u16 {
@@ -1461,8 +1558,27 @@ mod tests {
             regions.target_at(provider.x, provider.y),
             Some(UiTarget::AuthProvider(0))
         );
-        assert!(!regions.transcript_entries.is_empty());
+        assert!(
+            regions.transcript_entries.is_empty(),
+            "the auth owner must hide background hit targets"
+        );
         assert!(!cursor_visible);
+    }
+
+    #[test]
+    fn large_paste_confirmation_hides_cursor_and_background_targets() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "sent".into(), Vec::new());
+        app.handle_paste(&"x".repeat(crate::composer::REQUEST_CONFIRM_BYTES + 1));
+
+        let (screen, cursor_visible, regions, _) = render_to_string(&app, 100, 30);
+
+        assert!(screen.contains("Large paste"));
+        assert!(screen.contains("confirm"));
+        assert!(!cursor_visible);
+        assert!(regions.transcript_entries.is_empty());
+        assert!(regions.suggestions.is_empty());
     }
 
     #[test]
@@ -1485,6 +1601,25 @@ mod tests {
         assert_eq!(buffer.cell(Position::new(56, 2)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell(Position::new(57, 2)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell(Position::new(58, 2)).unwrap().symbol(), " ");
+    }
+
+    #[test]
+    fn transcript_tail_remains_visible_beyond_u16_rows() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript
+            .submit(1, format!("{}TAIL", "row\n".repeat(70_000)), Vec::new());
+
+        let (screen, _, regions, _) = render_to_string(&app, 60, 20);
+
+        assert!(screen.contains("TAIL"));
+        assert!(!regions.transcript_entries.is_empty());
+        assert!(
+            regions
+                .transcript_entries
+                .iter()
+                .all(|region| region.area.height <= 20)
+        );
     }
 
     #[test]
@@ -1742,7 +1877,7 @@ mod tests {
         app.transcript.submit(
             1,
             "Review this".into(),
-            vec![crate::transcript::Attachment::workspace_file("src/app.rs")],
+            vec![crate::workspace::Attachment::workspace_file("src/app.rs")],
         );
         app.open_message_dialog(app.transcript.entries()[0].id);
 
@@ -1763,7 +1898,7 @@ mod tests {
         app.transcript.submit(
             1,
             "Please inspect this".into(),
-            vec![crate::transcript::Attachment::workspace_file("src/app.rs")],
+            vec![crate::workspace::Attachment::workspace_file("src/app.rs")],
         );
 
         let (screen, _, regions, _) = render_to_string(&app, 100, 30);

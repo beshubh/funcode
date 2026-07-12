@@ -4,9 +4,9 @@ mod search;
 mod terminal;
 mod workspace;
 
-pub(crate) use workspace::{ReadFile, WorkspaceFileReader};
+pub(crate) use workspace::WorkspaceFileReader;
 
-use crate::composer::SessionMode;
+use crate::session::SessionMode;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use std::{
@@ -323,7 +323,7 @@ mod tests {
         AgentTool, ToolDisplay, ToolEvent, ToolExecutionContext, ToolFailure, ToolRegistry,
         ToolResult, ToolSession, ToolSpec, read::ReadFileTool,
     };
-    use crate::composer::SessionMode;
+    use crate::session::SessionMode;
     use futures::future::BoxFuture;
     use serde_json::json;
     use std::{

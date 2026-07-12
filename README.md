@@ -48,6 +48,10 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - Type `/` at the start of the composer: browse registered commands
 - Type `@` at the start of a token: insert a highlighted workspace-file reference in place
 - Unmatched `@text` stays plain text
+- Multiline bracketed paste: insert one atomic `[N lines pasted]` block; Left/Right skip it and
+  Backspace/Delete removes the whole block
+- Pasted CRLF and bare CR are normalized to LF. Tabs and other controls remain intact for the model
+  but are rendered safely in the terminal
 - Move the mouse over a suggestion to highlight it; click to activate it
 - Drag across terminal text to select and automatically copy it to the clipboard
 - Click a sent message: open a modal and copy its text and attached paths
@@ -57,14 +61,18 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
 - `/theme`: preview and select a bundled color theme
 - `/exit`: quit
 
-Prompts submitted while the runner is busy are shown immediately and processed in FIFO order. Only
-completed turns are included in later model context; failed or interrupted turns remain visible but
-are not sent again. Thinking is shown until the first response text arrives. Tool calls remain as
-expandable transcript blocks after completion. New composer commands implement
+Enter freezes the visible draft while a background preflight reads referenced files fresh and
+measures the complete request. A failed or cancelled preflight leaves the draft unchanged. Requests
+over 256 KiB require confirmation, and requests over 1 MiB are rejected; each attached file also
+retains its 256 KiB limit. Accepted prompts are then shown and processed in FIFO order. Only completed
+turns are included in later model context; failed or interrupted turns remain visible but are not
+sent again. Thinking is shown until the first response text arrives. Tool calls remain as expandable
+transcript blocks after completion. New composer commands implement
 the `Command` trait and are added through `App::register_command`; command actions can update app
 state and optionally return an `AppAction` for the runtime to dispatch. The commands displayed on the
 home screen and command popup both read from this registry, so they stay in sync. Plan/Build is
-session state controlled with Tab or the composer tabs, rather than composer text or slash commands.
+session state controlled with Tab and reflected by the composer labels, rather than composer text or
+slash commands.
 
 ## Agent tools
 

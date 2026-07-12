@@ -1,10 +1,11 @@
 use crate::{
     agent::{AgentEvent, AgentTaskRunner},
-    app::{App, AppAction, AuthProvider, FILE_SUGGESTION_LIMIT},
+    app::{App, AppAction, AuthProvider, FILE_SUGGESTION_LIMIT, PointerEvent},
     auth::{AuthEvent, AuthStore, AuthTaskRunner},
     clipboard::{ClipboardEvent, ClipboardTaskRunner},
     llm::{LlmClient, LlmConfig},
     model_catalog::ModelCatalogTaskRunner,
+    submission::{SubmissionEvent, SubmissionTaskRunner},
     terminal_selection::TerminalSelection,
     theme::{Theme, ThemeConfigEvent, ThemeConfigLoad, ThemeConfigStore, ThemeConfigTaskRunner},
     ui, workspace,
@@ -36,6 +37,27 @@ const TICK_RATE: Duration = Duration::from_millis(50);
 const WORKSPACE_SUGGESTION_REFRESH: Duration = Duration::from_millis(500);
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+#[derive(Debug)]
+struct RedrawScheduler {
+    dirty: bool,
+}
+
+impl Default for RedrawScheduler {
+    fn default() -> Self {
+        Self { dirty: true }
+    }
+}
+
+impl RedrawScheduler {
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LaunchMode {
@@ -97,6 +119,10 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         .as_ref()
         .cloned()
         .map(workspace::WorkspaceTaskRunner::spawn);
+    let mut submission_runner = workspace_root
+        .as_ref()
+        .cloned()
+        .map(SubmissionTaskRunner::spawn);
     let mut app = match &launch_mode {
         LaunchMode::Interactive(_) => App::new(),
         LaunchMode::AuthOnly => App::for_auth(),
@@ -131,7 +157,9 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
             (
                 Some(AgentTaskRunner::spawn_in(
                     llm.clone(),
-                    workspace_root.expect("interactive mode has a workspace"),
+                    workspace_root
+                        .clone()
+                        .expect("interactive mode has a workspace"),
                 )),
                 Some(ModelCatalogTaskRunner::spawn(llm)),
             )
@@ -145,12 +173,14 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     let mut regions = ui::UiRegions::default();
     let mut selection = TerminalSelection::default();
     let mut rendered_buffer = Buffer::empty(ratatui::layout::Rect::default());
-    let mut last_workspace_search: Option<(String, Instant)> = None;
+    let mut last_workspace_search: Option<(crate::composer::QueryId, Instant)> = None;
     let mut workspace_search_ready = false;
+    let mut redraw = RedrawScheduler::default();
 
     while !should_quit {
         if let Some(workspace_runner) = workspace_runner.as_ref() {
             while let Some(event) = workspace_runner.try_event() {
+                redraw.mark_dirty();
                 match event {
                     workspace::WorkspaceEvent::Ready { warning } => {
                         app.use_indexed_workspace_search();
@@ -159,8 +189,8 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                             app.set_notice(warning);
                         }
                     }
-                    workspace::WorkspaceEvent::Suggestions { query, paths } => {
-                        app.set_indexed_file_suggestions(query, paths);
+                    workspace::WorkspaceEvent::Suggestions { query_id, paths } => {
+                        app.set_indexed_file_suggestions(query_id, paths);
                     }
                 }
             }
@@ -168,21 +198,45 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         if let Some(runner) = runner.as_ref() {
             while let Some(agent_event) = runner.try_event() {
                 app.handle_agent_event(agent_event);
+                redraw.mark_dirty();
+            }
+        }
+        if let Some(submission_runner) = submission_runner.as_ref() {
+            while let Some(event) = submission_runner.try_event() {
+                redraw.mark_dirty();
+                if let Some(action) = app.handle_submission_event(event) {
+                    should_quit = dispatch(
+                        action,
+                        DispatchContext {
+                            app: &mut app,
+                            runner: runner.as_ref(),
+                            submission_runner: Some(submission_runner),
+                            model_runner: model_runner.as_ref(),
+                            auth_runner: &auth_runner,
+                            clipboard: &clipboard,
+                            theme_runner: theme_runner.as_ref(),
+                        },
+                    );
+                }
             }
         }
         while let Some(auth_event) = auth_runner.try_event() {
             app.handle_auth_event(auth_event);
+            redraw.mark_dirty();
         }
         if let Some(model_runner) = model_runner.as_ref() {
             while let Some(event) = model_runner.try_event() {
                 app.handle_model_catalog_event(event);
+                redraw.mark_dirty();
             }
         }
         while let Some(clipboard_event) = clipboard.try_event() {
             handle_clipboard_event(&mut app, clipboard_event);
+            redraw.mark_dirty();
         }
         if let Some(theme_runner) = theme_runner.as_ref() {
             while let Some(event) = theme_runner.try_event() {
+                redraw.mark_dirty();
                 match event {
                     ThemeConfigEvent::Saved(theme_id) => {
                         app.set_notice(format!("Theme changed to {}", theme_id.display_name()));
@@ -196,55 +250,69 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
 
         let workspace_query = app.workspace_file_query();
         if workspace_search_ready
-            && let (Some(workspace_runner), Some(query)) =
+            && let (Some(workspace_runner), Some((query_id, query))) =
                 (workspace_runner.as_ref(), workspace_query.as_ref())
         {
             let should_refresh =
                 last_workspace_search
                     .as_ref()
-                    .is_none_or(|(last_query, requested_at)| {
-                        last_query != query
+                    .is_none_or(|(last_query_id, requested_at)| {
+                        last_query_id != query_id
                             || requested_at.elapsed() >= WORKSPACE_SUGGESTION_REFRESH
                     });
             if should_refresh
-                && workspace_runner.request_suggestions(query.clone(), FILE_SUGGESTION_LIMIT)
+                && workspace_runner.request_suggestions(
+                    *query_id,
+                    query.clone(),
+                    FILE_SUGGESTION_LIMIT,
+                )
             {
-                last_workspace_search = Some((query.clone(), Instant::now()));
+                last_workspace_search = Some((*query_id, Instant::now()));
             }
         } else if workspace_query.is_none() {
             last_workspace_search = None;
         }
 
-        terminal
-            .draw(|frame| {
-                let theme = Theme::resolve(app.effective_theme_id());
-                regions = ui::render(frame, &app, &theme);
-                selection.highlight(frame.buffer_mut());
-                rendered_buffer = frame.buffer_mut().clone();
-            })
-            .context("failed to draw the terminal UI")?;
-        if let Some(area) = regions.composer_input {
-            app.set_composer_width(area.width);
+        if redraw.take_dirty() {
+            terminal
+                .draw(|frame| {
+                    let theme = Theme::resolve(app.effective_theme_id());
+                    regions = ui::render(frame, &app, &theme);
+                    selection.highlight(frame.buffer_mut());
+                    rendered_buffer = frame.buffer_mut().clone();
+                })
+                .context("failed to draw the terminal UI")?;
+            if let Some(area) = regions.composer_input {
+                app.set_composer_width(area.width);
+            }
         }
 
         let timeout = next_tick.saturating_duration_since(Instant::now());
         if event::poll(timeout).context("failed to poll terminal input")? {
             match event::read().context("failed to read terminal input")? {
                 Event::Key(key) if matches!(key.kind, KeyEventKind::Press) => {
+                    redraw.mark_dirty();
                     if let Some(action) = app.handle_key(key, Instant::now()) {
                         should_quit = dispatch(
                             action,
-                            &mut app,
-                            runner.as_ref(),
-                            model_runner.as_ref(),
-                            &auth_runner,
-                            &clipboard,
-                            theme_runner.as_ref(),
+                            DispatchContext {
+                                app: &mut app,
+                                runner: runner.as_ref(),
+                                submission_runner: submission_runner.as_ref(),
+                                model_runner: model_runner.as_ref(),
+                                auth_runner: &auth_runner,
+                                clipboard: &clipboard,
+                                theme_runner: theme_runner.as_ref(),
+                            },
                         );
                     }
                 }
-                Event::Paste(text) => app.handle_paste(&text),
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                    redraw.mark_dirty();
+                }
                 Event::Mouse(mouse) => {
+                    redraw.mark_dirty();
                     match handle_selection_mouse_event(&mut selection, &rendered_buffer, mouse) {
                         Some(SelectionMouseEvent::Copy(text)) => {
                             if let Err(error) = clipboard.copy(text, "Selection copied") {
@@ -255,24 +323,30 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                             if let Some(action) = handle_mouse_event(&mut app, &regions, mouse) {
                                 should_quit = dispatch(
                                     action,
-                                    &mut app,
-                                    runner.as_ref(),
-                                    model_runner.as_ref(),
-                                    &auth_runner,
-                                    &clipboard,
-                                    theme_runner.as_ref(),
+                                    DispatchContext {
+                                        app: &mut app,
+                                        runner: runner.as_ref(),
+                                        submission_runner: submission_runner.as_ref(),
+                                        model_runner: model_runner.as_ref(),
+                                        auth_runner: &auth_runner,
+                                        clipboard: &clipboard,
+                                        theme_runner: theme_runner.as_ref(),
+                                    },
                                 );
                             }
                         }
                         Some(SelectionMouseEvent::Consumed) => {}
                     }
                 }
+                Event::Resize(_, _) => redraw.mark_dirty(),
                 _ => {}
             }
         }
 
         if Instant::now() >= next_tick {
-            app.tick();
+            if app.tick() {
+                redraw.mark_dirty();
+            }
             next_tick = Instant::now() + TICK_RATE;
         }
     }
@@ -282,6 +356,9 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     }
     if let Some(model_runner) = model_runner.as_mut() {
         model_runner.shutdown();
+    }
+    if let Some(submission_runner) = submission_runner.as_mut() {
+        submission_runner.shutdown();
     }
     auth_runner.shutdown();
     clipboard.shutdown();
@@ -331,92 +408,80 @@ fn handle_mouse_event(
     regions: &ui::UiRegions,
     mouse: crossterm::event::MouseEvent,
 ) -> Option<AppAction> {
-    match mouse.kind {
-        MouseEventKind::Up(MouseButton::Left) => match regions.target_at(mouse.column, mouse.row) {
-            Some(ui::UiTarget::TranscriptEntry(entry_id)) => {
-                app.activate_transcript_entry(entry_id);
-                None
-            }
-            Some(ui::UiTarget::MessageCopy) => app.copy_message_dialog(),
-            Some(ui::UiTarget::AuthProvider(index)) => {
-                app.set_auth_selection(index);
-                app.select_auth_provider()
-            }
-            Some(ui::UiTarget::Suggestion(index)) => app.activate_suggestion(index),
-            Some(ui::UiTarget::Theme(index)) => {
-                app.set_theme_selection(index);
-                app.commit_theme_selection()
-            }
-            Some(ui::UiTarget::Model(index)) => app.activate_model(index),
-            Some(ui::UiTarget::ModelRefresh) => app.refresh_models(),
-            None => None,
-        },
-        MouseEventKind::Moved => {
-            match regions.target_at(mouse.column, mouse.row) {
-                Some(ui::UiTarget::Suggestion(index)) => app.set_suggestion_selection(index),
-                Some(ui::UiTarget::AuthProvider(index)) => app.set_auth_selection(index),
-                Some(ui::UiTarget::Theme(index)) => app.set_theme_selection(index),
-                Some(ui::UiTarget::Model(index)) => app.set_model_selection(index),
-                _ => {}
-            }
-            None
-        }
-        MouseEventKind::ScrollUp => {
-            if app.auth_dialog.is_some() {
-                app.move_auth_selection(-1);
-            } else if app.theme_dialog.is_some() {
-                app.move_theme_selection(-1);
-            } else if app.models_dialog.is_some() {
-                app.scroll_models_up();
-            } else if !app.suggestions().is_empty() {
-                app.move_suggestion_selection(-1);
-            } else if app.message_dialog.is_none() {
-                app.scroll_transcript_up();
-            }
-            None
-        }
-        MouseEventKind::ScrollDown => {
-            if app.auth_dialog.is_some() {
-                app.move_auth_selection(1);
-            } else if app.theme_dialog.is_some() {
-                app.move_theme_selection(1);
-            } else if app.models_dialog.is_some() {
-                app.scroll_models_down();
-            } else if !app.suggestions().is_empty() {
-                app.move_suggestion_selection(1);
-            } else if app.message_dialog.is_none() {
-                app.scroll_transcript_down();
-            }
-            None
-        }
-        _ => None,
-    }
+    let target = || regions.target_at(mouse.column, mouse.row);
+    let event = match mouse.kind {
+        MouseEventKind::Up(MouseButton::Left) => PointerEvent::Activate(target()),
+        MouseEventKind::Moved => PointerEvent::Hover(target()),
+        MouseEventKind::ScrollUp => PointerEvent::ScrollUp,
+        MouseEventKind::ScrollDown => PointerEvent::ScrollDown,
+        _ => return None,
+    };
+    app.handle_pointer(event)
 }
 
-fn dispatch(
-    action: AppAction,
-    app: &mut App,
-    runner: Option<&AgentTaskRunner>,
-    model_runner: Option<&ModelCatalogTaskRunner>,
-    auth_runner: &AuthTaskRunner,
-    clipboard: &ClipboardTaskRunner,
-    theme_runner: Option<&ThemeConfigTaskRunner>,
-) -> bool {
+struct DispatchContext<'a> {
+    app: &'a mut App,
+    runner: Option<&'a AgentTaskRunner>,
+    submission_runner: Option<&'a SubmissionTaskRunner>,
+    model_runner: Option<&'a ModelCatalogTaskRunner>,
+    auth_runner: &'a AuthTaskRunner,
+    clipboard: &'a ClipboardTaskRunner,
+    theme_runner: Option<&'a ThemeConfigTaskRunner>,
+}
+
+fn dispatch(action: AppAction, context: DispatchContext<'_>) -> bool {
+    let DispatchContext {
+        app,
+        runner,
+        submission_runner,
+        model_runner,
+        auth_runner,
+        clipboard,
+        theme_runner,
+    } = context;
     match action {
+        AppAction::Preflight {
+            draft_id,
+            content,
+            mode,
+        } => {
+            match submission_runner {
+                Some(runner) => {
+                    if let Err(error) = runner.request(draft_id, content, mode) {
+                        let _ = app.handle_submission_event(SubmissionEvent::Failed {
+                            draft_id,
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                None => {
+                    let _ = app.handle_submission_event(SubmissionEvent::Failed {
+                        draft_id,
+                        message: "submission preflight is unavailable in authentication-only mode"
+                            .into(),
+                    });
+                }
+            }
+            false
+        }
+        AppAction::CancelPreflight { draft_id } => {
+            if let Some(runner) = submission_runner
+                && let Err(error) = runner.cancel(draft_id)
+            {
+                let _ = app.handle_submission_event(SubmissionEvent::Failed {
+                    draft_id,
+                    message: error.to_string(),
+                });
+            }
+            false
+        }
         AppAction::Submit {
             request_id,
-            prompt,
-            attachments,
-            mode,
+            request,
         } => {
             match runner {
                 Some(runner) => {
-                    if let Err(error) = runner.submit_with_attachments_and_mode(
-                        request_id,
-                        prompt,
-                        attachments,
-                        mode,
-                    ) {
+                    if let Err(error) = runner.submit_prepared(request_id, request) {
                         app.handle_agent_event(AgentEvent::Failed {
                             request_id,
                             message: error.to_string(),
@@ -624,8 +689,8 @@ fn install_restoring_panic_hook(keyboard_enhancement: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        LaunchMode, SelectionMouseEvent, dispatch, handle_clipboard_event, handle_mouse_event,
-        handle_selection_mouse_event,
+        DispatchContext, LaunchMode, RedrawScheduler, SelectionMouseEvent, dispatch,
+        handle_clipboard_event, handle_mouse_event, handle_selection_mouse_event,
     };
     use crate::{
         app::{App, AppAction, Screen},
@@ -648,6 +713,20 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn redraw_scheduler_stays_clean_across_idle_wakeups() {
+        let mut redraw = RedrawScheduler::default();
+
+        assert!(redraw.take_dirty());
+        for _ in 0..100 {
+            assert!(!redraw.take_dirty());
+        }
+
+        redraw.mark_dirty();
+        assert!(redraw.take_dirty());
+        assert!(!redraw.take_dirty());
     }
 
     #[derive(Default)]
@@ -890,6 +969,50 @@ mod tests {
     }
 
     #[test]
+    fn message_owner_blocks_hidden_suggestion_wheel_input() {
+        let mut app = App::with_files(["src/app.rs", "src/runtime.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("@src");
+        app.set_suggestion_selection(0);
+        app.transcript.submit(1, "sent".into(), Vec::new());
+        app.open_message_dialog(app.transcript.entries()[0].id);
+
+        handle_mouse_event(
+            &mut app,
+            &UiRegions::default(),
+            mouse(MouseEventKind::ScrollDown, 0, 0),
+        );
+
+        assert_eq!(app.selected_suggestion(), 0);
+        assert_eq!(app.scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn modal_owner_blocks_clicks_on_background_transcript_regions() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "sent".into(), Vec::new());
+        let entry_id = app.transcript.entries()[0].id;
+        app.open_auth_dialog();
+        let regions = UiRegions {
+            transcript_entries: vec![crate::ui::transcript::EntryRegion {
+                id: entry_id,
+                area: Rect::new(2, 2, 20, 3),
+            }],
+            ..UiRegions::default()
+        };
+
+        handle_mouse_event(
+            &mut app,
+            &regions,
+            mouse(MouseEventKind::Up(MouseButton::Left), 3, 3),
+        );
+
+        assert!(app.message_dialog.is_none());
+        assert!(app.auth_dialog.is_some());
+    }
+
+    #[test]
     fn copy_action_uses_the_clipboard_and_shows_confirmation() {
         let mut app = App::new();
         let mut auth_runner = AuthTaskRunner::spawn();
@@ -899,12 +1022,15 @@ mod tests {
             AppAction::CopyToClipboard {
                 text: "copied message".into(),
             },
-            &mut app,
-            None,
-            None,
-            &auth_runner,
-            &clipboard,
-            None,
+            DispatchContext {
+                app: &mut app,
+                runner: None,
+                submission_runner: None,
+                model_runner: None,
+                auth_runner: &auth_runner,
+                clipboard: &clipboard,
+                theme_runner: None,
+            },
         ));
         handle_clipboard_event(
             &mut app,
