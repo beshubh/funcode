@@ -2,12 +2,14 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use funcode::{
+    agent::AgentEvent,
     app::{App, Screen},
     composer::{ComposerDocument, SubmittedContent},
     session::SessionMode,
     submission::{SubmissionEvent, SubmissionTaskRunner},
     theme::{Theme, ThemeId},
-    ui,
+    transcript::ToolArtifact,
+    ui::{self, UiRenderer},
     workspace::{Attachment, WorkspacePath},
 };
 use ratatui::{Terminal, backend::TestBackend};
@@ -301,6 +303,131 @@ fn transcript_rendering_benchmarks(criterion: &mut Criterion) {
     });
 }
 
+fn transcript_stress_app() -> App {
+    let mut app = App::new();
+    app.screen = Screen::Chat;
+    for request_id in 1..=200 {
+        app.transcript
+            .submit(request_id, format!("prompt {request_id}"), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id,
+            call_id: request_id,
+            name: "terminal".into(),
+            summary: format!("command {request_id}"),
+            artifacts: vec![ToolArtifact::Terminal {
+                description: format!("command {request_id}"),
+                command: "printf output".into(),
+                output: format!("output {request_id}\n"),
+                exit_code: Some(0),
+            }],
+        });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id,
+            text: format!("answer {request_id}"),
+        });
+        app.handle_agent_event(AgentEvent::Completed { request_id });
+    }
+    let request_id = 201;
+    app.transcript
+        .submit(request_id, "large artifact".into(), Vec::new());
+    app.handle_agent_event(AgentEvent::Started { request_id });
+    app.handle_agent_event(AgentEvent::ToolStarted {
+        request_id,
+        call_id: request_id,
+        name: "terminal".into(),
+        summary: "1,000-line output".into(),
+        artifacts: vec![ToolArtifact::Terminal {
+            description: "1,000-line output".into(),
+            command: "generate-output".into(),
+            output: (0..1_000)
+                .map(|line| format!("artifact-line-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            exit_code: Some(0),
+        }],
+    });
+    app
+}
+
+fn transcript_interaction_benchmarks(criterion: &mut Criterion) {
+    let theme = Theme::resolve(ThemeId::Terminal);
+    let mut app = transcript_stress_app();
+    let renderer = UiRenderer::default();
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    let mut maximum = 0;
+    terminal
+        .draw(|frame| {
+            maximum = renderer
+                .render(frame, &app, &theme)
+                .transcript_scroll_maximum();
+        })
+        .unwrap();
+    app.update_transcript_scroll_maximum(maximum);
+
+    criterion.bench_function(
+        "transcript/cached viewport 200 turns plus 1,000-line artifact",
+        |benchmark| {
+            benchmark.iter(|| {
+                terminal
+                    .draw(|frame| {
+                        black_box(renderer.render(frame, &app, &theme));
+                    })
+                    .unwrap();
+            });
+        },
+    );
+
+    criterion.bench_function("transcript/100 alternating scroll frames", |benchmark| {
+        benchmark.iter(|| {
+            for _ in 0..50 {
+                app.scroll_transcript_up();
+                terminal
+                    .draw(|frame| {
+                        black_box(renderer.render(frame, &app, &theme));
+                    })
+                    .unwrap();
+                app.scroll_transcript_down();
+                terminal
+                    .draw(|frame| {
+                        black_box(renderer.render(frame, &app, &theme));
+                    })
+                    .unwrap();
+            }
+        });
+    });
+
+    criterion.bench_function("transcript/1,000 streamed deltas one frame", |benchmark| {
+        benchmark.iter_batched(
+            || {
+                let mut app = App::new();
+                app.screen = Screen::Chat;
+                app.transcript.submit(1, "prompt".into(), Vec::new());
+                app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+                (
+                    app,
+                    UiRenderer::default(),
+                    Terminal::new(TestBackend::new(100, 30)).unwrap(),
+                )
+            },
+            |(mut app, renderer, mut terminal)| {
+                for _ in 0..1_000 {
+                    app.handle_agent_event(AgentEvent::TextDelta {
+                        request_id: 1,
+                        text: "delta ".into(),
+                    });
+                }
+                terminal
+                    .draw(|frame| {
+                        black_box(renderer.render(frame, &app, &theme));
+                    })
+                    .unwrap();
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
 fn composer_benchmarks(criterion: &mut Criterion) {
     cold_layout_size_matrix(criterion);
     paste_benchmarks(criterion);
@@ -308,6 +435,7 @@ fn composer_benchmarks(criterion: &mut Criterion) {
     cached_layout_and_navigation_benchmarks(criterion);
     submission_preflight_benchmark(criterion);
     transcript_rendering_benchmarks(criterion);
+    transcript_interaction_benchmarks(criterion);
 }
 
 criterion_group! {

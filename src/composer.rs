@@ -740,6 +740,10 @@ impl ComposerDocument {
         self.revision
     }
 
+    pub(crate) const fn interaction_revision(&self) -> u64 {
+        self.cursor_epoch
+    }
+
     pub fn is_empty(&self) -> bool {
         self.semantic_len() == 0
     }

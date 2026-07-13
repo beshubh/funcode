@@ -88,6 +88,24 @@ pub(crate) enum ModelsDialogPhase {
     Failed(String),
 }
 
+const fn models_phase_tag(phase: &ModelsDialogPhase) -> u8 {
+    match phase {
+        ModelsDialogPhase::Loading => 0,
+        ModelsDialogPhase::Loaded(_) => 1,
+        ModelsDialogPhase::Failed(_) => 2,
+    }
+}
+
+const fn auth_phase_tag(phase: &AuthDialogPhase) -> u8 {
+    match phase {
+        AuthDialogPhase::Selecting => 0,
+        AuthDialogPhase::Starting => 1,
+        AuthDialogPhase::WaitingForBrowser { .. } => 2,
+        AuthDialogPhase::Succeeded { .. } => 3,
+        AuthDialogPhase::Failed { .. } => 4,
+    }
+}
+
 impl Default for AuthDialog {
     fn default() -> Self {
         Self {
@@ -157,8 +175,13 @@ pub(crate) enum PointerEvent {
     Activate(Option<PointerTarget>),
     PlaceComposerCursor { column: u16, row: u16, height: u16 },
     Hover(Option<PointerTarget>),
-    ScrollUp,
-    ScrollDown,
+    Scroll(isize),
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PointerOutcome {
+    pub action: Option<AppAction>,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +234,62 @@ pub(crate) enum PendingSubmissionView {
     Confirming { bytes: usize },
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum TranscriptScroll {
+    #[default]
+    Following,
+    Manual {
+        from_bottom: usize,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InputVisualState {
+    screen: Screen,
+    composer_revision: u64,
+    session_mode: SessionMode,
+    transcript_entries: usize,
+    transcript_scroll: TranscriptScroll,
+    message_dialog: Option<EntryId>,
+    notice: Option<String>,
+    auth_dialog: Option<AuthDialog>,
+    theme_dialog: Option<ThemeDialog>,
+    models_phase: Option<u8>,
+    models_selected: usize,
+    paste_confirmation: bool,
+    pending_submission: Option<PendingSubmissionView>,
+    active_theme: ThemeId,
+    suggestion_selected: usize,
+    current_model: String,
+    current_model_context_window: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ModalTransitionState {
+    auth_phase: Option<u8>,
+    message_dialog: bool,
+    theme_dialog: bool,
+    models_phase: Option<u8>,
+    paste_confirmation: bool,
+    pending_submission: Option<PendingSubmissionView>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PointerActivationState {
+    input: InputVisualState,
+    expanded_entries: Vec<EntryId>,
+    collapsed_entries: Vec<EntryId>,
+    context_usage_pop_frames: u8,
+    context_usage_pop_origin: Option<(u16, u16)>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct AppInputOutcome {
+    pub action: Option<AppAction>,
+    pub changed: bool,
+    pub urgent: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct App {
     pub screen: Screen,
@@ -219,8 +298,8 @@ pub struct App {
     pub transcript: Transcript,
     pub active_request: Option<RequestId>,
     pub animation_frame: usize,
-    pub scroll_from_bottom: usize,
-    pub follow_output: bool,
+    transcript_scroll: TranscriptScroll,
+    transcript_scroll_maximum: usize,
     pub expanded_entries: Vec<EntryId>,
     pub collapsed_entries: Vec<EntryId>,
     pub message_dialog: Option<EntryId>,
@@ -259,7 +338,6 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         Self {
-            follow_output: true,
             composer_width: u16::MAX,
             next_request_id: 1,
             next_draft_id: 1,
@@ -368,6 +446,30 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, now: Instant) -> Option<AppAction> {
+        self.handle_key_with_outcome(key, now).action
+    }
+
+    pub(crate) fn handle_key_with_outcome(
+        &mut self,
+        key: KeyEvent,
+        now: Instant,
+    ) -> AppInputOutcome {
+        let before = self.input_visual_state();
+        let before_modal = self.modal_transition_state();
+        let action = self.handle_key_inner(key, now);
+        let after = self.input_visual_state();
+        let after_modal = self.modal_transition_state();
+        let urgent = before_modal != after_modal
+            || (before.notice != after.notice && after.notice.is_some())
+            || matches!(action, Some(AppAction::Quit));
+        AppInputOutcome {
+            action,
+            changed: before != after,
+            urgent,
+        }
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent, now: Instant) -> Option<AppAction> {
         match self.input_owner() {
             InputOwner::Auth => return self.handle_auth_key(key),
             InputOwner::Message => return self.handle_message_dialog_key(key),
@@ -478,9 +580,8 @@ impl App {
                 self.composer.move_home();
                 None
             }
-            KeyCode::End if !self.follow_output => {
-                self.scroll_from_bottom = 0;
-                self.follow_output = true;
+            KeyCode::End if !self.transcript_is_following() => {
+                self.transcript_scroll = TranscriptScroll::Following;
                 None
             }
             KeyCode::End => {
@@ -512,6 +613,24 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        self.handle_paste_with_outcome(text);
+    }
+
+    pub(crate) fn handle_paste_with_outcome(&mut self, text: &str) -> AppInputOutcome {
+        let before = self.input_visual_state();
+        let before_modal = self.modal_transition_state();
+        self.handle_paste_inner(text);
+        let after = self.input_visual_state();
+        let after_modal = self.modal_transition_state();
+        AppInputOutcome {
+            action: None,
+            changed: before != after,
+            urgent: before_modal != after_modal
+                || (before.notice != after.notice && after.notice.is_some()),
+        }
+    }
+
+    fn handle_paste_inner(&mut self, text: &str) {
         if !matches!(
             self.input_owner(),
             InputOwner::Composer | InputOwner::Suggestions
@@ -532,6 +651,42 @@ impl App {
         self.pending_indexed_file_selection = None;
         self.suggestion_selected = 0;
         self.last_escape = None;
+    }
+
+    fn input_visual_state(&self) -> InputVisualState {
+        InputVisualState {
+            screen: self.screen,
+            composer_revision: self.composer.interaction_revision(),
+            session_mode: self.session_mode,
+            transcript_entries: self.transcript.entries().len(),
+            transcript_scroll: self.transcript_scroll,
+            message_dialog: self.message_dialog,
+            notice: self.notice.clone(),
+            auth_dialog: self.auth_dialog.clone(),
+            theme_dialog: self.theme_dialog,
+            models_phase: self.models_dialog.as_ref().map(models_phase_tag),
+            models_selected: self.models_selected,
+            paste_confirmation: self.large_paste_confirmation.is_some(),
+            pending_submission: self.pending_submission_view(),
+            active_theme: self.active_theme,
+            suggestion_selected: self.suggestion_selected,
+            current_model: self.current_model.clone(),
+            current_model_context_window: self.current_model_context_window,
+        }
+    }
+
+    fn modal_transition_state(&self) -> ModalTransitionState {
+        ModalTransitionState {
+            auth_phase: self
+                .auth_dialog
+                .as_ref()
+                .map(|dialog| auth_phase_tag(&dialog.phase)),
+            message_dialog: self.message_dialog.is_some(),
+            theme_dialog: self.theme_dialog.is_some(),
+            models_phase: self.models_dialog.as_ref().map(models_phase_tag),
+            paste_confirmation: self.large_paste_confirmation.is_some(),
+            pending_submission: self.pending_submission_view(),
+        }
     }
 
     pub(crate) fn composer_cursor_visible(&self) -> bool {
@@ -556,9 +711,13 @@ impl App {
             })
     }
 
-    pub(crate) fn handle_pointer(&mut self, event: PointerEvent) -> Option<AppAction> {
+    pub(crate) fn handle_pointer(&mut self, event: PointerEvent) -> PointerOutcome {
         let owner = self.input_owner();
-        match event {
+        let only_changes_selection =
+            matches!(event, PointerEvent::Hover(_) | PointerEvent::Scroll(_));
+        let before = self.pointer_selection_state();
+        let activation_before = (!only_changes_selection).then(|| self.pointer_activation_state());
+        let action = match event {
             PointerEvent::PlaceComposerCursor {
                 column,
                 row,
@@ -625,43 +784,134 @@ impl App {
                 }
                 None
             }
-            PointerEvent::ScrollUp => {
+            PointerEvent::Scroll(delta) => {
+                let direction = if delta > 0 { -1 } else { 1 };
+                let count = delta.unsigned_abs();
                 match owner {
-                    InputOwner::Auth => self.move_auth_selection(-1),
-                    InputOwner::Theme => self.move_theme_selection(-1),
-                    InputOwner::Models => self.scroll_models_up(),
-                    InputOwner::Suggestions => self.move_suggestion_selection(-1),
-                    InputOwner::Composer => self.scroll_transcript_up(),
+                    InputOwner::Composer => {
+                        self.scroll_transcript_by(delta);
+                    }
+                    InputOwner::Auth => {
+                        for _ in 0..count % AuthProvider::ALL.len() {
+                            self.move_auth_selection(direction);
+                        }
+                    }
+                    InputOwner::Theme => {
+                        for _ in 0..count % ThemeId::ALL.len() {
+                            self.move_theme_selection(direction);
+                        }
+                    }
+                    InputOwner::Models => {
+                        self.move_model_selection(delta.saturating_neg());
+                    }
+                    InputOwner::Suggestions => {
+                        let suggestion_count = self.suggestions().len();
+                        for _ in 0..count % suggestion_count.max(1) {
+                            self.move_suggestion_selection(direction);
+                        }
+                    }
                     InputOwner::Message
                     | InputOwner::PasteConfirmation
                     | InputOwner::PendingSubmission => {}
                 }
                 None
             }
-            PointerEvent::ScrollDown => {
-                match owner {
-                    InputOwner::Auth => self.move_auth_selection(1),
-                    InputOwner::Theme => self.move_theme_selection(1),
-                    InputOwner::Models => self.scroll_models_down(),
-                    InputOwner::Suggestions => self.move_suggestion_selection(1),
-                    InputOwner::Composer => self.scroll_transcript_down(),
-                    InputOwner::Message
-                    | InputOwner::PasteConfirmation
-                    | InputOwner::PendingSubmission => {}
-                }
-                None
-            }
+        };
+        PointerOutcome {
+            changed: if only_changes_selection {
+                before != self.pointer_selection_state()
+            } else {
+                activation_before.as_ref() != Some(&self.pointer_activation_state())
+            },
+            action,
         }
     }
 
-    pub fn scroll_transcript_up(&mut self) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(SCROLL_STEP);
-        self.follow_output = false;
+    fn pointer_selection_state(
+        &self,
+    ) -> (TranscriptScroll, usize, usize, Option<usize>, Option<usize>) {
+        (
+            self.transcript_scroll,
+            self.suggestion_selected,
+            self.models_selected,
+            self.theme_dialog.map(|dialog| dialog.selected),
+            self.auth_dialog.as_ref().map(|dialog| dialog.selected),
+        )
     }
 
-    pub fn scroll_transcript_down(&mut self) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(SCROLL_STEP);
-        self.follow_output = self.scroll_from_bottom == 0;
+    fn pointer_activation_state(&self) -> PointerActivationState {
+        PointerActivationState {
+            input: self.input_visual_state(),
+            expanded_entries: self.expanded_entries.clone(),
+            collapsed_entries: self.collapsed_entries.clone(),
+            context_usage_pop_frames: self.context_usage_pop_frames,
+            context_usage_pop_origin: self.context_usage_pop_origin,
+        }
+    }
+
+    pub(crate) fn transcript_is_following(&self) -> bool {
+        matches!(self.transcript_scroll, TranscriptScroll::Following)
+    }
+
+    pub(crate) fn transcript_scroll_offset(&self, maximum: usize) -> usize {
+        let TranscriptScroll::Manual { from_bottom } = self.transcript_scroll else {
+            return 0;
+        };
+        let adjusted = if maximum >= self.transcript_scroll_maximum {
+            from_bottom.saturating_add(maximum - self.transcript_scroll_maximum)
+        } else {
+            from_bottom.saturating_sub(self.transcript_scroll_maximum - maximum)
+        };
+        adjusted.min(maximum)
+    }
+
+    pub fn update_transcript_scroll_maximum(&mut self, maximum: usize) -> bool {
+        let previous = self.transcript_scroll;
+        let from_bottom = self.transcript_scroll_offset(maximum);
+        self.transcript_scroll_maximum = maximum;
+        if matches!(previous, TranscriptScroll::Manual { .. }) {
+            self.transcript_scroll = TranscriptScroll::Manual { from_bottom };
+        }
+        self.transcript_scroll != previous
+    }
+
+    pub fn scroll_transcript_up(&mut self) -> bool {
+        self.scroll_transcript_by(1)
+    }
+
+    pub(crate) fn scroll_transcript_by(&mut self, delta: isize) -> bool {
+        if delta == 0 {
+            return false;
+        }
+        let rows = delta.unsigned_abs().saturating_mul(SCROLL_STEP);
+        if delta < 0 {
+            return self.scroll_transcript_down_by(rows);
+        }
+        let maximum = self.transcript_scroll_maximum;
+        let current = self.transcript_scroll_offset(maximum);
+        let from_bottom = current.saturating_add(rows).min(maximum);
+        if from_bottom == current {
+            return false;
+        }
+        self.transcript_scroll = TranscriptScroll::Manual { from_bottom };
+        true
+    }
+
+    pub fn scroll_transcript_down(&mut self) -> bool {
+        self.scroll_transcript_by(-1)
+    }
+
+    fn scroll_transcript_down_by(&mut self, rows: usize) -> bool {
+        let TranscriptScroll::Manual { from_bottom } = self.transcript_scroll else {
+            return false;
+        };
+        let from_bottom = from_bottom.saturating_sub(rows);
+        self.transcript_scroll = if from_bottom == 0 {
+            TranscriptScroll::Following
+        } else {
+            TranscriptScroll::Manual { from_bottom }
+        };
+        true
     }
 
     pub fn effective_mode(&self) -> SessionMode {
@@ -1380,14 +1630,6 @@ impl App {
         Some(AppAction::SelectModel { model: model_id })
     }
 
-    pub(crate) fn scroll_models_up(&mut self) {
-        self.move_model_selection(-1);
-    }
-
-    pub(crate) fn scroll_models_down(&mut self) {
-        self.move_model_selection(1);
-    }
-
     pub(crate) fn handle_model_catalog_event(&mut self, event: ModelCatalogEvent) {
         match event {
             ModelCatalogEvent::Loaded(catalogs) => {
@@ -1627,9 +1869,6 @@ impl App {
         self.next_request_id = self.next_request_id.wrapping_add(1);
         self.transcript
             .submit_content(request_id, request.content().clone());
-        if self.follow_output {
-            self.scroll_from_bottom = 0;
-        }
         Some(AppAction::Submit {
             request_id,
             request,
@@ -2741,13 +2980,71 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::Chat;
 
+        app.update_transcript_scroll_maximum(20);
+
         app.handle_key(key(KeyCode::PageUp), Instant::now());
-        assert!(!app.follow_output);
-        assert_eq!(app.scroll_from_bottom, 5);
+        assert!(!app.transcript_is_following());
+        assert_eq!(app.transcript_scroll_offset(20), 5);
 
         app.handle_key(key(KeyCode::End), Instant::now());
-        assert!(app.follow_output);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert!(app.transcript_is_following());
+        assert_eq!(app.transcript_scroll_offset(20), 0);
+    }
+
+    #[test]
+    fn overscrolling_at_the_top_does_not_create_hidden_reverse_debt() {
+        let mut app = App::new();
+        app.update_transcript_scroll_maximum(10);
+
+        for _ in 0..100 {
+            app.scroll_transcript_up();
+        }
+
+        assert_eq!(app.transcript_scroll_offset(10), 10);
+        app.scroll_transcript_down();
+        assert_eq!(app.transcript_scroll_offset(10), 5);
+    }
+
+    #[test]
+    fn manual_scroll_keeps_the_same_visible_top_when_transcript_grows() {
+        let mut app = App::new();
+        app.update_transcript_scroll_maximum(100);
+        app.scroll_transcript_up();
+        let visible_top = 100 - app.transcript_scroll_offset(100);
+
+        assert_eq!(app.transcript_scroll_offset(120), 25);
+        app.update_transcript_scroll_maximum(120);
+        assert_eq!(120 - app.transcript_scroll_offset(120), visible_top);
+    }
+
+    #[test]
+    fn manual_scroll_keeps_the_same_visible_top_when_viewport_resizes() {
+        let mut app = App::new();
+        app.update_transcript_scroll_maximum(100);
+        app.scroll_transcript_by(4);
+        let visible_top = 100 - app.transcript_scroll_offset(100);
+
+        app.update_transcript_scroll_maximum(80);
+        assert_eq!(80 - app.transcript_scroll_offset(80), visible_top);
+
+        app.update_transcript_scroll_maximum(120);
+        assert_eq!(120 - app.transcript_scroll_offset(120), visible_top);
+    }
+
+    #[test]
+    fn manual_anchor_survives_a_temporary_resize_to_the_bottom() {
+        let mut app = App::new();
+        app.update_transcript_scroll_maximum(100);
+        app.scroll_transcript_by(4);
+        assert!(!app.transcript_is_following());
+
+        app.update_transcript_scroll_maximum(80);
+        assert_eq!(app.transcript_scroll_offset(80), 0);
+
+        app.update_transcript_scroll_maximum(120);
+
+        assert!(!app.transcript_is_following());
+        assert_eq!(app.transcript_scroll_offset(120), 40);
     }
 
     #[test]

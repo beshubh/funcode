@@ -28,6 +28,10 @@ impl TerminalSelection {
         matches!((self.anchor, self.focus), (Some(anchor), Some(focus)) if anchor != focus)
     }
 
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
     pub(crate) fn text(&self, buffer: &Buffer) -> Option<String> {
         let (start, end) = self.ordered_bounds()?;
         if start == end || !buffer.area.contains(start) || !buffer.area.contains(end) {

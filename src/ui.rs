@@ -41,6 +41,7 @@ pub struct UiRegions {
     pub models: Vec<ModelRegion>,
     pub model_refresh: Option<Rect>,
     pub context_usage: Option<Rect>,
+    pub(crate) transcript_scroll_maximum: usize,
 }
 
 #[derive(Debug, Default)]
@@ -48,7 +49,30 @@ pub(crate) struct UiState {
     transcript: transcript::TranscriptRenderCache,
 }
 
+/// Retains layout indexes and viewport rows across terminal frames.
+#[derive(Debug, Default)]
+pub struct UiRenderer {
+    state: UiState,
+}
+
+impl UiRenderer {
+    pub fn render(&self, frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
+        render_with_state(frame, app, theme, &self.state)
+    }
+}
+
 impl UiRegions {
+    pub const fn transcript_scroll_maximum(&self) -> usize {
+        self.transcript_scroll_maximum
+    }
+
+    pub(crate) fn wants_pointer_motion(&self) -> bool {
+        !self.auth_providers.is_empty()
+            || !self.suggestions.is_empty()
+            || !self.theme_options.is_empty()
+            || !self.models.is_empty()
+    }
+
     pub fn target_at(&self, column: u16, row: u16) -> Option<UiTarget> {
         let position = Position::new(column, row);
         if self
@@ -106,7 +130,7 @@ impl UiRegions {
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
-    render_with_state(frame, app, theme, &UiState::default())
+    UiRenderer::default().render(frame, app, theme)
 }
 
 pub(crate) fn render_with_state(
@@ -794,8 +818,9 @@ fn render_chat(
     if app.transcript.entries().is_empty() {
         render_welcome(frame, rows[0], app, theme);
     } else {
-        regions.transcript_entries =
-            transcript::render(frame, rows[0], app, theme, &state.transcript);
+        let transcript = transcript::render(frame, rows[0], app, theme, &state.transcript);
+        regions.transcript_entries = transcript.entries;
+        regions.transcript_scroll_maximum = transcript.scroll_maximum;
     }
     render_activity(frame, rows[1], app, theme);
     let composer_area = rows[2];
@@ -1959,6 +1984,99 @@ mod tests {
     }
 
     #[test]
+    fn large_assistant_viewports_reuse_the_index_and_copy_only_visible_rows() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 1,
+            text: (0..10_000)
+                .map(|line| format!("assistant-line-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 1 });
+
+        let state = UiState::default();
+        let (_, _, regions, _) = render_to_string_with_state(&app, 80, 24, &state);
+        app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+        let before_scroll = state.transcript.viewport_stats();
+
+        app.scroll_transcript_up();
+        let _ = render_to_string_with_state(&app, 80, 24, &state);
+        let after_scroll = state.transcript.viewport_stats();
+
+        assert_eq!(after_scroll.0, before_scroll.0);
+        assert!(after_scroll.1.saturating_sub(before_scroll.1) <= 24);
+    }
+
+    #[test]
+    fn large_terminal_artifact_viewports_copy_only_visible_rows() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "run".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 1,
+            call_id: 1,
+            name: "terminal".into(),
+            summary: "large output".into(),
+            artifacts: vec![ToolArtifact::Terminal {
+                description: "large output".into(),
+                command: "generate-output".into(),
+                output: (0..10_000)
+                    .map(|line| format!("terminal-line-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                exit_code: Some(0),
+            }],
+        });
+
+        let state = UiState::default();
+        let (_, _, regions, _) = render_to_string_with_state(&app, 80, 24, &state);
+        app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+        let before_scroll = state.transcript.viewport_stats();
+
+        app.scroll_transcript_up();
+        let _ = render_to_string_with_state(&app, 80, 24, &state);
+        let after_scroll = state.transcript.viewport_stats();
+
+        assert_eq!(after_scroll.0, before_scroll.0);
+        assert!(after_scroll.1.saturating_sub(before_scroll.1) <= 24);
+    }
+
+    #[test]
+    fn streaming_output_does_not_move_the_visible_manual_viewport() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 1,
+            text: (0..100)
+                .map(|line| format!("stable-line-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+
+        let state = UiState::default();
+        let (_, _, regions, _) = render_to_string_with_state(&app, 80, 24, &state);
+        app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+        app.scroll_transcript_by(5);
+        let (before, _, regions, _) = render_to_string_with_state(&app, 80, 24, &state);
+        app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 1,
+            text: "\nnew-line-100\nnew-line-101".into(),
+        });
+        let (after, _, _, _) = render_to_string_with_state(&app, 80, 24, &state);
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn streamed_entry_updates_invalidate_only_the_changed_render_cache_entry() {
         let mut app = App::new();
         app.screen = Screen::Chat;
@@ -2285,7 +2403,8 @@ mod tests {
         });
         let tool_id = app.transcript.entries()[2].id;
         app.activate_transcript_entry(tool_id);
-        let (bottom, _, _, _) = render_to_string(&app, 60, 20);
+        let (bottom, _, regions, _) = render_to_string(&app, 60, 20);
+        app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
 
         for _ in 0..5 {
             app.scroll_transcript_up();

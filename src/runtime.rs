@@ -1,6 +1,6 @@
 use crate::{
     agent::{AgentEvent, AgentTaskRunner},
-    app::{App, AppAction, AuthProvider, FILE_SUGGESTION_LIMIT, PointerEvent},
+    app::{App, AppAction, AppInputOutcome, AuthProvider, FILE_SUGGESTION_LIMIT, PointerEvent},
     auth::{AuthEvent, AuthStore, AuthTaskRunner},
     clipboard::{ClipboardEvent, ClipboardTaskRunner},
     composer::SubmittedContent,
@@ -14,10 +14,11 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use crossterm::{
+    Command,
     cursor::{Hide, Show},
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event,
+        KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
@@ -36,18 +37,63 @@ use std::{
 };
 
 const TICK_RATE: Duration = Duration::from_millis(50);
+const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 const WORKSPACE_SUGGESTION_REFRESH: Duration = Duration::from_millis(500);
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableButtonMouseCapture;
+
+impl Command for EnableButtonMouseCapture {
+    fn write_ansi(&self, output: &mut impl std::fmt::Write) -> std::fmt::Result {
+        output.write_str(concat!(
+            "\x1b[?1000h",
+            "\x1b[?1002h",
+            "\x1b[?1015h",
+            "\x1b[?1006h",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::event::EnableMouseCapture.execute_winapi()
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetAnyMouseMotion(bool);
+
+impl Command for SetAnyMouseMotion {
+    fn write_ansi(&self, output: &mut impl std::fmt::Write) -> std::fmt::Result {
+        output.write_str(if self.0 { "\x1b[?1003h" } else { "\x1b[?1003l" })
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct RedrawScheduler {
     dirty: bool,
+    urgent: bool,
+    next_frame: Option<Instant>,
 }
 
 impl Default for RedrawScheduler {
     fn default() -> Self {
-        Self { dirty: true }
+        Self {
+            dirty: true,
+            urgent: true,
+            next_frame: None,
+        }
     }
 }
 
@@ -56,9 +102,176 @@ impl RedrawScheduler {
         self.dirty = true;
     }
 
-    fn take_dirty(&mut self) -> bool {
-        std::mem::take(&mut self.dirty)
+    fn mark_urgent(&mut self) {
+        self.dirty = true;
+        self.urgent = true;
     }
+
+    fn should_draw(&self, now: Instant) -> bool {
+        self.dirty && (self.urgent || self.next_frame.is_none_or(|deadline| now >= deadline))
+    }
+
+    fn frame_rendered(&mut self, now: Instant) {
+        self.dirty = false;
+        self.urgent = false;
+        self.next_frame = Some(now + FRAME_INTERVAL);
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.dirty.then(|| {
+            if self.urgent {
+                Instant::now()
+            } else {
+                self.next_frame.unwrap_or_else(Instant::now)
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchedEvent {
+    Key(crossterm::event::KeyEvent),
+    Paste(String),
+    Mouse(crossterm::event::MouseEvent),
+    Scroll { delta: isize },
+    Resize(u16, u16),
+}
+
+#[derive(Debug, Default)]
+struct TerminalEventBatch {
+    events: Vec<BatchedEvent>,
+}
+
+impl TerminalEventBatch {
+    fn from_events(events: impl IntoIterator<Item = Event>) -> Self {
+        let mut batch = Self::default();
+        for event in events {
+            match event {
+                Event::Key(key) => batch.events.push(BatchedEvent::Key(key)),
+                Event::Paste(text) => batch.events.push(BatchedEvent::Paste(text)),
+                Event::Resize(width, height) => {
+                    batch.events.push(BatchedEvent::Resize(width, height));
+                }
+                Event::Mouse(mouse)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    ) =>
+                {
+                    let direction = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                        1
+                    } else {
+                        -1
+                    };
+                    if let Some(BatchedEvent::Scroll { delta }) = batch.events.last_mut() {
+                        *delta = delta.saturating_add(direction);
+                    } else {
+                        batch.events.push(BatchedEvent::Scroll { delta: direction });
+                    }
+                }
+                Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                    if let Some(BatchedEvent::Mouse(previous)) = batch.events.last_mut()
+                        && matches!(previous.kind, MouseEventKind::Moved)
+                    {
+                        *previous = mouse;
+                    } else {
+                        batch.events.push(BatchedEvent::Mouse(mouse));
+                    }
+                }
+                Event::Mouse(mouse) => batch.events.push(BatchedEvent::Mouse(mouse)),
+                _ => {}
+            }
+        }
+        batch
+    }
+
+    fn events(&self) -> &[BatchedEvent] {
+        &self.events
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+}
+
+#[derive(Debug, Default)]
+struct InputOutcome {
+    action: Option<AppAction>,
+    changed: bool,
+    urgent: bool,
+    rendered_at: Option<Instant>,
+}
+
+impl From<AppInputOutcome> for InputOutcome {
+    fn from(outcome: AppInputOutcome) -> Self {
+        Self {
+            action: outcome.action,
+            changed: outcome.changed,
+            urgent: outcome.urgent,
+            rendered_at: None,
+        }
+    }
+}
+
+fn apply_app_input(
+    app: &mut App,
+    regions: &ui::UiRegions,
+    event: &BatchedEvent,
+    now: Instant,
+) -> InputOutcome {
+    match event {
+        BatchedEvent::Key(key) if matches!(key.kind, KeyEventKind::Press) => {
+            app.handle_key_with_outcome(*key, now).into()
+        }
+        BatchedEvent::Paste(text) => app.handle_paste_with_outcome(text).into(),
+        BatchedEvent::Mouse(mouse) => {
+            let outcome = handle_mouse_event_outcome(app, regions, *mouse);
+            InputOutcome {
+                action: outcome.action,
+                changed: outcome.changed,
+                urgent: false,
+                rendered_at: None,
+            }
+        }
+        BatchedEvent::Scroll { delta, .. } => {
+            let outcome = app.handle_pointer(PointerEvent::Scroll(*delta));
+            InputOutcome {
+                action: outcome.action,
+                changed: outcome.changed,
+                urgent: false,
+                rendered_at: None,
+            }
+        }
+        BatchedEvent::Resize(_, _) => InputOutcome {
+            changed: true,
+            urgent: true,
+            ..InputOutcome::default()
+        },
+        _ => InputOutcome::default(),
+    }
+}
+
+fn process_event_batch(
+    events: &[BatchedEvent],
+    redraw: &mut RedrawScheduler,
+    mut process: impl FnMut(&BatchedEvent) -> Result<(InputOutcome, bool)>,
+) -> Result<bool> {
+    for event in events {
+        let (outcome, should_quit) = process(event)?;
+        if let Some(rendered_at) = outcome.rendered_at {
+            redraw.frame_rendered(rendered_at);
+        }
+        if outcome.urgent {
+            redraw.mark_urgent();
+        } else if outcome.changed {
+            redraw.mark_dirty();
+        }
+        if should_quit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,9 +393,10 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     let mut next_tick = Instant::now() + TICK_RATE;
     let mut should_quit = false;
     let mut regions = ui::UiRegions::default();
-    let ui_state = ui::UiState::default();
+    let ui_renderer = ui::UiRenderer::default();
     let mut selection = TerminalSelection::default();
-    let mut rendered_buffer = Buffer::empty(ratatui::layout::Rect::default());
+    let mut selection_buffer: Option<Buffer> = None;
+    let mut any_mouse_motion = false;
     let mut last_workspace_search: Option<(crate::composer::QueryId, Instant)> = None;
     let mut workspace_search_ready = false;
     let mut redraw = RedrawScheduler::default();
@@ -191,7 +405,10 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     while !should_quit {
         if let Some(workspace_runner) = workspace_runner.as_ref() {
             while let Some(event) = workspace_runner.try_event() {
-                redraw.mark_dirty();
+                let urgent = matches!(
+                    &event,
+                    workspace::WorkspaceEvent::Ready { warning: Some(_) }
+                );
                 match event {
                     workspace::WorkspaceEvent::Ready { warning } => {
                         app.use_indexed_workspace_search();
@@ -204,12 +421,25 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                         app.set_indexed_file_suggestions(query_id, paths);
                     }
                 }
+                if urgent {
+                    redraw.mark_urgent();
+                } else {
+                    redraw.mark_dirty();
+                }
             }
         }
         if let Some(runner) = runner.as_ref() {
             while let Some(agent_event) = runner.try_event() {
+                let urgent = matches!(
+                    &agent_event,
+                    AgentEvent::ToolFailed { .. } | AgentEvent::Failed { .. }
+                );
                 app.handle_agent_event(agent_event);
-                redraw.mark_dirty();
+                if urgent {
+                    redraw.mark_urgent();
+                } else {
+                    redraw.mark_dirty();
+                }
             }
         }
         if let Some(preflight) =
@@ -221,7 +451,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         }
         if let Some(submission_runner) = submission_runner.as_ref() {
             while let Some(event) = submission_runner.try_event() {
-                redraw.mark_dirty();
+                let urgent = matches!(&event, SubmissionEvent::Failed { .. });
                 if let Some(action) = app.handle_submission_event(event) {
                     should_quit = dispatch(
                         action,
@@ -237,25 +467,45 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                         },
                     );
                 }
+                if urgent {
+                    redraw.mark_urgent();
+                } else {
+                    redraw.mark_dirty();
+                }
             }
         }
         while let Some(auth_event) = auth_runner.try_event() {
+            let urgent = matches!(&auth_event, AuthEvent::Failed { .. });
             app.handle_auth_event(auth_event);
-            redraw.mark_dirty();
-        }
-        if let Some(model_runner) = model_runner.as_ref() {
-            while let Some(event) = model_runner.try_event() {
-                app.handle_model_catalog_event(event);
+            if urgent {
+                redraw.mark_urgent();
+            } else {
                 redraw.mark_dirty();
             }
         }
+        if let Some(model_runner) = model_runner.as_ref() {
+            while let Some(event) = model_runner.try_event() {
+                let urgent = matches!(&event, crate::model_catalog::ModelCatalogEvent::Failed(_));
+                app.handle_model_catalog_event(event);
+                if urgent {
+                    redraw.mark_urgent();
+                } else {
+                    redraw.mark_dirty();
+                }
+            }
+        }
         while let Some(clipboard_event) = clipboard.try_event() {
+            let urgent = matches!(&clipboard_event, ClipboardEvent::Failed(_));
             handle_clipboard_event(&mut app, clipboard_event);
-            redraw.mark_dirty();
+            if urgent {
+                redraw.mark_urgent();
+            } else {
+                redraw.mark_dirty();
+            }
         }
         if let Some(theme_runner) = theme_runner.as_ref() {
             while let Some(event) = theme_runner.try_event() {
-                redraw.mark_dirty();
+                let urgent = matches!(&event, ThemeConfigEvent::Failed(_));
                 match event {
                     ThemeConfigEvent::Saved(theme_id) => {
                         app.set_notice(format!("Theme changed to {}", theme_id.display_name()));
@@ -263,6 +513,11 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
                     ThemeConfigEvent::Failed(error) => {
                         app.set_notice(format!("Could not save theme: {error}"));
                     }
+                }
+                if urgent {
+                    redraw.mark_urgent();
+                } else {
+                    redraw.mark_dirty();
                 }
             }
         }
@@ -292,76 +547,118 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
             last_workspace_search = None;
         }
 
-        if redraw.take_dirty() {
-            terminal
-                .draw(|frame| {
-                    let theme = Theme::resolve(app.effective_theme_id());
-                    regions = ui::render_with_state(frame, &app, &theme, &ui_state);
-                    selection.highlight(frame.buffer_mut());
-                    rendered_buffer = frame.buffer_mut().clone();
-                })
-                .context("failed to draw the terminal UI")?;
-            if let Some(area) = regions.composer_input {
-                app.set_composer_width(area.width);
-            }
+        let render_started = Instant::now();
+        if redraw.should_draw(render_started) {
+            render_frame(
+                terminal,
+                &mut app,
+                &ui_renderer,
+                &selection,
+                &mut regions,
+                &mut any_mouse_motion,
+                false,
+            )?;
+            redraw.frame_rendered(render_started);
         }
 
-        let timeout = next_tick.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let background_wake = app
+            .active_request
+            .map(|_| now + FRAME_INTERVAL)
+            .unwrap_or(next_tick);
+        let wake_at = redraw
+            .deadline()
+            .map_or(background_wake.min(next_tick), |frame_deadline| {
+                frame_deadline.min(background_wake).min(next_tick)
+            });
+        let timeout = wake_at.saturating_duration_since(now);
         if event::poll(timeout).context("failed to poll terminal input")? {
-            match event::read().context("failed to read terminal input")? {
-                Event::Key(key) if matches!(key.kind, KeyEventKind::Press) => {
-                    redraw.mark_dirty();
-                    if let Some(action) = app.handle_key(key, Instant::now()) {
-                        should_quit = dispatch(
-                            action,
-                            DispatchContext {
-                                app: &mut app,
-                                runner: runner.as_ref(),
-                                submission_runner: submission_runner.as_ref(),
-                                model_runner: model_runner.as_ref(),
-                                auth_runner: &auth_runner,
-                                clipboard: &clipboard,
-                                theme_runner: theme_runner.as_ref(),
-                                preflight_scheduler: &mut preflight_scheduler,
-                            },
-                        );
-                    }
-                }
-                Event::Paste(text) => {
-                    app.handle_paste(&text);
-                    redraw.mark_dirty();
-                }
-                Event::Mouse(mouse) => {
-                    redraw.mark_dirty();
-                    match handle_selection_mouse_event(&mut selection, &rendered_buffer, mouse) {
-                        Some(SelectionMouseEvent::Copy(text)) => {
-                            if let Err(error) = clipboard.copy(text, "Selection copied") {
-                                app.set_notice(error.to_string());
-                            }
-                        }
-                        Some(SelectionMouseEvent::Click) | None => {
-                            if let Some(action) = handle_mouse_event(&mut app, &regions, mouse) {
-                                should_quit = dispatch(
-                                    action,
-                                    DispatchContext {
-                                        app: &mut app,
-                                        runner: runner.as_ref(),
-                                        submission_runner: submission_runner.as_ref(),
-                                        model_runner: model_runner.as_ref(),
-                                        auth_runner: &auth_runner,
-                                        clipboard: &clipboard,
-                                        theme_runner: theme_runner.as_ref(),
-                                        preflight_scheduler: &mut preflight_scheduler,
-                                    },
-                                );
-                            }
-                        }
-                        Some(SelectionMouseEvent::Consumed) => {}
-                    }
-                }
-                Event::Resize(_, _) => redraw.mark_dirty(),
-                _ => {}
+            let mut events = vec![event::read().context("failed to read terminal input")?];
+            while event::poll(Duration::ZERO).context("failed to drain terminal input")? {
+                events.push(event::read().context("failed to read queued terminal input")?);
             }
+            let batch = TerminalEventBatch::from_events(events);
+            should_quit = process_event_batch(batch.events(), &mut redraw, |event| {
+                let mut rendered_at = None;
+                let mut outcome = match event {
+                    BatchedEvent::Mouse(mouse) => {
+                        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                            && selection_buffer.is_none()
+                        {
+                            selection_buffer = render_frame(
+                                terminal,
+                                &mut app,
+                                &ui_renderer,
+                                &selection,
+                                &mut regions,
+                                &mut any_mouse_motion,
+                                true,
+                            )?;
+                            rendered_at = Some(Instant::now());
+                        }
+                        match handle_selection_mouse_event(
+                            &mut selection,
+                            selection_buffer.as_ref(),
+                            *mouse,
+                        ) {
+                            Some(SelectionMouseEvent::Copy(text)) => {
+                                if let Err(error) = clipboard.copy(text, "Selection copied") {
+                                    app.set_notice(error.to_string());
+                                    InputOutcome {
+                                        changed: true,
+                                        urgent: true,
+                                        ..InputOutcome::default()
+                                    }
+                                } else {
+                                    InputOutcome {
+                                        changed: true,
+                                        ..InputOutcome::default()
+                                    }
+                                }
+                            }
+                            Some(SelectionMouseEvent::Click) | None => {
+                                apply_app_input(&mut app, &regions, event, Instant::now())
+                            }
+                            Some(SelectionMouseEvent::Consumed) => InputOutcome {
+                                changed: true,
+                                ..InputOutcome::default()
+                            },
+                        }
+                    }
+                    _ => apply_app_input(&mut app, &regions, event, Instant::now()),
+                };
+                outcome.rendered_at = rendered_at;
+                let notice_before_dispatch = app.notice.clone();
+                let event_should_quit = outcome.action.take().is_some_and(|action| {
+                    dispatch(
+                        action,
+                        DispatchContext {
+                            app: &mut app,
+                            runner: runner.as_ref(),
+                            submission_runner: submission_runner.as_ref(),
+                            model_runner: model_runner.as_ref(),
+                            auth_runner: &auth_runner,
+                            clipboard: &clipboard,
+                            theme_runner: theme_runner.as_ref(),
+                            preflight_scheduler: &mut preflight_scheduler,
+                        },
+                    )
+                });
+                if app.notice != notice_before_dispatch && app.notice.is_some() {
+                    outcome.changed = true;
+                    outcome.urgent = true;
+                }
+                if matches!(
+                    event,
+                    BatchedEvent::Mouse(crossterm::event::MouseEvent {
+                        kind: MouseEventKind::Up(MouseButton::Left),
+                        ..
+                    })
+                ) {
+                    selection_buffer = None;
+                }
+                Ok::<_, anyhow::Error>((outcome, event_should_quit))
+            })?;
         }
 
         if Instant::now() >= next_tick {
@@ -389,6 +686,39 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     Ok(())
 }
 
+fn render_frame(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    ui_renderer: &ui::UiRenderer,
+    selection: &TerminalSelection,
+    regions: &mut ui::UiRegions,
+    any_mouse_motion: &mut bool,
+    capture_buffer: bool,
+) -> Result<Option<Buffer>> {
+    let mut snapshot = None;
+    terminal
+        .draw(|frame| {
+            let theme = Theme::resolve(app.effective_theme_id());
+            *regions = ui_renderer.render(frame, app, &theme);
+            selection.highlight(frame.buffer_mut());
+            if capture_buffer {
+                snapshot = Some(frame.buffer_mut().clone());
+            }
+        })
+        .context("failed to draw the terminal UI")?;
+    if let Some(area) = regions.composer_input {
+        app.set_composer_width(area.width);
+    }
+    app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+    let wants_pointer_motion = regions.wants_pointer_motion();
+    if wants_pointer_motion != *any_mouse_motion {
+        execute!(stdout(), SetAnyMouseMotion(wants_pointer_motion))
+            .context("failed to update terminal mouse motion reporting")?;
+        *any_mouse_motion = wants_pointer_motion;
+    }
+    Ok(snapshot)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelectionMouseEvent {
     Consumed,
@@ -398,7 +728,7 @@ enum SelectionMouseEvent {
 
 fn handle_selection_mouse_event(
     selection: &mut TerminalSelection,
-    buffer: &Buffer,
+    buffer: Option<&Buffer>,
     mouse: crossterm::event::MouseEvent,
 ) -> Option<SelectionMouseEvent> {
     let position = Position::new(mouse.column, mouse.row);
@@ -414,7 +744,11 @@ fn handle_selection_mouse_event(
         MouseEventKind::Up(MouseButton::Left) => {
             selection.extend(position);
             let dragged = selection.has_range();
-            Some(match selection.finish(buffer) {
+            let copied = buffer.and_then(|buffer| selection.finish(buffer));
+            if buffer.is_none() {
+                selection.clear();
+            }
+            Some(match copied {
                 Some(text) => SelectionMouseEvent::Copy(text),
                 None if dragged => SelectionMouseEvent::Consumed,
                 None => SelectionMouseEvent::Click,
@@ -424,11 +758,11 @@ fn handle_selection_mouse_event(
     }
 }
 
-fn handle_mouse_event(
+fn handle_mouse_event_outcome(
     app: &mut App,
     regions: &ui::UiRegions,
     mouse: crossterm::event::MouseEvent,
-) -> Option<AppAction> {
+) -> crate::app::PointerOutcome {
     let target = || regions.target_at(mouse.column, mouse.row);
     let event = match mouse.kind {
         MouseEventKind::Up(MouseButton::Left) => {
@@ -445,11 +779,20 @@ fn handle_mouse_event(
             }
         }
         MouseEventKind::Moved => PointerEvent::Hover(target()),
-        MouseEventKind::ScrollUp => PointerEvent::ScrollUp,
-        MouseEventKind::ScrollDown => PointerEvent::ScrollDown,
-        _ => return None,
+        MouseEventKind::ScrollUp => PointerEvent::Scroll(1),
+        MouseEventKind::ScrollDown => PointerEvent::Scroll(-1),
+        _ => return crate::app::PointerOutcome::default(),
     };
     app.handle_pointer(event)
+}
+
+#[cfg(test)]
+fn handle_mouse_event(
+    app: &mut App,
+    regions: &ui::UiRegions,
+    mouse: crossterm::event::MouseEvent,
+) -> Option<AppAction> {
+    handle_mouse_event_outcome(app, regions, mouse).action
 }
 
 struct DeferredPreflight {
@@ -725,7 +1068,7 @@ impl TerminalSession {
                 stdout(),
                 EnterAlternateScreen,
                 EnableBracketedPaste,
-                EnableMouseCapture,
+                EnableButtonMouseCapture,
                 Hide
             )
             .context("failed to enter the alternate terminal screen")?;
@@ -790,9 +1133,10 @@ fn install_restoring_panic_hook(keyboard_enhancement: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeferredPreflight, DispatchContext, LaunchMode, PreflightScheduler, RedrawScheduler,
-        SelectionMouseEvent, dispatch, handle_clipboard_event, handle_mouse_event,
-        handle_selection_mouse_event,
+        BatchedEvent, DeferredPreflight, DispatchContext, EnableButtonMouseCapture, LaunchMode,
+        PreflightScheduler, RedrawScheduler, SelectionMouseEvent, SetAnyMouseMotion,
+        TerminalEventBatch, apply_app_input, dispatch, handle_clipboard_event, handle_mouse_event,
+        handle_selection_mouse_event, process_event_batch,
     };
     use crate::{
         app::{App, AppAction, Screen},
@@ -804,7 +1148,10 @@ mod tests {
         theme::ThemeId,
         ui::{ModelRegion, UiRegions},
     };
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::Command;
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::{buffer::Buffer, layout::Rect, style::Style};
     use std::time::Duration;
 
@@ -847,16 +1194,159 @@ mod tests {
 
     #[test]
     fn redraw_scheduler_stays_clean_across_idle_wakeups() {
+        let start = std::time::Instant::now();
         let mut redraw = RedrawScheduler::default();
 
-        assert!(redraw.take_dirty());
+        assert!(redraw.should_draw(start));
+        redraw.frame_rendered(start);
         for _ in 0..100 {
-            assert!(!redraw.take_dirty());
+            assert!(!redraw.should_draw(start));
         }
 
-        redraw.mark_dirty();
-        assert!(redraw.take_dirty());
-        assert!(!redraw.take_dirty());
+        for _ in 0..1_000 {
+            redraw.mark_dirty();
+        }
+        assert!(!redraw.should_draw(start + Duration::from_millis(1)));
+        assert!(redraw.should_draw(start + super::FRAME_INTERVAL));
+        redraw.frame_rendered(start + super::FRAME_INTERVAL);
+        assert!(!redraw.should_draw(start + super::FRAME_INTERVAL));
+    }
+
+    #[test]
+    fn event_batch_coalesces_wheel_and_motion_bursts_without_starving_keyboard_input() {
+        let mut events = Vec::new();
+        events.extend((0..10_000).map(|_| Event::Mouse(mouse(MouseEventKind::ScrollUp, 0, 0))));
+        events.extend(
+            (0..10_000)
+                .map(|column| Event::Mouse(mouse(MouseEventKind::Moved, (column % 80) as u16, 4))),
+        );
+        events.push(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+
+        let batch = TerminalEventBatch::from_events(events);
+        assert_eq!(batch.len(), 3);
+        assert!(matches!(
+            batch.events()[0],
+            BatchedEvent::Scroll { delta: 10_000, .. }
+        ));
+
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.update_transcript_scroll_maximum(25);
+        let regions = UiRegions::default();
+        let start = std::time::Instant::now();
+        let mut redraw = RedrawScheduler::default();
+        redraw.frame_rendered(start);
+        let should_quit = process_event_batch(batch.events(), &mut redraw, |event| {
+            Ok((apply_app_input(&mut app, &regions, event, start), false))
+        })
+        .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(app.transcript_scroll_offset(25), 25);
+        assert_eq!(app.composer.submission_text(), "x");
+        assert!(!redraw.should_draw(start + Duration::from_millis(1)));
+
+        let frame_time = start + super::FRAME_INTERVAL;
+        let mut renders_after_batch = 0;
+        if redraw.should_draw(frame_time) {
+            renders_after_batch += 1;
+            redraw.frame_rendered(frame_time);
+        }
+        assert_eq!(renders_after_batch, 1);
+        assert!(!redraw.should_draw(frame_time));
+    }
+
+    #[test]
+    fn ignored_keyboard_and_paste_input_do_not_dirty_the_frame() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        let regions = UiRegions::default();
+        let ignored = BatchedEvent::Key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+
+        assert!(!apply_app_input(&mut app, &regions, &ignored, std::time::Instant::now()).changed);
+
+        app.open_theme_dialog();
+        let ignored_paste = BatchedEvent::Paste("not accepted by a dialog".into());
+        assert!(
+            !apply_app_input(
+                &mut app,
+                &regions,
+                &ignored_paste,
+                std::time::Instant::now()
+            )
+            .changed
+        );
+    }
+
+    #[test]
+    fn opening_a_modal_requests_an_urgent_frame() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.composer.insert_text("/theme");
+        let enter = BatchedEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let outcome = apply_app_input(
+            &mut app,
+            &UiRegions::default(),
+            &enter,
+            std::time::Instant::now(),
+        );
+
+        assert!(outcome.changed);
+        assert!(outcome.urgent);
+        assert!(app.theme_dialog.is_some());
+    }
+
+    #[test]
+    fn redundant_hover_and_boundary_scroll_events_do_not_schedule_redraws() {
+        let mut app = App::with_files(["src/app.rs", "src/main.rs"]);
+        app.screen = Screen::Chat;
+        app.composer.insert_text("@src/");
+        let regions = UiRegions {
+            suggestions: vec![Rect::new(4, 5, 12, 1), Rect::new(4, 6, 12, 1)],
+            ..UiRegions::default()
+        };
+        let hover = BatchedEvent::Mouse(mouse(MouseEventKind::Moved, 4, 6));
+
+        assert!(apply_app_input(&mut app, &regions, &hover, std::time::Instant::now()).changed);
+        assert!(!apply_app_input(&mut app, &regions, &hover, std::time::Instant::now()).changed);
+
+        let empty_click = BatchedEvent::Mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 0));
+        assert!(
+            !apply_app_input(
+                &mut app,
+                &UiRegions::default(),
+                &empty_click,
+                std::time::Instant::now()
+            )
+            .changed
+        );
+
+        let mut scroll_app = App::new();
+        scroll_app.screen = Screen::Chat;
+        scroll_app.update_transcript_scroll_maximum(5);
+        let scroll = BatchedEvent::Scroll { delta: 10_000 };
+        assert!(
+            apply_app_input(
+                &mut scroll_app,
+                &UiRegions::default(),
+                &scroll,
+                std::time::Instant::now()
+            )
+            .changed
+        );
+        assert!(
+            !apply_app_input(
+                &mut scroll_app,
+                &UiRegions::default(),
+                &scroll,
+                std::time::Instant::now()
+            )
+            .changed
+        );
     }
 
     #[derive(Default)]
@@ -877,6 +1367,25 @@ mod tests {
         ));
         assert_eq!(LaunchMode::parse(["auth"]).unwrap(), LaunchMode::AuthOnly);
         assert!(LaunchMode::parse(["auth", "extra"]).is_err());
+    }
+
+    #[test]
+    fn mouse_capture_reports_click_wheel_and_drag_without_all_motion_mode() {
+        let mut ansi = String::new();
+        EnableButtonMouseCapture.write_ansi(&mut ansi).unwrap();
+
+        assert!(ansi.contains("?1000h"));
+        assert!(ansi.contains("?1002h"));
+        assert!(ansi.contains("?1006h"));
+        assert!(!ansi.contains("?1003h"));
+
+        ansi.clear();
+        SetAnyMouseMotion(true).write_ansi(&mut ansi).unwrap();
+        assert_eq!(ansi, "\x1b[?1003h");
+
+        ansi.clear();
+        SetAnyMouseMotion(false).write_ansi(&mut ansi).unwrap();
+        assert_eq!(ansi, "\x1b[?1003l");
     }
 
     #[test]
@@ -1055,7 +1564,7 @@ mod tests {
         assert_eq!(
             handle_selection_mouse_event(
                 &mut selection,
-                &buffer,
+                Some(&buffer),
                 mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
             ),
             Some(SelectionMouseEvent::Consumed)
@@ -1063,7 +1572,7 @@ mod tests {
         assert_eq!(
             handle_selection_mouse_event(
                 &mut selection,
-                &buffer,
+                Some(&buffer),
                 mouse(MouseEventKind::Drag(MouseButton::Left), 3, 0),
             ),
             Some(SelectionMouseEvent::Consumed)
@@ -1071,7 +1580,7 @@ mod tests {
         assert_eq!(
             handle_selection_mouse_event(
                 &mut selection,
-                &buffer,
+                Some(&buffer),
                 mouse(MouseEventKind::Up(MouseButton::Left), 3, 0),
             ),
             Some(SelectionMouseEvent::Copy("copy".into()))
@@ -1082,15 +1591,16 @@ mod tests {
     fn mouse_wheel_scrolls_the_transcript_when_no_overlay_owns_it() {
         let mut app = App::new();
         app.screen = Screen::Chat;
+        app.update_transcript_scroll_maximum(20);
         let regions = UiRegions::default();
 
         handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollUp, 0, 0));
-        assert_eq!(app.scroll_from_bottom, 5);
-        assert!(!app.follow_output);
+        assert_eq!(app.transcript_scroll_offset(20), 5);
+        assert!(!app.transcript_is_following());
 
         handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
-        assert_eq!(app.scroll_from_bottom, 0);
-        assert!(app.follow_output);
+        assert_eq!(app.transcript_scroll_offset(20), 0);
+        assert!(app.transcript_is_following());
     }
 
     #[test]
@@ -1139,7 +1649,7 @@ mod tests {
         handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
 
         assert_eq!(app.selected_model_index(), 1);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert!(app.transcript_is_following());
     }
 
     #[test]
@@ -1158,7 +1668,7 @@ mod tests {
         );
 
         assert_eq!(app.selected_suggestion(), 0);
-        assert_eq!(app.scroll_from_bottom, 0);
+        assert!(app.transcript_is_following());
     }
 
     #[test]
