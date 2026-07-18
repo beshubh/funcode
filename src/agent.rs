@@ -2,7 +2,10 @@ use crate::{
     llm::{ConversationCommit, LlmClient, LlmError, LlmEvent},
     submission::{PreparedAttachment, PreparedRequest},
     tools::{ToolDisplay, ToolEvent, ToolSession},
-    transcript::{ToolArtifact, ToolCallId},
+    transcript::{
+        CodeRangeArtifact, PatchArtifact, SearchResultsArtifact, TerminalArtifact, ToolArtifact,
+        ToolCallId,
+    },
     usage::TokenUsage,
 };
 use futures::StreamExt as _;
@@ -635,30 +638,30 @@ fn display_to_artifact(display: ToolDisplay) -> ToolArtifact {
             start_line,
             end_line,
             content,
-        } => ToolArtifact::CodeRange {
+        } => ToolArtifact::CodeRange(CodeRangeArtifact {
             path: path.into(),
             start_line,
             end_line,
             preview: Some(content),
-        },
+        }),
         ToolDisplay::SearchResults { query, matches } => {
-            ToolArtifact::SearchResults { query, matches }
+            ToolArtifact::SearchResults(SearchResultsArtifact { query, matches })
         }
-        ToolDisplay::Patch { path, diff } => ToolArtifact::Patch {
+        ToolDisplay::Patch { path, diff } => ToolArtifact::Patch(PatchArtifact {
             path: path.into(),
             diff,
-        },
+        }),
         ToolDisplay::Terminal {
             description,
             command,
             output,
             exit_code,
-        } => ToolArtifact::Terminal {
+        } => ToolArtifact::Terminal(TerminalArtifact {
             description,
             command,
             output,
             exit_code,
-        },
+        }),
     }
 }
 
@@ -684,12 +687,12 @@ fn emit_prepared_attachment_events(
                 request_id,
                 call_id,
                 summary: None,
-                artifacts: vec![ToolArtifact::CodeRange {
+                artifacts: vec![ToolArtifact::CodeRange(CodeRangeArtifact {
                     path: attachment.path().clone(),
                     start_line: 1,
                     end_line: attachment.line_count(),
                     preview: Some(attachment.preview().to_owned()),
-                }],
+                })],
             })
             .map_err(|_| ())?;
     }
@@ -784,7 +787,7 @@ mod tests {
             AgentEvent::ToolFinished { request_id: 3, artifacts, .. }
                 if matches!(
                     artifacts.as_slice(),
-                    [ToolArtifact::CodeRange { path, .. }] if path == "project.txt"
+                    [ToolArtifact::CodeRange(artifact)] if artifact.path == "project.txt"
                 )
         )));
 

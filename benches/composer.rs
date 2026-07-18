@@ -8,7 +8,7 @@ use funcode::{
     session::SessionMode,
     submission::{SubmissionEvent, SubmissionTaskRunner},
     theme::{Theme, ThemeId},
-    transcript::ToolArtifact,
+    transcript::{TerminalArtifact, ToolArtifact},
     ui::{self, UiRenderer},
     workspace::{Attachment, WorkspacePath},
 };
@@ -315,12 +315,12 @@ fn transcript_stress_app() -> App {
             call_id: request_id,
             name: "terminal".into(),
             summary: format!("command {request_id}"),
-            artifacts: vec![ToolArtifact::Terminal {
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
                 description: format!("command {request_id}"),
                 command: "printf output".into(),
                 output: format!("output {request_id}\n"),
                 exit_code: Some(0),
-            }],
+            })],
         });
         app.handle_agent_event(AgentEvent::TextDelta {
             request_id,
@@ -337,7 +337,7 @@ fn transcript_stress_app() -> App {
         call_id: request_id,
         name: "terminal".into(),
         summary: "1,000-line output".into(),
-        artifacts: vec![ToolArtifact::Terminal {
+        artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
             description: "1,000-line output".into(),
             command: "generate-output".into(),
             output: (0..1_000)
@@ -345,7 +345,7 @@ fn transcript_stress_app() -> App {
                 .collect::<Vec<_>>()
                 .join("\n"),
             exit_code: Some(0),
-        }],
+        })],
     });
     app
 }

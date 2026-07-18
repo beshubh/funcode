@@ -51,31 +51,53 @@ pub struct Reasoning {
     pub status: ActivityStatus,
 }
 
+/// Structured, displayable output attached to a tool call in the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeRangeArtifact {
+    pub path: WorkspacePath,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub preview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchArtifact {
+    pub path: WorkspacePath,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchResultsArtifact {
+    pub query: String,
+    pub matches: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalArtifact {
+    pub description: String,
+    pub command: String,
+    pub output: String,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextDetailArtifact {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileReferenceArtifact {
+    pub path: WorkspacePath,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolArtifact {
-    CodeRange {
-        path: WorkspacePath,
-        // start_line and end_line needs to be Optional using Option<u32>
-        start_line: u32,
-        end_line: u32,
-        preview: Option<String>,
-    },
-    Patch {
-        path: WorkspacePath,
-        diff: String,
-    },
-    SearchResults {
-        query: String,
-        matches: String,
-    },
-    Terminal {
-        description: String,
-        command: String,
-        output: String,
-        exit_code: Option<i32>,
-    },
-    TextDetail(String),
-    FileReference(WorkspacePath),
+    CodeRange(CodeRangeArtifact),
+    Patch(PatchArtifact),
+    SearchResults(SearchResultsArtifact),
+    Terminal(TerminalArtifact),
+    TextDetail(TextDetailArtifact),
+    FileReference(FileReferenceArtifact),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,12 +322,11 @@ impl Transcript {
             } => {
                 if self.is_active(turn_id) {
                     self.update_tool(turn_id, call_id, |tool| {
-                        let Some(ToolArtifact::Terminal { output, .. }) =
-                            tool.artifacts.first_mut()
+                        let Some(ToolArtifact::Terminal(artifact)) = tool.artifacts.first_mut()
                         else {
                             return false;
                         };
-                        output.push_str(&chunk);
+                        artifact.output.push_str(&chunk);
                         true
                     });
                 }
@@ -559,7 +580,8 @@ impl fmt::Display for ActivityStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivityStatus, AssistantStatus, EntryKind, ToolArtifact, Transcript, TranscriptEvent,
+        ActivityStatus, AssistantStatus, CodeRangeArtifact, EntryKind, TerminalArtifact,
+        ToolArtifact, Transcript, TranscriptEvent,
     };
     use crate::workspace::Attachment;
 
@@ -606,12 +628,12 @@ mod tests {
             turn_id: 4,
             call_id: 9,
             summary: None,
-            artifacts: vec![ToolArtifact::CodeRange {
+            artifacts: vec![ToolArtifact::CodeRange(CodeRangeArtifact {
                 path: "src/app.rs".into(),
                 start_line: 1,
                 end_line: 4,
                 preview: None,
-            }],
+            })],
         });
         transcript.apply(TranscriptEvent::TextDelta {
             turn_id: 4,
@@ -710,12 +732,12 @@ mod tests {
             call_id: 99,
             name: "terminal".into(),
             summary: "Running tests".into(),
-            artifacts: vec![ToolArtifact::Terminal {
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
                 description: "Running tests".into(),
                 command: "cargo test".into(),
                 output: String::new(),
                 exit_code: None,
-            }],
+            })],
         });
         transcript.apply(TranscriptEvent::ToolOutputDelta {
             turn_id: 1,
@@ -728,7 +750,7 @@ mod tests {
             EntryKind::Tool(tool)
                 if matches!(
                     tool.artifacts.first(),
-                    Some(ToolArtifact::Terminal { output, .. }) if output == "test result: ok"
+                    Some(ToolArtifact::Terminal(artifact)) if artifact.output == "test result: ok"
                 )
         ));
 
@@ -743,7 +765,7 @@ mod tests {
             EntryKind::Tool(tool)
                 if matches!(
                     tool.artifacts.first(),
-                    Some(ToolArtifact::Terminal { output, .. }) if output == "test result: ok"
+                    Some(ToolArtifact::Terminal(artifact)) if artifact.output == "test result: ok"
                 )
         ));
     }

@@ -1457,10 +1457,7 @@ impl App {
             EntryKind::Tool(tool) => {
                 tool.name == "terminal"
                     || tool.artifacts.iter().any(|artifact| {
-                        matches!(
-                            artifact,
-                            ToolArtifact::Patch { .. } | ToolArtifact::Terminal { .. }
-                        )
+                        matches!(artifact, ToolArtifact::Patch(_) | ToolArtifact::Terminal(_))
                     })
             }
             _ => false,
@@ -1895,7 +1892,10 @@ mod tests {
         model_catalog::ModelCatalogEvent,
         session::SessionMode,
         theme::ThemeId,
-        transcript::{AssistantStatus, EntryKind, ToolArtifact},
+        transcript::{
+            AssistantStatus, EntryKind, FileReferenceArtifact, PatchArtifact, TerminalArtifact,
+            ToolArtifact,
+        },
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::{Duration, Instant};
@@ -3085,7 +3085,9 @@ mod tests {
             request_id: 13,
             call_id: 4,
             summary: None,
-            artifacts: vec![ToolArtifact::FileReference("Cargo.toml".into())],
+            artifacts: vec![ToolArtifact::FileReference(FileReferenceArtifact {
+                path: "Cargo.toml".into(),
+            })],
         });
         assert!(matches!(
             &app.transcript.entries()[2].kind,
@@ -3113,27 +3115,29 @@ mod tests {
             request_id: 14,
             call_id: 1,
             summary: None,
-            artifacts: vec![ToolArtifact::FileReference("src/app.rs".into())],
+            artifacts: vec![ToolArtifact::FileReference(FileReferenceArtifact {
+                path: "src/app.rs".into(),
+            })],
         });
         app.handle_agent_event(AgentEvent::ToolFinished {
             request_id: 14,
             call_id: 2,
             summary: None,
-            artifacts: vec![ToolArtifact::Patch {
+            artifacts: vec![ToolArtifact::Patch(PatchArtifact {
                 path: "src/app.rs".into(),
                 diff: "-old\n+new".into(),
-            }],
+            })],
         });
         app.handle_agent_event(AgentEvent::ToolFinished {
             request_id: 14,
             call_id: 3,
             summary: None,
-            artifacts: vec![ToolArtifact::Terminal {
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
                 description: "Run tests".into(),
                 command: "cargo test".into(),
                 output: "ok".into(),
                 exit_code: Some(0),
-            }],
+            })],
         });
 
         let tool_ids = app

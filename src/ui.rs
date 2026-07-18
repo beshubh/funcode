@@ -1193,7 +1193,10 @@ mod tests {
         app::{App, ModelsDialogPhase, Screen},
         llm::{ModelInfo, ProviderModels},
         theme::{Theme, ThemeRole},
-        transcript::ToolArtifact,
+        transcript::{
+            PatchArtifact, SearchResultsArtifact, TerminalArtifact, TextDetailArtifact,
+            ToolArtifact,
+        },
     };
     use ratatui::{
         Terminal,
@@ -1940,23 +1943,23 @@ mod tests {
                 call_id: request_id,
                 name: "terminal".into(),
                 summary: format!("command {request_id}"),
-                artifacts: vec![ToolArtifact::Terminal {
+                artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
                     description: format!("command {request_id}"),
                     command: "printf output".into(),
                     output: format!("output {request_id}\n"),
                     exit_code: None,
-                }],
+                })],
             });
             app.handle_agent_event(AgentEvent::ToolFinished {
                 request_id,
                 call_id: request_id,
                 summary: Some("complete".into()),
-                artifacts: vec![ToolArtifact::Terminal {
+                artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
                     description: format!("command {request_id}"),
                     command: "printf output".into(),
                     output: format!("output {request_id}\n"),
                     exit_code: Some(0),
-                }],
+                })],
             });
             app.handle_agent_event(AgentEvent::TextDelta {
                 request_id,
@@ -2022,7 +2025,7 @@ mod tests {
             call_id: 1,
             name: "terminal".into(),
             summary: "large output".into(),
-            artifacts: vec![ToolArtifact::Terminal {
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
                 description: "large output".into(),
                 command: "generate-output".into(),
                 output: (0..10_000)
@@ -2030,7 +2033,7 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("\n"),
                 exit_code: Some(0),
-            }],
+            })],
         });
 
         let state = UiState::default();
@@ -2113,12 +2116,12 @@ mod tests {
             call_id: 7,
             name: "terminal".into(),
             summary: "running command".into(),
-            artifacts: vec![ToolArtifact::Terminal {
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
                 description: "run".into(),
                 command: "echo before".into(),
                 output: "before".into(),
                 exit_code: None,
-            }],
+            })],
         });
         let state = UiState::default();
         let _ = render_to_string_with_state(&app, 100, 30, &state);
@@ -2275,12 +2278,12 @@ mod tests {
             call_id: 8,
             name: "terminal".into(),
             summary: "Checking the project".into(),
-            artifacts: vec![ToolArtifact::Terminal {
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
                 description: "Checking the project".into(),
                 command: "cargo test".into(),
                 output: String::new(),
                 exit_code: None,
-            }],
+            })],
         });
         app.handle_agent_event(AgentEvent::ToolOutputDelta {
             request_id: 3,
@@ -2297,12 +2300,12 @@ mod tests {
             request_id: 3,
             call_id: 8,
             summary: Some("Exited with 0".into()),
-            artifacts: vec![ToolArtifact::Terminal {
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
                 description: "Checking the project".into(),
                 command: "cargo test".into(),
                 output: "test result: ok".into(),
                 exit_code: Some(0),
-            }],
+            })],
         });
         let (screen, _, _, _) = render_to_string(&app, 100, 30);
 
@@ -2330,10 +2333,10 @@ mod tests {
             request_id: 3,
             call_id: 11,
             summary: None,
-            artifacts: vec![ToolArtifact::Patch {
+            artifacts: vec![ToolArtifact::Patch(PatchArtifact {
                 path: "value.txt".into(),
                 diff: "--- value.txt\n+++ value.txt\n-old\n+new".into(),
-            }],
+            })],
         });
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2365,10 +2368,10 @@ mod tests {
             request_id: 3,
             call_id: 12,
             summary: None,
-            artifacts: vec![ToolArtifact::SearchResults {
+            artifacts: vec![ToolArtifact::SearchResults(SearchResultsArtifact {
                 query: "marker".into(),
                 matches: "src/main.rs:1:marker".into(),
-            }],
+            })],
         });
         let search_id = app.transcript.entries()[3].id;
         app.activate_transcript_entry(search_id);
@@ -2394,12 +2397,12 @@ mod tests {
             request_id: 3,
             call_id: 3,
             summary: None,
-            artifacts: vec![ToolArtifact::TextDetail(
-                (0..40)
+            artifacts: vec![ToolArtifact::TextDetail(TextDetailArtifact {
+                text: (0..40)
                     .map(|line| format!("tool-line-{line}"))
                     .collect::<Vec<_>>()
                     .join("\n"),
-            )],
+            })],
         });
         let tool_id = app.transcript.entries()[2].id;
         app.activate_transcript_entry(tool_id);
