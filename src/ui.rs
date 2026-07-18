@@ -32,6 +32,7 @@ pub struct ModelRegion {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UiRegions {
+    pub transcript: Option<Rect>,
     pub transcript_entries: Vec<transcript::EntryRegion>,
     pub auth_providers: Vec<Rect>,
     pub suggestions: Vec<Rect>,
@@ -120,11 +121,17 @@ impl UiRegions {
             .find(|(_, area)| area.contains(position))
         {
             Some(UiTarget::Theme(index))
+        } else if let Some(target) = self
+            .transcript_entries
+            .iter()
+            .find(|region| region.area.contains(position))
+            .map(|region| UiTarget::TranscriptEntry(region.id))
+        {
+            Some(target)
+        } else if self.transcript.is_some_and(|area| area.contains(position)) {
+            Some(UiTarget::Transcript)
         } else {
-            self.transcript_entries
-                .iter()
-                .find(|region| region.area.contains(position))
-                .map(|region| UiTarget::TranscriptEntry(region.id))
+            None
         }
     }
 }
@@ -814,7 +821,10 @@ fn render_chat(
     ])
     .split(inner);
 
-    let mut regions = UiRegions::default();
+    let mut regions = UiRegions {
+        transcript: Some(rows[0]),
+        ..UiRegions::default()
+    };
     if app.transcript.entries().is_empty() {
         render_welcome(frame, rows[0], app, theme);
     } else {
@@ -1190,7 +1200,7 @@ mod tests {
     };
     use crate::{
         agent::AgentEvent,
-        app::{App, ModelsDialogPhase, Screen},
+        app::{App, ModelsDialogPhase, PointerEvent, Screen},
         llm::{ModelInfo, ProviderModels},
         theme::{Theme, ThemeRole},
         transcript::{
@@ -2070,6 +2080,40 @@ mod tests {
         let (before, _, regions, _) = render_to_string_with_state(&app, 80, 24, &state);
         app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
 
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 1,
+            text: "\nnew-line-100\nnew-line-101".into(),
+        });
+        let (after, _, _, _) = render_to_string_with_state(&app, 80, 24, &state);
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn attachment_suggestions_do_not_steal_transcript_scroll_or_resume_stream_following() {
+        let mut app = App::with_files(["src/app.rs", "src/runtime.rs"]);
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 1,
+            text: (0..100)
+                .map(|line| format!("stable-line-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        app.composer.insert_text("@src");
+
+        let state = UiState::default();
+        let (_, _, regions, _) = render_to_string_with_state(&app, 80, 24, &state);
+        app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+        let transcript = regions.transcript.expect("transcript viewport");
+        let target = regions.target_at(transcript.x, transcript.y);
+        app.handle_pointer(PointerEvent::Scroll { delta: 1, target });
+        assert!(!app.transcript_is_following());
+
+        let (before, _, regions, _) = render_to_string_with_state(&app, 80, 24, &state);
+        app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
         app.handle_agent_event(AgentEvent::TextDelta {
             request_id: 1,
             text: "\nnew-line-100\nnew-line-101".into(),

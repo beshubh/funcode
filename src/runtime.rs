@@ -71,7 +71,14 @@ struct SetAnyMouseMotion(bool);
 
 impl Command for SetAnyMouseMotion {
     fn write_ansi(&self, output: &mut impl std::fmt::Write) -> std::fmt::Result {
-        output.write_str(if self.0 { "\x1b[?1003h" } else { "\x1b[?1003l" })
+        output.write_str(if self.0 {
+            "\x1b[?1003h"
+        } else {
+            // Some terminals treat 1000, 1002, and 1003 as replacement
+            // tracking modes rather than a stack. Disabling all-motion mode
+            // therefore does not reliably restore button and wheel events.
+            "\x1b[?1003l\x1b[?1000h\x1b[?1002h"
+        })
     }
 
     #[cfg(windows)]
@@ -133,7 +140,7 @@ enum BatchedEvent {
     Key(crossterm::event::KeyEvent),
     Paste(String),
     Mouse(crossterm::event::MouseEvent),
-    Scroll { delta: isize },
+    Scroll { delta: isize, column: u16, row: u16 },
     Resize(u16, u16),
 }
 
@@ -163,10 +170,18 @@ impl TerminalEventBatch {
                     } else {
                         -1
                     };
-                    if let Some(BatchedEvent::Scroll { delta }) = batch.events.last_mut() {
+                    if let Some(BatchedEvent::Scroll { delta, column, row }) =
+                        batch.events.last_mut()
+                        && *column == mouse.column
+                        && *row == mouse.row
+                    {
                         *delta = delta.saturating_add(direction);
                     } else {
-                        batch.events.push(BatchedEvent::Scroll { delta: direction });
+                        batch.events.push(BatchedEvent::Scroll {
+                            delta: direction,
+                            column: mouse.column,
+                            row: mouse.row,
+                        });
                     }
                 }
                 Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
@@ -234,8 +249,11 @@ fn apply_app_input(
                 rendered_at: None,
             }
         }
-        BatchedEvent::Scroll { delta, .. } => {
-            let outcome = app.handle_pointer(PointerEvent::Scroll(*delta));
+        BatchedEvent::Scroll { delta, column, row } => {
+            let outcome = app.handle_pointer(PointerEvent::Scroll {
+                delta: *delta,
+                target: regions.target_at(*column, *row),
+            });
             InputOutcome {
                 action: outcome.action,
                 changed: outcome.changed,
@@ -779,8 +797,14 @@ fn handle_mouse_event_outcome(
             }
         }
         MouseEventKind::Moved => PointerEvent::Hover(target()),
-        MouseEventKind::ScrollUp => PointerEvent::Scroll(1),
-        MouseEventKind::ScrollDown => PointerEvent::Scroll(-1),
+        MouseEventKind::ScrollUp => PointerEvent::Scroll {
+            delta: 1,
+            target: target(),
+        },
+        MouseEventKind::ScrollDown => PointerEvent::Scroll {
+            delta: -1,
+            target: target(),
+        },
         _ => return crate::app::PointerOutcome::default(),
     };
     app.handle_pointer(event)
@@ -1328,7 +1352,11 @@ mod tests {
         let mut scroll_app = App::new();
         scroll_app.screen = Screen::Chat;
         scroll_app.update_transcript_scroll_maximum(5);
-        let scroll = BatchedEvent::Scroll { delta: 10_000 };
+        let scroll = BatchedEvent::Scroll {
+            delta: 10_000,
+            column: 0,
+            row: 0,
+        };
         assert!(
             apply_app_input(
                 &mut scroll_app,
@@ -1385,7 +1413,7 @@ mod tests {
 
         ansi.clear();
         SetAnyMouseMotion(false).write_ansi(&mut ansi).unwrap();
-        assert_eq!(ansi, "\x1b[?1003l");
+        assert_eq!(ansi, "\x1b[?1003l\x1b[?1000h\x1b[?1002h");
     }
 
     #[test]
@@ -1601,6 +1629,54 @@ mod tests {
         handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollDown, 0, 0));
         assert_eq!(app.transcript_scroll_offset(20), 0);
         assert!(app.transcript_is_following());
+    }
+
+    #[test]
+    fn mouse_wheel_over_transcript_scrolls_when_file_suggestions_are_open() {
+        let mut app = App::with_files(["src/app.rs", "src/runtime.rs"]);
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "sent".into(), Vec::new());
+        app.composer.insert_text("@src");
+        app.set_suggestion_selection(0);
+        app.update_transcript_scroll_maximum(20);
+        let regions = UiRegions {
+            transcript_entries: vec![crate::ui::transcript::EntryRegion {
+                id: app.transcript.entries()[0].id,
+                area: Rect::new(0, 0, 40, 10),
+            }],
+            ..UiRegions::default()
+        };
+
+        handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollUp, 5, 5));
+
+        assert_eq!(app.transcript_scroll_offset(20), 5);
+        assert_eq!(app.selected_suggestion(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_over_transcript_scrolls_while_attachment_preflight_is_pending() {
+        let mut app = App::with_files(["src/app.rs", "src/runtime.rs"]);
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "sent".into(), Vec::new());
+        app.composer.insert_text("@src/runtime");
+        app.activate_suggestion(0);
+        assert!(matches!(
+            app.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                std::time::Instant::now()
+            ),
+            Some(AppAction::Preflight { .. })
+        ));
+        app.update_transcript_scroll_maximum(20);
+        let regions = UiRegions {
+            transcript: Some(Rect::new(0, 0, 40, 10)),
+            ..UiRegions::default()
+        };
+
+        handle_mouse_event(&mut app, &regions, mouse(MouseEventKind::ScrollUp, 5, 5));
+
+        assert_eq!(app.transcript_scroll_offset(20), 5);
+        assert!(!app.transcript_is_following());
     }
 
     #[test]

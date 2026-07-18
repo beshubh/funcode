@@ -1,4 +1,4 @@
-mod config;
+pub mod config;
 
 pub(crate) use config::{
     ThemeConfigEvent, ThemeConfigLoad, ThemeConfigStore, ThemeConfigTaskRunner,

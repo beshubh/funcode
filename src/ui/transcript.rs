@@ -750,7 +750,7 @@ impl ToolArtifact {
     fn renderer(&self) -> &dyn Render {
         match self {
             Self::CodeRange(artifact) => artifact,
-            Self::Patch(artifact) => artifact,
+            Self::Patch(artifact)=> artifact,
             Self::SearchResults(artifact) => artifact,
             Self::Terminal(artifact) => artifact,
             Self::TextDetail(artifact) => artifact,

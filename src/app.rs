@@ -160,6 +160,7 @@ pub enum SuggestionKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerTarget {
+    Transcript,
     TranscriptEntry(EntryId),
     AuthProvider(usize),
     Suggestion(usize),
@@ -173,9 +174,16 @@ pub enum PointerTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PointerEvent {
     Activate(Option<PointerTarget>),
-    PlaceComposerCursor { column: u16, row: u16, height: u16 },
+    PlaceComposerCursor {
+        column: u16,
+        row: u16,
+        height: u16,
+    },
     Hover(Option<PointerTarget>),
-    Scroll(isize),
+    Scroll {
+        delta: isize,
+        target: Option<PointerTarget>,
+    },
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -714,7 +722,7 @@ impl App {
     pub(crate) fn handle_pointer(&mut self, event: PointerEvent) -> PointerOutcome {
         let owner = self.input_owner();
         let only_changes_selection =
-            matches!(event, PointerEvent::Hover(_) | PointerEvent::Scroll(_));
+            matches!(event, PointerEvent::Hover(_) | PointerEvent::Scroll { .. });
         let before = self.pointer_selection_state();
         let activation_before = (!only_changes_selection).then(|| self.pointer_activation_state());
         let action = match event {
@@ -784,11 +792,18 @@ impl App {
                 }
                 None
             }
-            PointerEvent::Scroll(delta) => {
+            PointerEvent::Scroll { delta, target } => {
                 let direction = if delta > 0 { -1 } else { 1 };
                 let count = delta.unsigned_abs();
+                let over_transcript = matches!(
+                    target,
+                    Some(PointerTarget::Transcript | PointerTarget::TranscriptEntry(_))
+                );
                 match owner {
                     InputOwner::Composer => {
+                        self.scroll_transcript_by(delta);
+                    }
+                    InputOwner::Suggestions | InputOwner::PendingSubmission if over_transcript => {
                         self.scroll_transcript_by(delta);
                     }
                     InputOwner::Auth => {
@@ -975,6 +990,21 @@ impl App {
     }
 
     fn handle_pending_submission_key(&mut self, key: KeyEvent) -> Option<AppAction> {
+        match key.code {
+            KeyCode::PageUp => {
+                self.scroll_transcript_up();
+                return None;
+            }
+            KeyCode::PageDown => {
+                self.scroll_transcript_down();
+                return None;
+            }
+            KeyCode::End if !self.transcript_is_following() => {
+                self.transcript_scroll = TranscriptScroll::Following;
+                return None;
+            }
+            _ => {}
+        }
         let pending = self.pending_submission.as_ref()?;
         match (&pending.phase, key.code) {
             (PendingSubmissionPhase::Preflighting, KeyCode::Esc) => {
