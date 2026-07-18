@@ -1583,9 +1583,18 @@ impl App {
         self.last_escape = None;
     }
 
+    #[cfg(test)]
     pub(crate) fn set_current_model(&mut self, model: impl Into<String>) {
+        self.set_current_model_with_context(model, None);
+    }
+
+    pub(crate) fn set_current_model_with_context(
+        &mut self,
+        model: impl Into<String>,
+        context_window: Option<u64>,
+    ) {
         self.current_model = model.into();
-        self.current_model_context_window = None;
+        self.current_model_context_window = context_window;
     }
 
     pub(crate) fn current_model(&self) -> &str {
@@ -1680,6 +1689,7 @@ impl App {
                     self.models_dialog = Some(ModelsDialogPhase::Failed(message));
                 }
             }
+            ModelCatalogEvent::SelectionPersistenceFailed(_) => {}
         }
     }
 

@@ -106,6 +106,7 @@ Theme colors are resolved through semantic roles rather than widget-specific col
 drives activity, commands, selections, attachments, and the Fun logo; Plan and Build keep distinct
 orange and GitHub-style green mode colors across themes.
 
-Provider catalogs are cached in `~/.funcode/models.json` for 24 hours. In the model picker, press
-`r` or click **Refresh** to bypass the cache, query authenticated providers, and replace the saved
-catalog.
+Provider catalogs are cached in `~/.funcode/models.json` for 24 hours, including each model's
+context-window size and the most recently selected model. The selected model is restored on the
+next launch unless `FUNCODE_MODEL` explicitly overrides it. In the model picker, press `r` or click
+**Refresh** to bypass the cache, query authenticated providers, and replace the saved catalog.

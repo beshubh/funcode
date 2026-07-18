@@ -5,7 +5,7 @@ use crate::{
     clipboard::{ClipboardEvent, ClipboardTaskRunner},
     composer::SubmittedContent,
     llm::{LlmClient, LlmConfig},
-    model_catalog::ModelCatalogTaskRunner,
+    model_catalog::{ModelCatalogEvent, ModelCatalogTaskRunner, load_model_preferences},
     session::SessionMode,
     submission::{DraftId, SubmissionEvent, SubmissionTaskRunner},
     terminal_selection::TerminalSelection,
@@ -373,15 +373,20 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     if let Some(warning) = theme_load.warning {
         app.set_notice(warning);
     }
+    let model_preferences = load_model_preferences();
     let (mut runner, mut model_runner, mut submission_runner) = match &launch_mode {
         LaunchMode::Interactive(_) => {
-            let config = LlmConfig::from_env().context("failed to load LLM configuration")?;
+            let config = LlmConfig::from_env_or(model_preferences.selected_model())
+                .context("failed to load LLM configuration")?;
             let auth_store =
                 AuthStore::standard().context("failed to locate ChatGPT credentials")?;
             let llm = LlmClient::new(config, auth_store).context("failed to configure the LLM")?;
-            app.set_current_model(
-                llm.current_model()
-                    .context("failed to read the selected model")?,
+            let current_model = llm
+                .current_model()
+                .context("failed to read the selected model")?;
+            app.set_current_model_with_context(
+                current_model.clone(),
+                model_preferences.context_window(&current_model),
             );
             (
                 Some(AgentTaskRunner::spawn_in(
@@ -503,8 +508,16 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
         }
         if let Some(model_runner) = model_runner.as_ref() {
             while let Some(event) = model_runner.try_event() {
-                let urgent = matches!(&event, crate::model_catalog::ModelCatalogEvent::Failed(_));
-                app.handle_model_catalog_event(event);
+                let urgent = matches!(
+                    &event,
+                    ModelCatalogEvent::Failed(_) | ModelCatalogEvent::SelectionPersistenceFailed(_)
+                );
+                match event {
+                    ModelCatalogEvent::SelectionPersistenceFailed(error) => {
+                        app.set_notice(format!("Could not save model selection: {error}"));
+                    }
+                    event => app.handle_model_catalog_event(event),
+                }
                 if urgent {
                     redraw.mark_urgent();
                 } else {
@@ -1055,7 +1068,6 @@ fn dispatch(action: AppAction, context: DispatchContext<'_>) -> bool {
                     if let Err(error) = model_runner.select_model(model.clone()) {
                         app.set_notice(error.to_string());
                     } else {
-                        app.set_current_model(model.clone());
                         app.set_notice(format!("Model changed to {model}"));
                     }
                 }

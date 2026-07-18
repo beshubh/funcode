@@ -1,5 +1,6 @@
 use crate::llm::{LlmClient, ProviderModels};
 use std::{
+    collections::HashMap,
     fmt, fs,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
@@ -14,17 +15,37 @@ const CACHE_FRESHNESS: Duration = Duration::from_secs(24 * 60 * 60);
 struct CachedCatalogs {
     version: u8,
     fetched_at: u64,
+    #[serde(default)]
+    selected_model: Option<String>,
     catalogs: Vec<ProviderModels>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ModelPreferences {
+    selected_model: Option<String>,
+    context_windows: HashMap<String, u64>,
+}
+
+impl ModelPreferences {
+    pub(crate) fn selected_model(&self) -> Option<&str> {
+        self.selected_model.as_deref()
+    }
+
+    pub(crate) fn context_window(&self, model: &str) -> Option<u64> {
+        self.context_windows.get(model).copied()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ModelCatalogEvent {
     Loaded(Vec<ProviderModels>),
     Failed(String),
+    SelectionPersistenceFailed(String),
 }
 
 enum ModelCatalogCommand {
     Load { refresh: bool },
+    PersistSelection { model: String },
     Shutdown,
 }
 
@@ -77,6 +98,13 @@ impl ModelCatalogTaskRunner {
                             return;
                         }
                     }
+                    ModelCatalogCommand::PersistSelection { model } => {
+                        if let Err(error) = persist_selected_model(&cache_path, model) {
+                            let _ = event_tx.send(ModelCatalogEvent::SelectionPersistenceFailed(
+                                error.to_string(),
+                            ));
+                        }
+                    }
                     ModelCatalogCommand::Shutdown => return,
                 }
             }
@@ -102,7 +130,14 @@ impl ModelCatalogTaskRunner {
     }
 
     pub(crate) fn select_model(&self, model: String) -> Result<(), crate::llm::LlmError> {
-        self.client.select_model(model)
+        self.client.select_model(model.clone())?;
+        self.commands
+            .send(ModelCatalogCommand::PersistSelection { model })
+            .map_err(|_| {
+                crate::llm::LlmError::Internal(
+                    "the selected model could not be queued for persistence".into(),
+                )
+            })
     }
 
     pub(crate) fn try_event(&self) -> Option<ModelCatalogEvent> {
@@ -136,6 +171,33 @@ fn standard_cache_path() -> PathBuf {
         .join("models.json")
 }
 
+pub(crate) fn load_model_preferences() -> ModelPreferences {
+    load_model_preferences_from(&standard_cache_path())
+}
+
+fn load_model_preferences_from(path: &Path) -> ModelPreferences {
+    let Some(cache) = read_cache(path) else {
+        return ModelPreferences::default();
+    };
+    if cache.version != CACHE_VERSION {
+        return ModelPreferences::default();
+    }
+    let context_windows = cache
+        .catalogs
+        .iter()
+        .flat_map(|catalog| catalog.models.iter())
+        .filter_map(|model| {
+            model
+                .context_window
+                .map(|context_window| (model.id.clone(), context_window))
+        })
+        .collect();
+    ModelPreferences {
+        selected_model: cache.selected_model,
+        context_windows,
+    }
+}
+
 fn load_catalogs(
     runtime: &tokio::runtime::Runtime,
     client: &LlmClient,
@@ -155,7 +217,7 @@ fn load_catalogs(
 }
 
 fn read_fresh_cache(path: &Path, freshness: Duration) -> Option<Vec<ProviderModels>> {
-    let cache: CachedCatalogs = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let cache = read_cache(path)?;
     if cache.version != CACHE_VERSION {
         return None;
     }
@@ -175,7 +237,39 @@ fn read_fresh_cache(path: &Path, freshness: Duration) -> Option<Vec<ProviderMode
     )
 }
 
+fn read_cache(path: &Path) -> Option<CachedCatalogs> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
 fn write_cache(path: &Path, catalogs: &[ProviderModels]) -> std::io::Result<()> {
+    let selected_model = read_cache(path)
+        .filter(|cache| cache.version == CACHE_VERSION)
+        .and_then(|cache| cache.selected_model);
+    let fetched_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    write_cache_contents(path, fetched_at, selected_model, catalogs)
+}
+
+fn persist_selected_model(path: &Path, model: String) -> std::io::Result<()> {
+    let cache = read_cache(path)
+        .filter(|cache| cache.version == CACHE_VERSION)
+        .unwrap_or(CachedCatalogs {
+            version: CACHE_VERSION,
+            fetched_at: 0,
+            selected_model: None,
+            catalogs: Vec::new(),
+        });
+    write_cache_contents(path, cache.fetched_at, Some(model), &cache.catalogs)
+}
+
+fn write_cache_contents(
+    path: &Path,
+    fetched_at: u64,
+    selected_model: Option<String>,
+    catalogs: &[ProviderModels],
+) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -183,17 +277,16 @@ fn write_cache(path: &Path, catalogs: &[ProviderModels]) -> std::io::Result<()> 
         )
     })?;
     fs::create_dir_all(parent)?;
-    let fetched_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     let bytes = serde_json::to_vec_pretty(&CachedCatalogs {
         version: CACHE_VERSION,
         fetched_at,
+        selected_model,
         catalogs: catalogs.to_vec(),
     })
     .map_err(std::io::Error::other)?;
-    fs::write(path, bytes)
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, bytes)?;
+    fs::rename(temporary, path)
 }
 
 impl Drop for ModelCatalogTaskRunner {
@@ -204,7 +297,10 @@ impl Drop for ModelCatalogTaskRunner {
 
 #[cfg(test)]
 mod tests {
-    use super::{CACHE_VERSION, CachedCatalogs, ModelCatalogEvent, ModelCatalogTaskRunner};
+    use super::{
+        CACHE_VERSION, CachedCatalogs, ModelCatalogEvent, ModelCatalogTaskRunner,
+        load_model_preferences_from,
+    };
     use crate::llm::{
         LlmClient, LlmError, ModelInfo, Provider, ProviderModels, ProviderRequest, ProviderStream,
     };
@@ -237,7 +333,7 @@ mod tests {
                     models: vec![ModelInfo {
                         id: "test-model".into(),
                         display_name: "Test Model".into(),
-                        context_window: None,
+                        context_window: Some(128_000),
                     }],
                 })
             })
@@ -333,6 +429,27 @@ mod tests {
             ModelCatalogEvent::Failed("catalog unavailable".into())
         );
         runner.shutdown();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn selected_model_and_catalog_context_windows_survive_restart() {
+        let client = LlmClient::with_provider(Arc::new(CatalogProvider));
+        let path = cache_path();
+        let mut runner = ModelCatalogTaskRunner::spawn_with_cache(
+            client,
+            path.clone(),
+            Duration::from_secs(24 * 60 * 60),
+        );
+
+        runner.load().unwrap();
+        runner.recv_timeout(Duration::from_secs(1)).unwrap();
+        runner.select_model("test-model".into()).unwrap();
+        runner.shutdown();
+
+        let preferences = load_model_preferences_from(&path);
+        assert_eq!(preferences.selected_model(), Some("test-model"));
+        assert_eq!(preferences.context_window("test-model"), Some(128_000));
         let _ = std::fs::remove_file(path);
     }
 
@@ -434,6 +551,7 @@ mod tests {
         let stale = CachedCatalogs {
             version: CACHE_VERSION,
             fetched_at: 0,
+            selected_model: None,
             catalogs: vec![ProviderModels {
                 provider: "Stale".into(),
                 source: "cached catalog".into(),

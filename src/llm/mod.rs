@@ -81,8 +81,16 @@ pub(crate) struct LlmConfig {
 }
 
 impl LlmConfig {
+    #[cfg(test)]
     pub(crate) fn from_env() -> Result<Self, LlmError> {
-        let model = std::env::var("FUNCODE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        Self::from_env_or(None)
+    }
+
+    pub(crate) fn from_env_or(persisted_model: Option<&str>) -> Result<Self, LlmError> {
+        let model = std::env::var("FUNCODE_MODEL")
+            .ok()
+            .or_else(|| persisted_model.map(str::to_owned))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         Self::with_model(model)
     }
 
