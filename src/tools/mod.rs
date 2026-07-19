@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file_rejects_invalid_ranges_as_recoverable_failures() {
+    async fn read_file_clamps_an_oversized_end_to_a_short_file() {
         let root = tempfile::tempdir().expect("temporary workspace should be created");
         fs::write(root.path().join("notes.txt"), "one\ntwo\n").expect("fixture should be written");
 
@@ -481,12 +481,122 @@ mod tests {
             root.path(),
             SessionMode::Build,
             "read_file",
-            json!({ "path": "notes.txt", "start_line": 2, "end_line": 3 }),
+            json!({ "path": "notes.txt", "start_line": 1, "end_line": 10 }),
         )
         .await;
 
-        assert!(output.contains("invalid line range"));
-        assert!(matches!(events.last(), Some(ToolEvent::Failed { .. })));
+        assert_eq!(output, "     1\tone\n     2\ttwo");
+        assert!(matches!(
+            events.last(),
+            Some(ToolEvent::Finished {
+                display: ToolDisplay::CodeRange {
+                    start_line: 1,
+                    end_line: 2,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_file_clamps_ranges_past_the_end_of_a_short_file() {
+        let root = tempfile::tempdir().expect("temporary workspace should be created");
+        fs::write(root.path().join("notes.txt"), "one\ntwo\n").expect("fixture should be written");
+
+        let (output, events) = execute(
+            root.path(),
+            SessionMode::Build,
+            "read_file",
+            json!({ "path": "notes.txt", "start_line": 10, "end_line": 20 }),
+        )
+        .await;
+
+        assert_eq!(output, "     2\ttwo");
+        assert!(matches!(
+            events.last(),
+            Some(ToolEvent::Finished {
+                display: ToolDisplay::CodeRange {
+                    start_line: 2,
+                    end_line: 2,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_file_normalizes_zero_and_reversed_bounds() {
+        let root = tempfile::tempdir().expect("temporary workspace should be created");
+        fs::write(root.path().join("notes.txt"), "one\ntwo\n").expect("fixture should be written");
+
+        let (zero_output, zero_events) = execute(
+            root.path(),
+            SessionMode::Build,
+            "read_file",
+            json!({ "path": "notes.txt", "start_line": 0, "end_line": 0 }),
+        )
+        .await;
+        let (reversed_output, reversed_events) = execute(
+            root.path(),
+            SessionMode::Build,
+            "read_file",
+            json!({ "path": "notes.txt", "start_line": 2, "end_line": 1 }),
+        )
+        .await;
+
+        assert_eq!(zero_output, "     1\tone");
+        assert_eq!(reversed_output, "     2\ttwo");
+        assert!(matches!(
+            zero_events.last(),
+            Some(ToolEvent::Finished {
+                display: ToolDisplay::CodeRange {
+                    start_line: 1,
+                    end_line: 1,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            reversed_events.last(),
+            Some(ToolEvent::Finished {
+                display: ToolDisplay::CodeRange {
+                    start_line: 2,
+                    end_line: 2,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_file_reports_a_safe_empty_range_for_an_empty_file() {
+        let root = tempfile::tempdir().expect("temporary workspace should be created");
+        fs::write(root.path().join("empty.txt"), "").expect("fixture should be written");
+
+        let (output, events) = execute(
+            root.path(),
+            SessionMode::Build,
+            "read_file",
+            json!({ "path": "empty.txt", "start_line": 1, "end_line": 10 }),
+        )
+        .await;
+
+        assert!(output.is_empty());
+        assert!(matches!(
+            events.last(),
+            Some(ToolEvent::Finished {
+                display: ToolDisplay::CodeRange {
+                    start_line: 1,
+                    end_line: 1,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
