@@ -741,6 +741,7 @@ fn render_frame(
         app.set_composer_width(area.width);
     }
     app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+    app.update_tool_output_scroll_maxima(&regions.tool_output_scroll_maxima);
     let wants_pointer_motion = regions.wants_pointer_motion();
     if wants_pointer_motion != *any_mouse_motion {
         execute!(stdout(), SetAnyMouseMotion(wants_pointer_motion))

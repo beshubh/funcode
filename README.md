@@ -58,7 +58,8 @@ If credentials are missing or the saved refresh token is rejected, the failed tu
   Option+Left/Right moves by word
 - Drag across terminal text to select and automatically copy it to the clipboard
 - Click a sent message: open a modal and copy its text and attached paths
-- Click a Thinking or tool block: expand its persistent activity summary
+- Click a Thinking block or an overflowing tool header: expand it within the transcript viewport
+- Scroll over terminal, diff, or search output to inspect its history; End resumes live tail-follow
 - `/auth`: open the authentication picker
 - `/models`: choose a model from every configured provider; use arrows or hover, then Enter/click
 - `/theme`: preview and select a bundled color theme
@@ -80,10 +81,11 @@ slash commands.
 ## Agent tools
 
 Build mode exposes `read_file`, `search_files`, `edit_file`, and `terminal`. File tools reject paths
-that escape the directory where Funcode was launched. Edits use exact text replacements or create a
-new file, write atomically, and display a unified diff. Terminal commands run through non-interactive
-Bash from the opened project; stdout and stderr stream into a terminal-style block with the command
-and exit status.
+that escape the directory where Funcode was launched. Reads remain concise path-only transcript
+records. Edits use exact text replacements or create a new file, write atomically, and display a
+unified diff. Terminal, diff, and search output use independently scrollable ten-row transcript
+viewports. Terminal commands run through non-interactive Bash from the opened project; stdout and
+stderr stream into a tail-following block with the command and exit status.
 
 Plan mode omits `edit_file` but allows reads, searches, and terminal inspection. The terminal's
 read-only Plan behavior is instruction-enforced rather than an operating-system sandbox, so arbitrary
