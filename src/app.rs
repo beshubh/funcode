@@ -11,14 +11,16 @@ use crate::{
     session::SessionMode,
     submission::{DraftId, PreparedRequest, SubmissionEvent},
     theme::ThemeId,
-    transcript::{Entry, EntryId, EntryKind, ToolArtifact, Transcript, TranscriptEvent},
+    transcript::{Entry, EntryId, EntryKind, Transcript, TranscriptEvent},
     usage::SessionUsage,
     workspace::WorkspacePath,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{
     cell::{Cell, RefCell},
-    sync::Arc,
+    collections::HashMap,
+    ops::Range,
+    sync::{Arc, RwLock, Weak},
     time::{Duration, Instant},
 };
 
@@ -162,6 +164,7 @@ pub enum SuggestionKind {
 pub enum PointerTarget {
     Transcript,
     TranscriptEntry(EntryId),
+    TranscriptOutput(EntryId),
     AuthProvider(usize),
     Suggestion(usize),
     MessageCopy,
@@ -251,6 +254,461 @@ enum TranscriptScroll {
     },
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum ToolOutputScrollPosition {
+    #[default]
+    Following,
+    Manual {
+        top: usize,
+        anchor: Option<ToolOutputRowAnchor>,
+    },
+}
+
+#[derive(Debug, Default, Clone)]
+struct ToolOutputScroll {
+    position: ToolOutputScrollPosition,
+    maximum: usize,
+    layout_id: Option<ToolOutputLayoutId>,
+    row_index: Weak<ToolOutputRowIndex>,
+}
+
+impl PartialEq for ToolOutputScroll {
+    fn eq(&self, other: &Self) -> bool {
+        self.position == other.position && self.maximum == other.maximum
+    }
+}
+
+impl Eq for ToolOutputScroll {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolOutputScrollMetrics {
+    pub entry_id: EntryId,
+    pub maximum: usize,
+    pub layout_id: ToolOutputLayoutId,
+    pub row_index: Arc<ToolOutputRowIndex>,
+}
+
+impl PartialEq for ToolOutputScrollMetrics {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry_id == other.entry_id
+            && self.maximum == other.maximum
+            && self.layout_id == other.layout_id
+    }
+}
+
+impl Eq for ToolOutputScrollMetrics {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolOutputLayoutId {
+    pub revision: u64,
+    pub width: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ToolOutputRowAnchor {
+    pub artifact: usize,
+    pub logical_line: usize,
+    pub source_byte: usize,
+}
+
+const TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS: usize = 128;
+
+#[derive(Debug, Clone, Copy)]
+struct ToolOutputSparseCheckpoint {
+    row: usize,
+    byte: usize,
+    anchor: ToolOutputRowAnchor,
+}
+
+#[derive(Debug)]
+enum ToolOutputRowSegment {
+    Dense(Vec<ToolOutputRowAnchor>),
+    Sparse {
+        rows: Weak<String>,
+        row_count: usize,
+        checkpoints: Vec<ToolOutputSparseCheckpoint>,
+    },
+}
+
+impl ToolOutputRowSegment {
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(anchors) => anchors.len(),
+            Self::Sparse { row_count, .. } => *row_count,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ToolOutputRowIndex {
+    segments: RwLock<Vec<ToolOutputRowSegment>>,
+}
+
+impl ToolOutputRowIndex {
+    pub(crate) fn new(segments: Vec<Vec<ToolOutputRowAnchor>>) -> Self {
+        Self {
+            segments: RwLock::new(
+                segments
+                    .into_iter()
+                    .map(ToolOutputRowSegment::Dense)
+                    .collect(),
+            ),
+        }
+    }
+
+    pub(crate) fn new_sparse(segments: &[(Arc<String>, usize)]) -> Self {
+        Self {
+            segments: RwLock::new(
+                segments
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(artifact, (rows, row_count))| ToolOutputRowSegment::Sparse {
+                            rows: Arc::downgrade(rows),
+                            row_count: *row_count,
+                            checkpoints: sparse_row_checkpoints(rows, *row_count, artifact),
+                        },
+                    )
+                    .collect(),
+            ),
+        }
+    }
+
+    pub(crate) fn anchor_at(&self, mut row: usize) -> Option<ToolOutputRowAnchor> {
+        let segments = self.segments.read().ok()?;
+        for segment in segments.iter() {
+            if row < segment.len() {
+                return match segment {
+                    ToolOutputRowSegment::Dense(anchors) => anchors.get(row).copied(),
+                    ToolOutputRowSegment::Sparse {
+                        rows,
+                        row_count,
+                        checkpoints,
+                    } => sparse_anchor_at(&rows.upgrade()?, *row_count, checkpoints, row),
+                };
+            }
+            row = row.saturating_sub(segment.len());
+        }
+        None
+    }
+
+    fn row_for_anchor(&self, anchor: ToolOutputRowAnchor) -> usize {
+        self.segments.read().map_or(0, |segments| {
+            let preceding = segments
+                .iter()
+                .take(anchor.artifact)
+                .fold(0usize, |rows, segment| rows.saturating_add(segment.len()));
+            let Some(segment) = segments.get(anchor.artifact) else {
+                return preceding;
+            };
+            let local = match segment {
+                ToolOutputRowSegment::Dense(anchors) => anchors
+                    .partition_point(|candidate| *candidate <= anchor)
+                    .saturating_sub(1)
+                    .min(anchors.len().saturating_sub(1)),
+                ToolOutputRowSegment::Sparse {
+                    rows,
+                    row_count,
+                    checkpoints,
+                } => rows.upgrade().map_or(0, |rows| {
+                    sparse_row_for_anchor(&rows, *row_count, checkpoints, anchor)
+                }),
+            };
+            preceding.saturating_add(local)
+        })
+    }
+
+    pub(crate) fn sparse_row_ranges(
+        &self,
+        segment: usize,
+        range: Range<usize>,
+    ) -> Vec<Range<usize>> {
+        let Ok(segments) = self.segments.read() else {
+            return Vec::new();
+        };
+        let Some(ToolOutputRowSegment::Sparse {
+            rows,
+            row_count,
+            checkpoints,
+        }) = segments.get(segment)
+        else {
+            return Vec::new();
+        };
+        let Some(rows) = rows.upgrade() else {
+            return Vec::new();
+        };
+        sparse_row_ranges(&rows, *row_count, checkpoints, range)
+    }
+
+    pub(crate) fn replace_segment(
+        &self,
+        segment: usize,
+        anchors: impl IntoIterator<Item = ToolOutputRowAnchor>,
+    ) {
+        let Ok(mut segments) = self.segments.write() else {
+            return;
+        };
+        if segments.len() <= segment {
+            segments.resize_with(segment.saturating_add(1), || {
+                ToolOutputRowSegment::Dense(Vec::new())
+            });
+        }
+        segments[segment] = ToolOutputRowSegment::Dense(anchors.into_iter().collect());
+    }
+
+    pub(crate) fn replace_sparse_segment(
+        &self,
+        segment: usize,
+        rows: &Arc<String>,
+        row_count: usize,
+    ) {
+        let Ok(mut segments) = self.segments.write() else {
+            return;
+        };
+        if segments.len() <= segment {
+            segments.resize_with(segment.saturating_add(1), || {
+                ToolOutputRowSegment::Dense(Vec::new())
+            });
+        }
+        segments[segment] = ToolOutputRowSegment::Sparse {
+            rows: Arc::downgrade(rows),
+            row_count,
+            checkpoints: sparse_row_checkpoints(rows, row_count, segment),
+        };
+    }
+
+    pub(crate) fn refresh_dense_segment_tail(
+        &self,
+        segment: usize,
+        first_changed_row: usize,
+        anchors: impl IntoIterator<Item = ToolOutputRowAnchor>,
+    ) {
+        let Ok(mut segments) = self.segments.write() else {
+            return;
+        };
+        let Some(ToolOutputRowSegment::Dense(cached)) = segments.get_mut(segment) else {
+            return;
+        };
+        cached.truncate(first_changed_row.min(cached.len()));
+        cached.extend(anchors);
+    }
+
+    pub(crate) fn refresh_sparse_segment_tail(
+        &self,
+        segment: usize,
+        rows: &Arc<String>,
+        row_count: usize,
+        first_changed_row: usize,
+    ) {
+        let Ok(mut segments) = self.segments.write() else {
+            return;
+        };
+        let Some(ToolOutputRowSegment::Sparse {
+            rows: cached_rows,
+            row_count: cached_count,
+            checkpoints,
+        }) = segments.get_mut(segment)
+        else {
+            return;
+        };
+        *cached_rows = Arc::downgrade(rows);
+        *cached_count = row_count;
+        refresh_sparse_checkpoints(rows, row_count, segment, checkpoints, first_changed_row);
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.segments
+            .read()
+            .map_or(std::mem::size_of::<Self>(), |segments| {
+                std::mem::size_of::<Self>()
+                    .saturating_add(
+                        segments
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ToolOutputRowSegment>()),
+                    )
+                    .saturating_add(segments.iter().fold(0usize, |bytes, segment| {
+                        bytes.saturating_add(match segment {
+                            ToolOutputRowSegment::Dense(anchors) => anchors
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ToolOutputRowAnchor>()),
+                            ToolOutputRowSegment::Sparse { checkpoints, .. } => checkpoints
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ToolOutputSparseCheckpoint>()),
+                        })
+                    }))
+            })
+    }
+}
+
+fn sparse_row_checkpoints(
+    rows: &str,
+    row_count: usize,
+    artifact: usize,
+) -> Vec<ToolOutputSparseCheckpoint> {
+    let mut checkpoints = Vec::with_capacity(
+        row_count.saturating_add(TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS - 1)
+            / TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS,
+    );
+    let mut byte = 0usize;
+    let mut anchor = ToolOutputRowAnchor {
+        artifact,
+        logical_line: 0,
+        source_byte: 0,
+    };
+    for row in 0..row_count {
+        if row.is_multiple_of(TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS) {
+            checkpoints.push(ToolOutputSparseCheckpoint { row, byte, anchor });
+        }
+        let _ = advance_sparse_row(rows, &mut byte, &mut anchor);
+    }
+    checkpoints
+}
+
+fn refresh_sparse_checkpoints(
+    rows: &str,
+    row_count: usize,
+    artifact: usize,
+    checkpoints: &mut Vec<ToolOutputSparseCheckpoint>,
+    first_changed_row: usize,
+) {
+    if row_count == 0 || checkpoints.is_empty() || first_changed_row == 0 {
+        *checkpoints = sparse_row_checkpoints(rows, row_count, artifact);
+        return;
+    }
+    let retained = checkpoints
+        .partition_point(|checkpoint| checkpoint.row <= first_changed_row)
+        .saturating_sub(1);
+    let checkpoint = checkpoints[retained];
+    checkpoints.truncate(retained.saturating_add(1));
+    let mut row = checkpoint.row;
+    let mut byte = checkpoint.byte;
+    let mut anchor = checkpoint.anchor;
+    while row < row_count {
+        if row != checkpoint.row && row.is_multiple_of(TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS) {
+            checkpoints.push(ToolOutputSparseCheckpoint { row, byte, anchor });
+        }
+        let _ = advance_sparse_row(rows, &mut byte, &mut anchor);
+        row = row.saturating_add(1);
+    }
+}
+
+fn sparse_anchor_at(
+    rows: &str,
+    row_count: usize,
+    checkpoints: &[ToolOutputSparseCheckpoint],
+    target: usize,
+) -> Option<ToolOutputRowAnchor> {
+    if target >= row_count {
+        return None;
+    }
+    let checkpoint = checkpoints
+        .get(target / TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS)
+        .copied()
+        .or_else(|| checkpoints.last().copied())?;
+    let mut row = checkpoint.row;
+    let mut byte = checkpoint.byte;
+    let mut anchor = checkpoint.anchor;
+    while row < target {
+        let _ = advance_sparse_row(rows, &mut byte, &mut anchor);
+        row = row.saturating_add(1);
+    }
+    Some(anchor)
+}
+
+fn sparse_row_for_anchor(
+    rows: &str,
+    row_count: usize,
+    checkpoints: &[ToolOutputSparseCheckpoint],
+    target: ToolOutputRowAnchor,
+) -> usize {
+    let Some(checkpoint) = checkpoints
+        .get(
+            checkpoints
+                .partition_point(|checkpoint| checkpoint.anchor <= target)
+                .saturating_sub(1),
+        )
+        .copied()
+    else {
+        return 0;
+    };
+    let mut row = checkpoint.row;
+    let mut byte = checkpoint.byte;
+    let mut anchor = checkpoint.anchor;
+    while row.saturating_add(1) < row_count {
+        let mut next_byte = byte;
+        let mut next_anchor = anchor;
+        let _ = advance_sparse_row(rows, &mut next_byte, &mut next_anchor);
+        if next_anchor > target {
+            break;
+        }
+        row = row.saturating_add(1);
+        byte = next_byte;
+        anchor = next_anchor;
+        if row.is_multiple_of(TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS) && anchor > target {
+            break;
+        }
+    }
+    row
+}
+
+fn sparse_row_ranges(
+    rows: &str,
+    row_count: usize,
+    checkpoints: &[ToolOutputSparseCheckpoint],
+    range: Range<usize>,
+) -> Vec<Range<usize>> {
+    let start = range.start.min(row_count);
+    let end = range.end.min(row_count);
+    if start >= end {
+        return Vec::new();
+    }
+    let Some(checkpoint) = checkpoints
+        .get(start / TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS)
+        .copied()
+        .or_else(|| checkpoints.last().copied())
+    else {
+        return Vec::new();
+    };
+    let mut row = checkpoint.row;
+    let mut byte = checkpoint.byte;
+    let mut anchor = checkpoint.anchor;
+    while row < start {
+        let _ = advance_sparse_row(rows, &mut byte, &mut anchor);
+        row = row.saturating_add(1);
+    }
+    let mut ranges = Vec::with_capacity(end.saturating_sub(start));
+    while row < end {
+        ranges.push(advance_sparse_row(rows, &mut byte, &mut anchor));
+        row = row.saturating_add(1);
+    }
+    ranges
+}
+
+fn advance_sparse_row(
+    rows: &str,
+    byte: &mut usize,
+    anchor: &mut ToolOutputRowAnchor,
+) -> Range<usize> {
+    let start = (*byte).min(rows.len());
+    let relative_end = rows.as_bytes()[start..]
+        .iter()
+        .position(|byte| matches!(*byte, b'\n' | b'\r'));
+    let end = relative_end.map_or(rows.len(), |end| start.saturating_add(end));
+    let delimiter = rows.as_bytes().get(end).copied();
+    *byte = end.saturating_add(usize::from(delimiter.is_some()));
+    match delimiter {
+        Some(b'\n') => {
+            anchor.source_byte = anchor.source_byte.saturating_add(end.saturating_sub(start));
+        }
+        Some(b'\r') => {
+            anchor.logical_line = anchor.logical_line.saturating_add(1);
+            anchor.source_byte = 0;
+        }
+        _ => {}
+    }
+    start..end
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct InputVisualState {
     screen: Screen,
@@ -258,6 +716,8 @@ struct InputVisualState {
     session_mode: SessionMode,
     transcript_entries: usize,
     transcript_scroll: TranscriptScroll,
+    tool_output_scrolls: Vec<(EntryId, ToolOutputScroll)>,
+    active_tool_output: Option<EntryId>,
     message_dialog: Option<EntryId>,
     notice: Option<String>,
     auth_dialog: Option<AuthDialog>,
@@ -291,6 +751,17 @@ struct PointerActivationState {
     context_usage_pop_origin: Option<(u16, u16)>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PointerSelectionState {
+    transcript_scroll: TranscriptScroll,
+    tool_output_scrolls: Vec<(EntryId, ToolOutputScroll)>,
+    active_tool_output: Option<EntryId>,
+    suggestion_selected: usize,
+    models_selected: usize,
+    theme_selected: Option<usize>,
+    auth_selected: Option<usize>,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct AppInputOutcome {
     pub action: Option<AppAction>,
@@ -308,6 +779,8 @@ pub struct App {
     pub animation_frame: usize,
     transcript_scroll: TranscriptScroll,
     transcript_scroll_maximum: usize,
+    tool_output_scrolls: HashMap<EntryId, ToolOutputScroll>,
+    active_tool_output: Option<EntryId>,
     pub expanded_entries: Vec<EntryId>,
     pub collapsed_entries: Vec<EntryId>,
     pub message_dialog: Option<EntryId>,
@@ -588,6 +1061,10 @@ impl App {
                 self.composer.move_home();
                 None
             }
+            KeyCode::End if self.active_tool_output.is_some() => {
+                self.follow_active_tool_output();
+                None
+            }
             KeyCode::End if !self.transcript_is_following() => {
                 self.transcript_scroll = TranscriptScroll::Following;
                 None
@@ -609,11 +1086,19 @@ impl App {
                 None
             }
             KeyCode::PageUp => {
-                self.scroll_transcript_up();
+                if let Some(entry_id) = self.active_tool_output {
+                    self.scroll_tool_output_by(entry_id, 1);
+                } else {
+                    self.scroll_transcript_up();
+                }
                 None
             }
             KeyCode::PageDown => {
-                self.scroll_transcript_down();
+                if let Some(entry_id) = self.active_tool_output {
+                    self.scroll_tool_output_by(entry_id, -1);
+                } else {
+                    self.scroll_transcript_down();
+                }
                 None
             }
             _ => None,
@@ -668,6 +1153,8 @@ impl App {
             session_mode: self.session_mode,
             transcript_entries: self.transcript.entries().len(),
             transcript_scroll: self.transcript_scroll,
+            tool_output_scrolls: self.tool_output_scroll_state(),
+            active_tool_output: self.active_tool_output,
             message_dialog: self.message_dialog,
             notice: self.notice.clone(),
             auth_dialog: self.auth_dialog.clone(),
@@ -731,6 +1218,7 @@ impl App {
                 row,
                 height,
             } => {
+                self.clear_active_tool_output();
                 if matches!(owner, InputOwner::Composer | InputOwner::Suggestions) {
                     self.composer.move_to_visual_position(
                         self.composer_width as usize,
@@ -741,39 +1229,53 @@ impl App {
                 }
                 None
             }
-            PointerEvent::Activate(target) => match (owner, target) {
-                (InputOwner::Auth, Some(PointerTarget::AuthProvider(index))) => {
-                    self.set_auth_selection(index);
-                    self.select_auth_provider()
+            PointerEvent::Activate(target) => {
+                if !matches!(target, Some(PointerTarget::TranscriptOutput(_))) {
+                    self.clear_active_tool_output();
                 }
-                (InputOwner::Message, Some(PointerTarget::MessageCopy)) => {
-                    self.copy_message_dialog()
+                match (owner, target) {
+                    (InputOwner::Auth, Some(PointerTarget::AuthProvider(index))) => {
+                        self.set_auth_selection(index);
+                        self.select_auth_provider()
+                    }
+                    (InputOwner::Message, Some(PointerTarget::MessageCopy)) => {
+                        self.copy_message_dialog()
+                    }
+                    (InputOwner::Theme, Some(PointerTarget::Theme(index))) => {
+                        self.set_theme_selection(index);
+                        self.commit_theme_selection()
+                    }
+                    (InputOwner::Models, Some(PointerTarget::Model(index))) => {
+                        self.activate_model(index)
+                    }
+                    (InputOwner::Models, Some(PointerTarget::ModelRefresh)) => {
+                        self.refresh_models()
+                    }
+                    (InputOwner::Suggestions, Some(PointerTarget::Suggestion(index))) => {
+                        self.activate_suggestion(index)
+                    }
+                    (
+                        InputOwner::Composer | InputOwner::Suggestions,
+                        Some(PointerTarget::ContextUsage { column, row }),
+                    ) => {
+                        self.context_usage_pop_frames = CONTEXT_USAGE_POP_FRAMES;
+                        self.context_usage_pop_origin = Some((column, row));
+                        None
+                    }
+                    (InputOwner::Composer, Some(PointerTarget::TranscriptEntry(entry_id))) => {
+                        self.activate_transcript_entry(entry_id);
+                        None
+                    }
+                    (
+                        InputOwner::Composer | InputOwner::Suggestions,
+                        Some(PointerTarget::TranscriptOutput(entry_id)),
+                    ) => {
+                        self.active_tool_output = Some(entry_id);
+                        None
+                    }
+                    _ => None,
                 }
-                (InputOwner::Theme, Some(PointerTarget::Theme(index))) => {
-                    self.set_theme_selection(index);
-                    self.commit_theme_selection()
-                }
-                (InputOwner::Models, Some(PointerTarget::Model(index))) => {
-                    self.activate_model(index)
-                }
-                (InputOwner::Models, Some(PointerTarget::ModelRefresh)) => self.refresh_models(),
-                (InputOwner::Suggestions, Some(PointerTarget::Suggestion(index))) => {
-                    self.activate_suggestion(index)
-                }
-                (
-                    InputOwner::Composer | InputOwner::Suggestions,
-                    Some(PointerTarget::ContextUsage { column, row }),
-                ) => {
-                    self.context_usage_pop_frames = CONTEXT_USAGE_POP_FRAMES;
-                    self.context_usage_pop_origin = Some((column, row));
-                    None
-                }
-                (InputOwner::Composer, Some(PointerTarget::TranscriptEntry(entry_id))) => {
-                    self.activate_transcript_entry(entry_id);
-                    None
-                }
-                _ => None,
-            },
+            }
             PointerEvent::Hover(target) => {
                 match (owner, target) {
                     (InputOwner::Auth, Some(PointerTarget::AuthProvider(index))) => {
@@ -797,9 +1299,20 @@ impl App {
                 let count = delta.unsigned_abs();
                 let over_transcript = matches!(
                     target,
-                    Some(PointerTarget::Transcript | PointerTarget::TranscriptEntry(_))
+                    Some(
+                        PointerTarget::Transcript
+                            | PointerTarget::TranscriptEntry(_)
+                            | PointerTarget::TranscriptOutput(_)
+                    )
                 );
                 match owner {
+                    InputOwner::Composer
+                    | InputOwner::Suggestions
+                    | InputOwner::PendingSubmission
+                        if let Some(PointerTarget::TranscriptOutput(entry_id)) = target =>
+                    {
+                        self.scroll_tool_output_by(entry_id, delta);
+                    }
                     InputOwner::Composer => {
                         self.scroll_transcript_by(delta);
                     }
@@ -842,16 +1355,26 @@ impl App {
         }
     }
 
-    fn pointer_selection_state(
-        &self,
-    ) -> (TranscriptScroll, usize, usize, Option<usize>, Option<usize>) {
-        (
-            self.transcript_scroll,
-            self.suggestion_selected,
-            self.models_selected,
-            self.theme_dialog.map(|dialog| dialog.selected),
-            self.auth_dialog.as_ref().map(|dialog| dialog.selected),
-        )
+    fn pointer_selection_state(&self) -> PointerSelectionState {
+        PointerSelectionState {
+            transcript_scroll: self.transcript_scroll,
+            tool_output_scrolls: self.tool_output_scroll_state(),
+            active_tool_output: self.active_tool_output,
+            suggestion_selected: self.suggestion_selected,
+            models_selected: self.models_selected,
+            theme_selected: self.theme_dialog.map(|dialog| dialog.selected),
+            auth_selected: self.auth_dialog.as_ref().map(|dialog| dialog.selected),
+        }
+    }
+
+    fn tool_output_scroll_state(&self) -> Vec<(EntryId, ToolOutputScroll)> {
+        let mut state = self
+            .tool_output_scrolls
+            .iter()
+            .map(|(entry_id, state)| (*entry_id, state.clone()))
+            .collect::<Vec<_>>();
+        state.sort_unstable_by_key(|(entry_id, _)| *entry_id);
+        state
     }
 
     fn pointer_activation_state(&self) -> PointerActivationState {
@@ -929,6 +1452,180 @@ impl App {
         true
     }
 
+    #[cfg(test)]
+    pub(crate) fn tool_output_scroll_offset(&self, entry_id: EntryId, maximum: usize) -> usize {
+        let layout_id = self
+            .tool_output_scrolls
+            .get(&entry_id)
+            .and_then(|state| state.layout_id)
+            .unwrap_or(ToolOutputLayoutId {
+                revision: 0,
+                width: 0,
+            });
+        self.tool_output_scroll_offset_for_layout(entry_id, maximum, layout_id, None)
+    }
+
+    pub(crate) fn tool_output_scroll_offset_for_layout(
+        &self,
+        entry_id: EntryId,
+        maximum: usize,
+        layout_id: ToolOutputLayoutId,
+        row_index: Option<&Arc<ToolOutputRowIndex>>,
+    ) -> usize {
+        let Some(state) = self.tool_output_scrolls.get(&entry_id) else {
+            return 0;
+        };
+        let ToolOutputScrollPosition::Manual { top, anchor } = state.position else {
+            return 0;
+        };
+        let top = row_index
+            .filter(|_| state.layout_id != Some(layout_id))
+            .and_then(|row_index| anchor.map(|anchor| row_index.row_for_anchor(anchor)))
+            .unwrap_or(top);
+        maximum.saturating_sub(top.min(maximum))
+    }
+
+    pub(crate) fn update_tool_output_scroll_metrics(
+        &mut self,
+        metrics: &[ToolOutputScrollMetrics],
+    ) -> bool {
+        metrics.iter().fold(false, |changed, metrics| {
+            let previous = self
+                .tool_output_scrolls
+                .get(&metrics.entry_id)
+                .cloned()
+                .unwrap_or_default();
+            let layout_changed = previous.layout_id != Some(metrics.layout_id);
+            let position = match previous.position.clone() {
+                ToolOutputScrollPosition::Manual {
+                    top: _,
+                    anchor: Some(anchor),
+                } if layout_changed => {
+                    let remapped = metrics.row_index.row_for_anchor(anchor);
+                    ToolOutputScrollPosition::Manual {
+                        top: remapped,
+                        anchor: Some(anchor),
+                    }
+                }
+                ToolOutputScrollPosition::Manual { top, anchor } => {
+                    ToolOutputScrollPosition::Manual {
+                        top,
+                        anchor: anchor
+                            .or_else(|| metrics.row_index.anchor_at(top.min(metrics.maximum))),
+                    }
+                }
+                position => position,
+            };
+            let current = ToolOutputScroll {
+                position,
+                maximum: metrics.maximum,
+                layout_id: Some(metrics.layout_id),
+                row_index: Arc::downgrade(&metrics.row_index),
+            };
+            let entry_changed = current != previous;
+            self.tool_output_scrolls.insert(metrics.entry_id, current);
+            entry_changed || changed
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update_tool_output_scroll_maximum(
+        &mut self,
+        entry_id: EntryId,
+        maximum: usize,
+    ) -> bool {
+        self.update_tool_output_scroll_maxima(&[(entry_id, maximum)])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update_tool_output_scroll_maxima(&mut self, maxima: &[(EntryId, usize)]) -> bool {
+        let metrics = maxima
+            .iter()
+            .map(|(entry_id, maximum)| ToolOutputScrollMetrics {
+                entry_id: *entry_id,
+                maximum: *maximum,
+                layout_id: ToolOutputLayoutId {
+                    revision: 0,
+                    width: 0,
+                },
+                row_index: Arc::new(ToolOutputRowIndex::new(vec![
+                    (0..=maximum.saturating_add(1))
+                        .map(|logical_line| ToolOutputRowAnchor {
+                            artifact: 0,
+                            logical_line,
+                            source_byte: 0,
+                        })
+                        .collect(),
+                ])),
+            })
+            .collect::<Vec<_>>();
+        self.update_tool_output_scroll_metrics(&metrics)
+    }
+
+    pub(crate) fn scroll_tool_output_by(&mut self, entry_id: EntryId, delta: isize) -> bool {
+        self.active_tool_output = Some(entry_id);
+        if delta == 0 {
+            return false;
+        }
+        let state = self.tool_output_scrolls.entry(entry_id).or_default();
+        let rows = delta.unsigned_abs().saturating_mul(SCROLL_STEP);
+        let current_top = match state.position {
+            ToolOutputScrollPosition::Following => state.maximum,
+            ToolOutputScrollPosition::Manual { top, .. } => top.min(state.maximum),
+        };
+        let top = if delta > 0 {
+            current_top.saturating_sub(rows)
+        } else {
+            current_top.saturating_add(rows).min(state.maximum)
+        };
+        state.position = if top == state.maximum {
+            ToolOutputScrollPosition::Following
+        } else {
+            ToolOutputScrollPosition::Manual {
+                top,
+                anchor: state
+                    .row_index
+                    .upgrade()
+                    .and_then(|row_index| row_index.anchor_at(top)),
+            }
+        };
+        top != current_top
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn active_tool_output(&self) -> Option<EntryId> {
+        self.active_tool_output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tool_output_source_anchor(
+        &self,
+        entry_id: EntryId,
+    ) -> Option<ToolOutputRowAnchor> {
+        match self.tool_output_scrolls.get(&entry_id)?.position {
+            ToolOutputScrollPosition::Following => None,
+            ToolOutputScrollPosition::Manual { anchor, .. } => anchor,
+        }
+    }
+
+    fn follow_active_tool_output(&mut self) -> bool {
+        let Some(entry_id) = self.active_tool_output else {
+            return false;
+        };
+        let Some(state) = self.tool_output_scrolls.get_mut(&entry_id) else {
+            return false;
+        };
+        if matches!(state.position, ToolOutputScrollPosition::Following) {
+            return false;
+        }
+        state.position = ToolOutputScrollPosition::Following;
+        true
+    }
+
+    fn clear_active_tool_output(&mut self) {
+        self.active_tool_output = None;
+    }
+
     pub fn effective_mode(&self) -> SessionMode {
         self.session_mode
     }
@@ -992,11 +1689,23 @@ impl App {
     fn handle_pending_submission_key(&mut self, key: KeyEvent) -> Option<AppAction> {
         match key.code {
             KeyCode::PageUp => {
-                self.scroll_transcript_up();
+                if let Some(entry_id) = self.active_tool_output {
+                    self.scroll_tool_output_by(entry_id, 1);
+                } else {
+                    self.scroll_transcript_up();
+                }
                 return None;
             }
             KeyCode::PageDown => {
-                self.scroll_transcript_down();
+                if let Some(entry_id) = self.active_tool_output {
+                    self.scroll_tool_output_by(entry_id, -1);
+                } else {
+                    self.scroll_transcript_down();
+                }
+                return None;
+            }
+            KeyCode::End if self.active_tool_output.is_some() => {
+                self.follow_active_tool_output();
                 return None;
             }
             KeyCode::End if !self.transcript_is_following() => {
@@ -1483,15 +2192,8 @@ impl App {
     }
 
     fn entry_is_expanded_by_default(entry: &Entry) -> bool {
-        match &entry.kind {
-            EntryKind::Tool(tool) => {
-                tool.name == "terminal"
-                    || tool.artifacts.iter().any(|artifact| {
-                        matches!(artifact, ToolArtifact::Patch(_) | ToolArtifact::Terminal(_))
-                    })
-            }
-            _ => false,
-        }
+        let _ = entry;
+        false
     }
 
     pub fn open_message_dialog(&mut self, entry_id: EntryId) {
@@ -1509,7 +2211,11 @@ impl App {
             .map(|entry| &entry.kind);
         match kind {
             Some(EntryKind::User(_)) => self.open_message_dialog(entry_id),
-            Some(EntryKind::Reasoning(_) | EntryKind::Tool(_)) => self.toggle_entry(entry_id),
+            Some(EntryKind::Reasoning(_)) => self.toggle_entry(entry_id),
+            Some(EntryKind::Tool(_)) => {
+                self.active_tool_output = Some(entry_id);
+                self.toggle_entry(entry_id);
+            }
             Some(EntryKind::Assistant(_) | EntryKind::Retry(_)) | None => {}
         }
     }
@@ -1923,7 +2629,10 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, AppAction, AuthDialogPhase, AuthProvider, Screen, SuggestionKind};
+    use super::{
+        App, AppAction, AuthDialogPhase, AuthProvider, PointerEvent, PointerTarget, Screen,
+        SuggestionKind,
+    };
     use crate::{
         agent::AgentEvent,
         auth::AuthEvent,
@@ -3058,6 +3767,120 @@ mod tests {
     }
 
     #[test]
+    fn tool_output_scroll_pauses_tail_follow_and_preserves_visible_history() {
+        let mut app = App::new();
+        app.update_tool_output_scroll_maximum(42, 20);
+
+        assert_eq!(app.tool_output_scroll_offset(42, 20), 0);
+        assert!(app.scroll_tool_output_by(42, 1));
+        assert_eq!(app.active_tool_output(), Some(42));
+        assert_eq!(app.tool_output_scroll_offset(42, 20), 5);
+
+        app.update_tool_output_scroll_maximum(42, 30);
+        assert_eq!(app.tool_output_scroll_offset(42, 30), 15);
+
+        app.update_tool_output_scroll_maximum(42, 0);
+        assert_eq!(app.tool_output_scroll_offset(42, 0), 0);
+        app.update_tool_output_scroll_maximum(42, 30);
+        assert_eq!(app.tool_output_scroll_offset(42, 30), 15);
+
+        assert!(app.scroll_tool_output_by(42, -3));
+        assert_eq!(app.tool_output_scroll_offset(42, 30), 0);
+    }
+
+    #[test]
+    fn tool_output_metrics_do_not_accumulate_row_index_ownership_in_app() {
+        let mut app = App::new();
+        let row_indexes = (0..4)
+            .map(|_| {
+                std::sync::Arc::new(super::ToolOutputRowIndex::new(vec![vec![
+                    super::ToolOutputRowAnchor {
+                        artifact: 0,
+                        logical_line: 0,
+                        source_byte: 0,
+                    },
+                ]]))
+            })
+            .collect::<Vec<_>>();
+        let weak = row_indexes
+            .iter()
+            .map(std::sync::Arc::downgrade)
+            .collect::<Vec<_>>();
+        let metrics = row_indexes
+            .iter()
+            .enumerate()
+            .map(|(index, row_index)| super::ToolOutputScrollMetrics {
+                entry_id: 42 + index as u64,
+                maximum: 10,
+                layout_id: super::ToolOutputLayoutId {
+                    revision: 1,
+                    width: 80,
+                },
+                row_index: std::sync::Arc::clone(row_index),
+            })
+            .collect::<Vec<_>>();
+
+        app.update_tool_output_scroll_metrics(&metrics);
+        drop(metrics);
+        drop(row_indexes);
+
+        assert!(
+            weak.iter().all(|row_index| row_index.upgrade().is_none()),
+            "App must retain only bounded scroll state, not the renderer's row index"
+        );
+    }
+
+    #[test]
+    fn active_tool_output_owns_scroll_keys_until_end_or_an_outside_click() {
+        let mut app = App::new();
+        app.update_transcript_scroll_maximum(20);
+        app.update_tool_output_scroll_maximum(42, 30);
+
+        let outcome = app.handle_pointer(PointerEvent::Scroll {
+            delta: 1,
+            target: Some(PointerTarget::TranscriptOutput(42)),
+        });
+
+        assert!(outcome.changed);
+        assert_eq!(app.tool_output_scroll_offset(42, 30), 5);
+        assert_eq!(app.transcript_scroll_offset(20), 0);
+
+        app.handle_key(key(KeyCode::PageUp), Instant::now());
+        assert_eq!(app.tool_output_scroll_offset(42, 30), 10);
+        assert_eq!(app.transcript_scroll_offset(20), 0);
+
+        app.handle_key(key(KeyCode::End), Instant::now());
+        assert_eq!(app.tool_output_scroll_offset(42, 30), 0);
+
+        app.handle_pointer(PointerEvent::Activate(Some(PointerTarget::Transcript)));
+        assert_eq!(app.active_tool_output(), None);
+        app.handle_key(key(KeyCode::PageUp), Instant::now());
+        assert_eq!(app.transcript_scroll_offset(20), 5);
+    }
+
+    #[test]
+    fn pending_submission_does_not_retarget_active_output_scrolling() {
+        let mut app = App::new();
+        app.update_tool_output_scroll_maximum(42, 30);
+        app.scroll_tool_output_by(42, 1);
+        app.composer.insert_text("new request");
+        let _ = app.handle_key(key(KeyCode::Enter), Instant::now());
+        assert!(app.pending_submission_view().is_some());
+
+        app.handle_key(key(KeyCode::PageUp), Instant::now());
+        assert_eq!(app.tool_output_scroll_offset(42, 30), 10);
+        app.handle_key(key(KeyCode::End), Instant::now());
+        assert_eq!(app.tool_output_scroll_offset(42, 30), 0);
+
+        let outcome = app.handle_pointer(PointerEvent::Scroll {
+            delta: 1,
+            target: Some(PointerTarget::TranscriptOutput(42)),
+        });
+        assert!(outcome.changed);
+        assert_eq!(app.tool_output_scroll_offset(42, 30), 5);
+    }
+
+    #[test]
     fn manual_scroll_keeps_the_same_visible_top_when_viewport_resizes() {
         let mut app = App::new();
         app.update_transcript_scroll_maximum(100);
@@ -3136,7 +3959,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_and_diff_tools_are_expanded_by_default_but_other_tools_are_not() {
+    fn all_tool_outputs_start_compact_and_expand_on_activation() {
         let mut app = App::new();
         app.transcript
             .submit(14, "change and verify".into(), Vec::new());
@@ -3188,11 +4011,11 @@ mod tests {
             .map(|entry| entry.id)
             .collect::<Vec<_>>();
         assert!(!app.entry_is_expanded(tool_ids[0]));
-        assert!(app.entry_is_expanded(tool_ids[1]));
-        assert!(app.entry_is_expanded(tool_ids[2]));
+        assert!(!app.entry_is_expanded(tool_ids[1]));
+        assert!(!app.entry_is_expanded(tool_ids[2]));
 
         app.activate_transcript_entry(tool_ids[1]);
-        assert!(!app.entry_is_expanded(tool_ids[1]));
+        assert!(app.entry_is_expanded(tool_ids[1]));
     }
 
     #[test]

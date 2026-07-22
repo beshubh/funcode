@@ -81,11 +81,6 @@ pub(crate) struct LlmConfig {
 }
 
 impl LlmConfig {
-    #[cfg(test)]
-    pub(crate) fn from_env() -> Result<Self, LlmError> {
-        Self::from_env_or(None)
-    }
-
     pub(crate) fn from_env_or(persisted_model: Option<&str>) -> Result<Self, LlmError> {
         let model = std::env::var("FUNCODE_MODEL")
             .ok()
