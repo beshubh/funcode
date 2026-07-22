@@ -64,8 +64,8 @@ impl UiRenderer {
         render_with_state(frame, app, theme, &self.state)
     }
 
-    pub(crate) fn poll_background_layouts(&self) -> bool {
-        self.state.transcript.drain_markdown_results()
+    pub(crate) fn poll_background_layouts(&self, app: &App) -> bool {
+        self.state.transcript.drain_markdown_results_for(app)
     }
 }
 

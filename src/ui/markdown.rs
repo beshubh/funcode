@@ -4,7 +4,7 @@ use ratatui::{
     style::Modifier,
     text::{Line, Span},
 };
-use std::{str::FromStr, sync::OnceLock};
+use std::{ops::Range, str::FromStr, sync::OnceLock};
 use syntect::{
     easy::ScopeRegionIterator,
     highlighting::ScopeSelectors,
@@ -72,15 +72,22 @@ pub(super) struct MarkdownLayout {
 
 impl MarkdownLayout {
     pub(super) fn new(source: &str, width: usize) -> Self {
+        Self::build(source, width, true)
+    }
+
+    pub(super) fn unhighlighted(source: &str, width: usize) -> Self {
+        Self::build(source, width, false)
+    }
+
+    fn build(source: &str, width: usize, syntax_highlighting: bool) -> Self {
         let width = width.max(1);
-        let mut builder = MarkdownBuilder::new(width);
-        if contains_image(source) {
-            builder.append_literal_block(source);
-        } else if let Some(unclosed) = unclosed_fence_start(source) {
-            builder.parse(&source[..unclosed]);
-            builder.append_literal_block(&source[unclosed..]);
+        let mut builder = MarkdownBuilder::new(width, syntax_highlighting);
+        let protected = protect_unsupported(source);
+        if let Some(unclosed) = unclosed_fence_start(&protected) {
+            builder.parse(&protected[..unclosed]);
+            builder.append_literal_block(&protected[unclosed..]);
         } else {
-            builder.parse(source);
+            builder.parse(&protected);
         }
         let mut rows = builder.finish();
         if rows.is_empty() {
@@ -206,16 +213,86 @@ impl MarkdownLayout {
     }
 }
 
-fn contains_image(source: &str) -> bool {
-    source.match_indices("![").any(|(index, _)| {
-        source[..index]
-            .bytes()
-            .rev()
-            .take_while(|byte| *byte == b'\\')
-            .count()
-            % 2
-            == 0
-    })
+fn markdown_options() -> Options {
+    Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_MATH
+        | Options::ENABLE_DEFINITION_LIST
+}
+
+fn protect_unsupported(source: &str) -> String {
+    let mut ranges = Vec::<Range<usize>>::new();
+    let mut image_ids = Vec::new();
+    for (event, range) in Parser::new_ext(source, markdown_options()).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Image { id, .. }) => {
+                if !id.is_empty() {
+                    image_ids.push(id.to_ascii_lowercase());
+                }
+                ranges.push(range);
+            }
+            Event::Start(Tag::Table(_) | Tag::FootnoteDefinition(_) | Tag::DefinitionList) => {
+                ranges.push(range)
+            }
+            Event::Start(Tag::HtmlBlock)
+            | Event::Html(_)
+            | Event::InlineHtml(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::FootnoteReference(_) => ranges.push(range),
+            _ => {}
+        }
+    }
+    if !image_ids.is_empty() {
+        let mut offset = 0usize;
+        for line in source.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix('[')
+                && let Some((label, destination)) = rest.split_once("]:")
+                && !destination.trim().is_empty()
+                && image_ids
+                    .iter()
+                    .any(|image_id| image_id.eq_ignore_ascii_case(label.trim()))
+            {
+                ranges.push(offset..offset.saturating_add(line.len()));
+            }
+            offset = offset.saturating_add(line.len());
+        }
+    }
+    if ranges.is_empty() {
+        return source.to_owned();
+    }
+    ranges.sort_by_key(|range| range.start);
+    let mut merged = Vec::<Range<usize>>::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    let mut protected = String::with_capacity(source.len());
+    let mut offset = 0usize;
+    for range in merged {
+        protected.push_str(&source[offset..range.start]);
+        escape_markdown_literal(&source[range.clone()], &mut protected);
+        offset = range.end;
+    }
+    protected.push_str(&source[offset..]);
+    protected
+}
+
+fn escape_markdown_literal(source: &str, output: &mut String) {
+    for character in source.chars() {
+        if character.is_ascii_punctuation() {
+            output.push('\\');
+        }
+        output.push(character);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +318,7 @@ struct CodeBlock {
 
 struct MarkdownBuilder {
     width: usize,
+    syntax_highlighting: bool,
     logical: Vec<LogicalLine>,
     current: Vec<SemanticSpan>,
     first_prefix: Vec<SemanticSpan>,
@@ -259,9 +337,10 @@ struct MarkdownBuilder {
 }
 
 impl MarkdownBuilder {
-    fn new(width: usize) -> Self {
+    fn new(width: usize, syntax_highlighting: bool) -> Self {
         Self {
             width,
+            syntax_highlighting,
             logical: Vec::new(),
             current: Vec::new(),
             first_prefix: Vec::new(),
@@ -284,9 +363,7 @@ impl MarkdownBuilder {
         if source.is_empty() {
             return;
         }
-        let mut options = Options::empty();
-        options.insert(Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS);
-        for event in Parser::new_ext(source, options) {
+        for event in Parser::new_ext(source, markdown_options()) {
             self.event(event);
         }
         self.end_text_block();
@@ -669,7 +746,11 @@ impl MarkdownBuilder {
             vec![SemanticSpan::new("│ ", ThemeRole::MarkdownRule)],
         ]
         .concat();
-        let highlighted = highlight_code(&code.text, code.language.as_deref());
+        let highlighted = if self.syntax_highlighting {
+            highlight_code(&code.text, code.language.as_deref())
+        } else {
+            plain_code_lines(&code.text.replace('\t', "    "))
+        };
         for spans in highlighted {
             self.logical.push(LogicalLine {
                 first_prefix: code_prefix.clone(),
@@ -840,7 +921,9 @@ fn unclosed_fence_start(source: &str) -> Option<usize> {
     let mut offset = 0usize;
     for line_with_ending in source.split_inclusive('\n') {
         let line = line_with_ending.trim_end_matches(['\r', '\n']);
-        if let Some(candidate) = container_fence_candidate(line) {
+        if let Some(candidate) =
+            container_fence_candidate(line, open.map(|(_, _, _, container)| container))
+        {
             let character = candidate.text.chars().next();
             if matches!(character, Some('`' | '~')) {
                 let character = character.expect("fence character");
@@ -894,7 +977,10 @@ struct FenceCandidate<'a> {
     container: FenceContainer,
 }
 
-fn container_fence_candidate(mut line: &str) -> Option<FenceCandidate<'_>> {
+fn container_fence_candidate(
+    mut line: &str,
+    open_container: Option<FenceContainer>,
+) -> Option<FenceCandidate<'_>> {
     let mut quote_depth = 0usize;
     let mut indent = 0usize;
     loop {
@@ -902,7 +988,10 @@ fn container_fence_candidate(mut line: &str) -> Option<FenceCandidate<'_>> {
             .chars()
             .take_while(|character| *character == ' ')
             .count();
-        if spaces > 3 {
+        let continuation_indent = open_container
+            .and_then(|container| container.list_indent)
+            .is_some_and(|required| indent.saturating_add(spaces) >= required);
+        if spaces > 3 && !continuation_indent {
             return None;
         }
         indent = indent.saturating_add(spaces);
@@ -1168,6 +1257,12 @@ mod tests {
         let rendered = symbols(&MarkdownLayout::new(nested_closed, 80)).join("\n");
         assert!(rendered.contains("┌─ rust"), "{rendered:?}");
         assert!(!rendered.contains("~~~"), "{rendered:?}");
+
+        let nested_list = "- outer\n  - ```rust\n    code\n    ```";
+        let rendered = symbols(&MarkdownLayout::new(nested_list, 80)).join("\n");
+        assert!(rendered.contains("┌─ rust"), "{rendered:?}");
+        assert!(rendered.contains("│ code"), "{rendered:?}");
+        assert!(!rendered.contains("```"), "{rendered:?}");
     }
 
     #[test]
@@ -1198,22 +1293,23 @@ mod tests {
 
     #[test]
     fn unsupported_footnotes_math_and_definition_lists_preserve_their_text() {
-        let source = "term\n: definition\n\nFootnote[^note] and $x + y$.\n\n[^note]: details";
+        let source = "**styled**\n\nterm\n: *definition*\n\nFootnote[^note] and $*x* + y$.\n\n[^note]: *details*";
         let rendered = symbols(&MarkdownLayout::new(source, 120)).join("\n");
 
         for content in [
+            "styled",
             "term",
-            ": definition",
-            "Footnote",
-            "note",
-            "$x + y$",
-            "details",
+            ": *definition*",
+            "Footnote[^note]",
+            "$*x* + y$",
+            "[^note]: *details*",
         ] {
             assert!(
                 rendered.contains(content),
                 "missing {content:?}: {rendered:?}"
             );
         }
+        assert!(!rendered.contains("**styled**"));
     }
 
     #[test]
@@ -1228,6 +1324,17 @@ mod tests {
                 source
             );
         }
+
+        let mixed = "**styled** ![**raw alt**](img.png) and `![code](not-an-image)`";
+        assert_eq!(
+            symbols(&MarkdownLayout::new(mixed, 120)).join("\n"),
+            "styled ![**raw alt**](img.png) and ![code](not-an-image)"
+        );
+
+        let fenced = "```text\n![code](not-an-image)\n```";
+        let rendered = symbols(&MarkdownLayout::new(fenced, 120)).join("\n");
+        assert!(rendered.contains("┌─ text"), "{rendered:?}");
+        assert!(rendered.contains("│ ![code](not-an-image)"), "{rendered:?}");
     }
 
     #[test]

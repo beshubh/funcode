@@ -426,7 +426,7 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     let mut preflight_scheduler = PreflightScheduler::default();
 
     while !should_quit {
-        if ui_renderer.poll_background_layouts() {
+        if ui_renderer.poll_background_layouts(&app) {
             redraw.mark_dirty();
         }
         if let Some(workspace_runner) = workspace_runner.as_ref() {
