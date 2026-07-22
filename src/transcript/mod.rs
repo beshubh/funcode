@@ -131,11 +131,16 @@ pub struct Entry {
     pub turn_id: TurnId,
     pub kind: EntryKind,
     revision: u64,
+    tool_output_epoch: u64,
 }
 
 impl Entry {
     pub(crate) const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub(crate) const fn tool_output_epoch(&self) -> u64 {
+        self.tool_output_epoch
     }
 
     fn touch(&mut self) {
@@ -321,7 +326,7 @@ impl Transcript {
                 chunk,
             } => {
                 if self.is_active(turn_id) {
-                    self.update_tool(turn_id, call_id, |tool| {
+                    self.update_tool(turn_id, call_id, false, |tool| {
                         let Some(ToolArtifact::Terminal(artifact)) = tool.artifacts.first_mut()
                         else {
                             return false;
@@ -338,7 +343,7 @@ impl Transcript {
                 artifacts,
             } => {
                 if self.is_active(turn_id) {
-                    self.update_tool(turn_id, call_id, |tool| {
+                    self.update_tool(turn_id, call_id, true, |tool| {
                         if let Some(summary) = summary {
                             tool.summary = summary;
                         }
@@ -354,7 +359,7 @@ impl Transcript {
                 message,
             } => {
                 if self.is_active(turn_id) {
-                    self.update_tool(turn_id, call_id, |tool| {
+                    self.update_tool(turn_id, call_id, false, |tool| {
                         tool.status = ActivityStatus::Failed(message);
                         true
                     });
@@ -418,6 +423,7 @@ impl Transcript {
             turn_id,
             kind,
             revision: 0,
+            tool_output_epoch: 0,
         });
     }
 
@@ -441,6 +447,7 @@ impl Transcript {
                 turn_id,
                 kind,
                 revision: 0,
+                tool_output_epoch: 0,
             },
         );
     }
@@ -513,6 +520,7 @@ impl Transcript {
         &mut self,
         turn_id: TurnId,
         call_id: ToolCallId,
+        output_replaced: bool,
         update: impl FnOnce(&mut ToolCall) -> bool,
     ) -> bool {
         let Some(entry) = self.entries.iter_mut().rev().find(|entry| {
@@ -525,6 +533,9 @@ impl Transcript {
         };
         if !update(tool) {
             return false;
+        }
+        if output_replaced {
+            entry.tool_output_epoch = entry.tool_output_epoch.wrapping_add(1);
         }
         entry.touch();
         true

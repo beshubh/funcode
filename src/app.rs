@@ -253,20 +253,47 @@ enum TranscriptScroll {
     },
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 enum ToolOutputScrollPosition {
     #[default]
     Following,
     Manual {
         top: usize,
+        logical_line: usize,
     },
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 struct ToolOutputScroll {
     position: ToolOutputScrollPosition,
     maximum: usize,
+    logical_lines: Arc<[usize]>,
 }
+
+impl PartialEq for ToolOutputScroll {
+    fn eq(&self, other: &Self) -> bool {
+        self.position == other.position && self.maximum == other.maximum
+    }
+}
+
+impl Eq for ToolOutputScroll {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolOutputScrollMetrics {
+    pub entry_id: EntryId,
+    pub maximum: usize,
+    pub logical_lines: Arc<[usize]>,
+}
+
+impl PartialEq for ToolOutputScrollMetrics {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry_id == other.entry_id
+            && self.maximum == other.maximum
+            && Arc::ptr_eq(&self.logical_lines, &other.logical_lines)
+    }
+}
+
+impl Eq for ToolOutputScrollMetrics {}
 
 #[derive(Debug, PartialEq, Eq)]
 struct InputVisualState {
@@ -930,7 +957,7 @@ impl App {
         let mut state = self
             .tool_output_scrolls
             .iter()
-            .map(|(entry_id, state)| (*entry_id, *state))
+            .map(|(entry_id, state)| (*entry_id, state.clone()))
             .collect::<Vec<_>>();
         state.sort_unstable_by_key(|(entry_id, _)| *entry_id);
         state
@@ -948,6 +975,13 @@ impl App {
 
     pub(crate) fn transcript_is_following(&self) -> bool {
         matches!(self.transcript_scroll, TranscriptScroll::Following)
+    }
+
+    pub(crate) fn transcript_has_manual_scroll_offset(&self) -> bool {
+        matches!(
+            self.transcript_scroll,
+            TranscriptScroll::Manual { from_bottom } if from_bottom > 0
+        )
     }
 
     pub(crate) fn transcript_scroll_offset(&self, maximum: usize) -> usize {
@@ -1011,38 +1045,90 @@ impl App {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn tool_output_scroll_offset(&self, entry_id: EntryId, maximum: usize) -> usize {
+        self.tool_output_scroll_offset_for_layout(entry_id, maximum, None)
+    }
+
+    pub(crate) fn tool_output_scroll_offset_for_layout(
+        &self,
+        entry_id: EntryId,
+        maximum: usize,
+        logical_lines: Option<&Arc<[usize]>>,
+    ) -> usize {
         let Some(state) = self.tool_output_scrolls.get(&entry_id) else {
             return 0;
         };
-        let ToolOutputScrollPosition::Manual { top } = state.position else {
+        let ToolOutputScrollPosition::Manual { top, logical_line } = state.position else {
             return 0;
         };
+        let top = logical_lines
+            .filter(|logical_lines| !Arc::ptr_eq(&state.logical_lines, logical_lines))
+            .map(|logical_lines| {
+                logical_lines.partition_point(|candidate| *candidate < logical_line)
+            })
+            .unwrap_or(top);
         maximum.saturating_sub(top.min(maximum))
     }
 
+    pub(crate) fn update_tool_output_scroll_metrics(
+        &mut self,
+        metrics: &[ToolOutputScrollMetrics],
+    ) -> bool {
+        metrics.iter().fold(false, |changed, metrics| {
+            let previous = self
+                .tool_output_scrolls
+                .get(&metrics.entry_id)
+                .cloned()
+                .unwrap_or_default();
+            let layout_changed = !Arc::ptr_eq(&previous.logical_lines, &metrics.logical_lines);
+            let position = match previous.position.clone() {
+                ToolOutputScrollPosition::Manual {
+                    top: _,
+                    logical_line,
+                } if layout_changed => {
+                    let remapped = metrics
+                        .logical_lines
+                        .partition_point(|candidate| *candidate < logical_line)
+                        .min(metrics.maximum);
+                    ToolOutputScrollPosition::Manual {
+                        top: remapped,
+                        logical_line,
+                    }
+                }
+                position => position,
+            };
+            let current = ToolOutputScroll {
+                position,
+                maximum: metrics.maximum,
+                logical_lines: Arc::clone(&metrics.logical_lines),
+            };
+            let entry_changed = current != previous || layout_changed;
+            self.tool_output_scrolls.insert(metrics.entry_id, current);
+            entry_changed || changed
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn update_tool_output_scroll_maximum(
         &mut self,
         entry_id: EntryId,
         maximum: usize,
     ) -> bool {
-        let previous = self
-            .tool_output_scrolls
-            .get(&entry_id)
-            .copied()
-            .unwrap_or_default();
-        let current = ToolOutputScroll {
-            position: previous.position,
-            maximum,
-        };
-        self.tool_output_scrolls.insert(entry_id, current);
-        current != previous
+        self.update_tool_output_scroll_maxima(&[(entry_id, maximum)])
     }
 
+    #[cfg(test)]
     pub(crate) fn update_tool_output_scroll_maxima(&mut self, maxima: &[(EntryId, usize)]) -> bool {
-        maxima.iter().fold(false, |changed, (entry_id, maximum)| {
-            self.update_tool_output_scroll_maximum(*entry_id, *maximum) || changed
-        })
+        let metrics = maxima
+            .iter()
+            .map(|(entry_id, maximum)| ToolOutputScrollMetrics {
+                entry_id: *entry_id,
+                maximum: *maximum,
+                logical_lines: (0..=maximum.saturating_add(1)).collect::<Vec<_>>().into(),
+            })
+            .collect::<Vec<_>>();
+        self.update_tool_output_scroll_metrics(&metrics)
     }
 
     pub(crate) fn scroll_tool_output_by(&mut self, entry_id: EntryId, delta: isize) -> bool {
@@ -1054,7 +1140,7 @@ impl App {
         let rows = delta.unsigned_abs().saturating_mul(SCROLL_STEP);
         let current_top = match state.position {
             ToolOutputScrollPosition::Following => state.maximum,
-            ToolOutputScrollPosition::Manual { top } => top.min(state.maximum),
+            ToolOutputScrollPosition::Manual { top, .. } => top.min(state.maximum),
         };
         let top = if delta > 0 {
             current_top.saturating_sub(rows)
@@ -1064,7 +1150,10 @@ impl App {
         state.position = if top == state.maximum {
             ToolOutputScrollPosition::Following
         } else {
-            ToolOutputScrollPosition::Manual { top }
+            ToolOutputScrollPosition::Manual {
+                top,
+                logical_line: state.logical_lines.get(top).copied().unwrap_or(top),
+            }
         };
         top != current_top
     }
@@ -1072,6 +1161,14 @@ impl App {
     #[cfg(test)]
     pub(crate) const fn active_tool_output(&self) -> Option<EntryId> {
         self.active_tool_output
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tool_output_scroll_anchor(&self, entry_id: EntryId) -> Option<usize> {
+        match self.tool_output_scrolls.get(&entry_id)?.position {
+            ToolOutputScrollPosition::Following => None,
+            ToolOutputScrollPosition::Manual { logical_line, .. } => Some(logical_line),
+        }
     }
 
     fn follow_active_tool_output(&mut self) -> bool {
