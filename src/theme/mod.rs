@@ -63,7 +63,30 @@ pub enum ThemeRole {
     BuildMode,
     DiffAdded,
     DiffRemoved,
+    MarkdownHeading1,
+    MarkdownHeading2,
+    MarkdownHeading3,
+    MarkdownHeading4,
+    MarkdownHeading5,
+    MarkdownHeading6,
+    MarkdownStrong,
+    MarkdownEmphasis,
+    MarkdownStrikethrough,
+    MarkdownInlineCode,
+    MarkdownLink,
+    MarkdownQuote,
+    MarkdownRule,
+    CodeText,
+    CodeKeyword,
+    CodeString,
+    CodeComment,
+    CodeConstant,
+    CodeType,
+    CodeFunction,
+    CodeOperator,
 }
+
+const THEME_ROLE_COUNT: usize = ThemeRole::CodeOperator as usize + 1;
 
 #[derive(Debug, Clone, Copy)]
 struct ThemeDefinition {
@@ -81,6 +104,7 @@ struct ThemeDefinition {
     build: Color,
     diff_added: Color,
     diff_removed: Color,
+    markdown_accents: [Color; 6],
 }
 
 const TERMINAL: ThemeDefinition = ThemeDefinition {
@@ -98,6 +122,14 @@ const TERMINAL: ThemeDefinition = ThemeDefinition {
     build: Color::Rgb(63, 185, 80),
     diff_added: Color::Green,
     diff_removed: Color::Red,
+    markdown_accents: [
+        Color::Cyan,
+        Color::Blue,
+        Color::Magenta,
+        Color::Yellow,
+        Color::Green,
+        Color::DarkGray,
+    ],
 };
 
 const FUN_DARK: ThemeDefinition = ThemeDefinition {
@@ -115,6 +147,14 @@ const FUN_DARK: ThemeDefinition = ThemeDefinition {
     build: Color::Rgb(63, 185, 80),
     diff_added: Color::Rgb(63, 185, 80),
     diff_removed: Color::Rgb(248, 81, 73),
+    markdown_accents: [
+        Color::Rgb(181, 255, 0),
+        Color::Rgb(88, 166, 255),
+        Color::Rgb(210, 168, 255),
+        Color::Rgb(255, 166, 87),
+        Color::Rgb(126, 231, 135),
+        Color::Rgb(255, 122, 178),
+    ],
 };
 
 const MIDNIGHT: ThemeDefinition = ThemeDefinition {
@@ -132,6 +172,14 @@ const MIDNIGHT: ThemeDefinition = ThemeDefinition {
     build: Color::Rgb(63, 185, 80),
     diff_added: Color::Rgb(74, 222, 128),
     diff_removed: Color::Rgb(248, 113, 113),
+    markdown_accents: [
+        Color::Rgb(96, 165, 250),
+        Color::Rgb(167, 139, 250),
+        Color::Rgb(244, 114, 182),
+        Color::Rgb(251, 191, 36),
+        Color::Rgb(45, 212, 191),
+        Color::Rgb(148, 163, 184),
+    ],
 };
 
 const PAPER: ThemeDefinition = ThemeDefinition {
@@ -149,13 +197,21 @@ const PAPER: ThemeDefinition = ThemeDefinition {
     build: Color::Rgb(26, 127, 55),
     diff_added: Color::Rgb(26, 127, 55),
     diff_removed: Color::Rgb(185, 28, 28),
+    markdown_accents: [
+        Color::Rgb(109, 40, 217),
+        Color::Rgb(29, 78, 216),
+        Color::Rgb(190, 24, 93),
+        Color::Rgb(180, 83, 9),
+        Color::Rgb(4, 120, 87),
+        Color::Rgb(87, 83, 78),
+    ],
 };
 
 #[derive(Debug, Clone)]
 pub struct Theme {
     id: ThemeId,
     appearance: ThemeAppearance,
-    styles: [Style; 12],
+    styles: [Style; THEME_ROLE_COUNT],
     border_set: border::Set<'static>,
 }
 
@@ -169,6 +225,7 @@ impl Theme {
         };
         debug_assert_eq!(definition.id, id);
         let foreground = |color| Style::default().fg(color);
+        let [a1, a2, a3, a4, a5, a6] = definition.markdown_accents;
         let styles = [
             Style::default()
                 .fg(definition.foreground)
@@ -184,6 +241,27 @@ impl Theme {
             foreground(definition.build),
             foreground(definition.diff_added),
             foreground(definition.diff_removed),
+            foreground(a1).add_modifier(Modifier::BOLD),
+            foreground(a2).add_modifier(Modifier::BOLD),
+            foreground(a3),
+            foreground(a4),
+            foreground(a5),
+            foreground(a6),
+            foreground(a4).add_modifier(Modifier::BOLD),
+            foreground(a6).add_modifier(Modifier::ITALIC),
+            foreground(definition.muted).add_modifier(Modifier::CROSSED_OUT),
+            foreground(a2),
+            foreground(a2).add_modifier(Modifier::UNDERLINED),
+            foreground(a3),
+            foreground(definition.muted),
+            foreground(definition.foreground),
+            foreground(a6).add_modifier(Modifier::BOLD),
+            foreground(a5),
+            foreground(definition.muted).add_modifier(Modifier::ITALIC),
+            foreground(a4),
+            foreground(a1),
+            foreground(a2),
+            foreground(a3),
         ];
         Self {
             id,

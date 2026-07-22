@@ -1,3 +1,4 @@
+mod markdown;
 pub mod transcript;
 
 pub use crate::app::PointerTarget as UiTarget;

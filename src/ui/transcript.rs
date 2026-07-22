@@ -1,3 +1,4 @@
+use super::markdown::MarkdownLayout;
 use crate::{
     app::App,
     composer::DisplayRunKind,
@@ -38,6 +39,8 @@ pub(super) struct RenderResult {
 
 const RENDERED_SLICE_CACHE_CAPACITY: usize = 32;
 const RENDERED_SLICE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const MARKDOWN_LAYOUT_CACHE_CAPACITY: usize = 32;
+const MARKDOWN_LAYOUT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeightKey {
@@ -70,13 +73,30 @@ struct CachedSlice {
     bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MarkdownLayoutKey {
+    revision: u64,
+    width: usize,
+}
+
+#[derive(Debug)]
+struct CachedMarkdownLayout {
+    entry_id: EntryId,
+    key: MarkdownLayoutKey,
+    layout: Arc<MarkdownLayout>,
+    bytes: usize,
+}
+
 #[derive(Debug, Default)]
 struct RenderCacheInner {
     heights: HashMap<EntryId, CachedHeight>,
     slices: VecDeque<CachedSlice>,
     slice_bytes: usize,
+    markdown_layouts: VecDeque<CachedMarkdownLayout>,
+    markdown_layout_bytes: usize,
     height_builds: usize,
     slice_builds: usize,
+    markdown_layout_builds: usize,
     visible_rows_copied: usize,
 }
 
@@ -201,6 +221,73 @@ impl TranscriptRenderCache {
         let mut inner = self.inner.borrow_mut();
         inner.slice_builds = inner.slice_builds.saturating_add(1);
     }
+
+    fn markdown_layout(&self, entry: &Entry, width: usize) -> Option<Arc<MarkdownLayout>> {
+        let EntryKind::Assistant(message) = &entry.kind else {
+            return None;
+        };
+        if !matches!(
+            message.status,
+            AssistantStatus::Streaming | AssistantStatus::Completed | AssistantStatus::Interrupted
+        ) {
+            return None;
+        }
+        let key = MarkdownLayoutKey {
+            revision: entry.revision(),
+            width,
+        };
+        {
+            let mut inner = self.inner.borrow_mut();
+            if let Some(index) = inner
+                .markdown_layouts
+                .iter()
+                .position(|cached| cached.entry_id == entry.id && cached.key == key)
+                && let Some(cached) = inner.markdown_layouts.remove(index)
+            {
+                let layout = Arc::clone(&cached.layout);
+                inner.markdown_layouts.push_back(cached);
+                return Some(layout);
+            }
+        }
+
+        let layout = Arc::new(MarkdownLayout::new(
+            &message.text,
+            width.saturating_sub(2).max(1),
+        ));
+        let bytes = layout.bytes();
+        let mut inner = self.inner.borrow_mut();
+        inner.markdown_layout_builds = inner.markdown_layout_builds.saturating_add(1);
+        if let Some(index) = inner
+            .markdown_layouts
+            .iter()
+            .position(|cached| cached.entry_id == entry.id)
+            && let Some(previous) = inner.markdown_layouts.remove(index)
+        {
+            inner.markdown_layout_bytes =
+                inner.markdown_layout_bytes.saturating_sub(previous.bytes);
+        }
+        inner.markdown_layout_bytes = inner.markdown_layout_bytes.saturating_add(bytes);
+        inner.markdown_layouts.push_back(CachedMarkdownLayout {
+            entry_id: entry.id,
+            key,
+            layout: Arc::clone(&layout),
+            bytes,
+        });
+        while inner.markdown_layouts.len() > MARKDOWN_LAYOUT_CACHE_CAPACITY
+            || inner.markdown_layout_bytes > MARKDOWN_LAYOUT_CACHE_BYTES
+        {
+            let Some(evicted) = inner.markdown_layouts.pop_front() else {
+                break;
+            };
+            inner.markdown_layout_bytes = inner.markdown_layout_bytes.saturating_sub(evicted.bytes);
+        }
+        Some(layout)
+    }
+
+    #[cfg(test)]
+    fn markdown_layout_builds(&self) -> usize {
+        self.inner.borrow().markdown_layout_builds
+    }
 }
 
 struct RenderContext<'a> {
@@ -227,21 +314,26 @@ struct EntryRenderer<'a> {
     entry: &'a Entry,
     expanded: bool,
     animation_frame: usize,
+    markdown_layout: Option<Arc<MarkdownLayout>>,
 }
 
 impl<'a> EntryRenderer<'a> {
-    fn new(entry: &'a Entry, app: &App) -> Self {
+    fn new(entry: &'a Entry, app: &App, cache: &TranscriptRenderCache, width: usize) -> Self {
         Self {
             entry,
             expanded: app.transcript_entry_is_expanded(entry),
             animation_frame: app.animation_frame,
+            markdown_layout: cache.markdown_layout(entry, width),
         }
     }
 
     fn dispatch<T>(&self, dispatch: impl FnOnce(&dyn Render) -> T) -> T {
         match &self.entry.kind {
             EntryKind::User(message) => dispatch(message),
-            EntryKind::Assistant(message) => dispatch(message),
+            EntryKind::Assistant(message) => dispatch(&AssistantRenderer {
+                message,
+                layout: self.markdown_layout.as_deref(),
+            }),
             EntryKind::Reasoning(reasoning) => dispatch(&ReasoningRenderer {
                 reasoning,
                 expanded: self.expanded,
@@ -340,7 +432,7 @@ pub(super) fn render(
         }
 
         let entry = &app.transcript.entries()[entry_index];
-        let renderer = EntryRenderer::new(entry, app);
+        let renderer = EntryRenderer::new(entry, app, cache, width);
         let local = visible_start.saturating_sub(measured.start)
             ..visible_end.saturating_sub(measured.start);
         let area = Rect::new(
@@ -459,7 +551,7 @@ fn measured_entry_height(
     width: usize,
     cache: &TranscriptRenderCache,
 ) -> usize {
-    let renderer = EntryRenderer::new(entry, app);
+    let renderer = EntryRenderer::new(entry, app, cache, width);
     let key = HeightKey {
         revision: entry.revision(),
         width,
@@ -494,12 +586,17 @@ impl Render for UserMessage {
     }
 }
 
-impl Render for AssistantMessage {
+struct AssistantRenderer<'a> {
+    message: &'a AssistantMessage,
+    layout: Option<&'a MarkdownLayout>,
+}
+
+impl Render for AssistantRenderer<'_> {
     fn height(&self, width: usize) -> usize {
         let theme = Theme::default();
         let header = LinesRenderer::new(assistant_header(&theme));
         let footer = LinesRenderer::new(assistant_footer(&theme));
-        let body = match &self.status {
+        let body = match &self.message.status {
             AssistantStatus::Queued => LinesRenderer::new(vec![Line::styled(
                 "│ queued…",
                 theme.style(ThemeRole::Accent),
@@ -511,10 +608,11 @@ impl Render for AssistantMessage {
             )])
             .height(width),
             AssistantStatus::Streaming | AssistantStatus::Completed => {
-                MessageRenderer::new(&self.text, ThemeRole::Text).height(width)
+                self.layout.map_or(1, MarkdownMessageRenderer::height)
             }
-            AssistantStatus::Interrupted => MessageRenderer::new(&self.text, ThemeRole::Text)
-                .height(width)
+            AssistantStatus::Interrupted => self
+                .layout
+                .map_or(1, MarkdownMessageRenderer::height)
                 .saturating_add(
                     LinesRenderer::new(vec![Line::styled(
                         "│ [interrupted]",
@@ -540,7 +638,7 @@ impl Render for AssistantMessage {
             0,
             &mut context,
         );
-        cursor = match &self.status {
+        cursor = match &self.message.status {
             AssistantStatus::Queued => render_child(
                 &LinesRenderer::new(vec![Line::styled(
                     "│ queued…",
@@ -557,17 +655,15 @@ impl Render for AssistantMessage {
                 cursor,
                 &mut context,
             ),
-            AssistantStatus::Streaming | AssistantStatus::Completed => render_child(
-                &MessageRenderer::new(&self.text, ThemeRole::Text),
-                cursor,
-                &mut context,
-            ),
+            AssistantStatus::Streaming | AssistantStatus::Completed => {
+                self.layout.map_or(cursor, |layout| {
+                    render_child(&MarkdownMessageRenderer { layout }, cursor, &mut context)
+                })
+            }
             AssistantStatus::Interrupted => {
-                let cursor = render_child(
-                    &MessageRenderer::new(&self.text, ThemeRole::Text),
-                    cursor,
-                    &mut context,
-                );
+                let cursor = self.layout.map_or(cursor, |layout| {
+                    render_child(&MarkdownMessageRenderer { layout }, cursor, &mut context)
+                });
                 render_child(
                     &LinesRenderer::new(vec![Line::styled(
                         "│ [interrupted]",
@@ -591,6 +687,40 @@ impl Render for AssistantMessage {
             cursor,
             &mut context,
         );
+    }
+}
+
+struct MarkdownMessageRenderer<'a> {
+    layout: &'a MarkdownLayout,
+}
+
+impl MarkdownMessageRenderer<'_> {
+    fn height(layout: &MarkdownLayout) -> usize {
+        layout.height()
+    }
+}
+
+impl Render for MarkdownMessageRenderer<'_> {
+    fn height(&self, _width: usize) -> usize {
+        self.layout.height()
+    }
+
+    fn render(&self, context: RenderContext<'_>) {
+        let start = context.visible_rows.start.min(self.layout.height());
+        let end = context.visible_rows.end.min(self.layout.height());
+        for (destination_row, source_row) in (start..end).enumerate() {
+            let Some(line) = self.layout.line(source_row, context.theme) else {
+                continue;
+            };
+            let mut spans = vec![Span::styled("│ ", context.theme.style(ThemeRole::Text))];
+            spans.extend(line.spans);
+            context.buffer.set_line(
+                context.area.x,
+                context.area.y.saturating_add(destination_row as u16),
+                &Line::from(spans),
+                context.area.width,
+            );
+        }
     }
 }
 
@@ -750,7 +880,7 @@ impl ToolArtifact {
     fn renderer(&self) -> &dyn Render {
         match self {
             Self::CodeRange(artifact) => artifact,
-            Self::Patch(artifact)=> artifact,
+            Self::Patch(artifact) => artifact,
             Self::SearchResults(artifact) => artifact,
             Self::Terminal(artifact) => artifact,
             Self::TextDetail(artifact) => artifact,
@@ -1322,13 +1452,15 @@ fn spinner(frame: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReasoningRenderer, Render, RenderContext, ToolRenderer, TranscriptRenderCache, render,
+        AssistantRenderer, ReasoningRenderer, Render, RenderContext, ToolRenderer,
+        TranscriptRenderCache, render,
     };
+    use crate::ui::markdown::MarkdownLayout;
     use crate::{
         agent::AgentEvent,
         app::App,
         composer::SubmittedContent,
-        theme::{Theme, ThemeRole},
+        theme::{Theme, ThemeId, ThemeRole},
         transcript::{
             ActivityStatus, AssistantMessage, AssistantStatus, CodeRangeArtifact,
             FileReferenceArtifact, PatchArtifact, Reasoning, RetryAttempt, SearchResultsArtifact,
@@ -1360,12 +1492,19 @@ mod tests {
     }
 
     fn render_transcript(app: &App, cache: &TranscriptRenderCache) -> String {
-        let theme = Theme::default();
+        render_transcript_with_theme(app, cache, &Theme::default())
+    }
+
+    fn render_transcript_with_theme(
+        app: &App,
+        cache: &TranscriptRenderCache,
+        theme: &Theme,
+    ) -> String {
         let area = Rect::new(0, 0, 80, 24);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal
             .draw(|frame| {
-                let _ = render(frame, area, app, &theme, cache);
+                let _ = render(frame, area, app, theme, cache);
             })
             .unwrap();
         terminal.backend().to_string()
@@ -1448,7 +1587,12 @@ mod tests {
                 text: "response".into(),
                 status,
             };
-            assert!(symbols(&render_widget(&assistant, 80)).contains(expected));
+            let layout = MarkdownLayout::new(&assistant.text, 78);
+            let renderer = AssistantRenderer {
+                message: &assistant,
+                layout: Some(&layout),
+            };
+            assert!(symbols(&render_widget(&renderer, 80)).contains(expected));
         }
 
         let reasoning = Reasoning {
@@ -1530,6 +1674,47 @@ mod tests {
         assert!(second.contains("Thinking/"));
         assert_eq!(second_stats.0, first_stats.0);
         assert_eq!(second_stats.1, first_stats.1 + 1);
+    }
+
+    #[test]
+    fn assistant_markdown_renders_without_mutating_source_and_reuses_semantic_layout() {
+        let source = "# Result\n\nUse **care** and `cargo test`.";
+        let mut app = App::new();
+        app.transcript.submit(21, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 21 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 21,
+            text: source.into(),
+        });
+        let cache = TranscriptRenderCache::default();
+
+        let terminal = render_transcript(&app, &cache);
+        assert!(terminal.contains("Result"));
+        assert!(terminal.contains("Use care and cargo test."));
+        assert!(!terminal.contains("# Result"));
+        assert!(!terminal.contains("**care**"));
+        assert_eq!(cache.markdown_layout_builds(), 1);
+
+        let _ = render_transcript_with_theme(&app, &cache, &Theme::resolve(ThemeId::Paper));
+        assert_eq!(cache.markdown_layout_builds(), 1);
+
+        let assistant = app
+            .transcript
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                crate::transcript::EntryKind::Assistant(message) => Some(message),
+                _ => None,
+            })
+            .expect("assistant response");
+        assert_eq!(assistant.text, source);
+
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 21,
+            text: " More.".into(),
+        });
+        let _ = render_transcript(&app, &cache);
+        assert_eq!(cache.markdown_layout_builds(), 2);
     }
 
     #[test]
