@@ -35,6 +35,7 @@ pub struct ModelRegion {
 pub struct UiRegions {
     pub transcript: Option<Rect>,
     pub transcript_entries: Vec<transcript::EntryRegion>,
+    pub transcript_outputs: Vec<transcript::OutputRegion>,
     pub auth_providers: Vec<Rect>,
     pub suggestions: Vec<Rect>,
     pub message_copy: Option<Rect>,
@@ -44,6 +45,7 @@ pub struct UiRegions {
     pub model_refresh: Option<Rect>,
     pub context_usage: Option<Rect>,
     pub(crate) transcript_scroll_maximum: usize,
+    pub(crate) tool_output_scroll_maxima: Vec<(crate::transcript::EntryId, usize)>,
 }
 
 #[derive(Debug, Default)]
@@ -122,6 +124,13 @@ impl UiRegions {
             .find(|(_, area)| area.contains(position))
         {
             Some(UiTarget::Theme(index))
+        } else if let Some(target) = self
+            .transcript_outputs
+            .iter()
+            .find(|region| region.area.contains(position))
+            .map(|region| UiTarget::TranscriptOutput(region.id))
+        {
+            Some(target)
         } else if let Some(target) = self
             .transcript_entries
             .iter()
@@ -831,7 +840,9 @@ fn render_chat(
     } else {
         let transcript = transcript::render(frame, rows[0], app, theme, &state.transcript);
         regions.transcript_entries = transcript.entries;
+        regions.transcript_outputs = transcript.outputs;
         regions.transcript_scroll_maximum = transcript.scroll_maximum;
+        regions.tool_output_scroll_maxima = transcript.output_scroll_maxima;
     }
     render_activity(frame, rows[1], app, theme);
     let composer_area = rows[2];
@@ -1492,7 +1503,7 @@ mod tests {
             let _ = render(frame, &app, &theme);
         })
         .unwrap();
-        for label in ["queued…", "thinking", "tool", "Waiting"] {
+        for label in ["queued…", "thinking", "Read File", "Waiting"] {
             assert_eq!(style_at_text(&chat, label).fg, accent, "{label}");
         }
     }
@@ -2285,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_are_persistent_clickable_transcript_blocks() {
+    fn read_tools_are_persistent_non_clickable_summary_records() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.transcript.submit(3, "inspect".into(), Vec::new());
@@ -2298,18 +2309,15 @@ mod tests {
             artifacts: Vec::new(),
         });
 
-        let (collapsed, _, regions, _) = render_to_string(&app, 100, 30);
-        assert!(collapsed.contains("tool"));
-        assert!(collapsed.contains("read_file"));
-        let tools = *regions.transcript_entries.last().unwrap();
-        assert_eq!(
-            regions.target_at(tools.area.x, tools.area.y),
-            Some(UiTarget::TranscriptEntry(tools.id))
+        let (screen, _, regions, _) = render_to_string(&app, 100, 30);
+        assert!(screen.contains("Read File: src/main.rs"));
+        let read_id = app.transcript.entries()[2].id;
+        assert!(
+            regions
+                .transcript_entries
+                .iter()
+                .all(|region| region.id != read_id)
         );
-
-        app.activate_transcript_entry(tools.id);
-        let (expanded, _, _, _) = render_to_string(&app, 100, 30);
-        assert!(expanded.contains("Reading src/main.rs"));
     }
 
     #[test]
@@ -2418,8 +2426,6 @@ mod tests {
                 matches: "src/main.rs:1:marker".into(),
             })],
         });
-        let search_id = app.transcript.entries()[3].id;
-        app.activate_transcript_entry(search_id);
         let (screen, _, _, _) = render_to_string(&app, 100, 30);
         assert!(screen.contains("Search /marker/"));
         assert!(screen.contains("src/main.rs:1:marker"));
@@ -2434,8 +2440,8 @@ mod tests {
         app.handle_agent_event(AgentEvent::ToolStarted {
             request_id: 3,
             call_id: 3,
-            name: "read_file".into(),
-            summary: "Reading src/main.rs".into(),
+            name: "inspect".into(),
+            summary: "Inspecting output".into(),
             artifacts: Vec::new(),
         });
         app.handle_agent_event(AgentEvent::ToolFinished {
@@ -2450,18 +2456,25 @@ mod tests {
             })],
         });
         let tool_id = app.transcript.entries()[2].id;
-        app.activate_transcript_entry(tool_id);
         let (bottom, _, regions, _) = render_to_string(&app, 60, 20);
         app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+        app.update_tool_output_scroll_maxima(&regions.tool_output_scroll_maxima);
+        let output = regions
+            .transcript_outputs
+            .iter()
+            .find(|region| region.id == tool_id)
+            .expect("visible tool output");
+        assert_eq!(
+            regions.target_at(output.area.x, output.area.y),
+            Some(UiTarget::TranscriptOutput(tool_id))
+        );
 
-        for _ in 0..5 {
-            app.scroll_transcript_up();
-        }
+        app.scroll_tool_output_by(tool_id, 5);
         let (scrolled, _, _, _) = render_to_string(&app, 60, 20);
 
         assert!(bottom.contains("tool-line-39"));
         assert_ne!(bottom, scrolled);
-        assert!(scrolled.contains("↑ End to follow"));
+        assert!(scrolled.contains("paused · End to follow"));
     }
 
     #[test]
