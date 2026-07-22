@@ -63,6 +63,10 @@ impl UiRenderer {
     pub fn render(&self, frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
         render_with_state(frame, app, theme, &self.state)
     }
+
+    pub(crate) fn poll_background_layouts(&self) -> bool {
+        self.state.transcript.drain_markdown_results()
+    }
 }
 
 impl UiRegions {

@@ -359,4 +359,78 @@ mod tests {
             assert_eq!(theme.style(ThemeRole::BuildMode).fg, Some(build));
         }
     }
+
+    #[test]
+    fn bundled_markdown_roles_follow_the_exact_six_accent_palettes() {
+        let cases = [
+            (
+                ThemeId::Terminal,
+                [
+                    Color::Cyan,
+                    Color::Blue,
+                    Color::Magenta,
+                    Color::Yellow,
+                    Color::Green,
+                    Color::DarkGray,
+                ],
+            ),
+            (
+                ThemeId::FunDark,
+                [
+                    Color::Rgb(181, 255, 0),
+                    Color::Rgb(88, 166, 255),
+                    Color::Rgb(210, 168, 255),
+                    Color::Rgb(255, 166, 87),
+                    Color::Rgb(126, 231, 135),
+                    Color::Rgb(255, 122, 178),
+                ],
+            ),
+            (
+                ThemeId::Midnight,
+                [
+                    Color::Rgb(96, 165, 250),
+                    Color::Rgb(167, 139, 250),
+                    Color::Rgb(244, 114, 182),
+                    Color::Rgb(251, 191, 36),
+                    Color::Rgb(45, 212, 191),
+                    Color::Rgb(148, 163, 184),
+                ],
+            ),
+            (
+                ThemeId::Paper,
+                [
+                    Color::Rgb(109, 40, 217),
+                    Color::Rgb(29, 78, 216),
+                    Color::Rgb(190, 24, 93),
+                    Color::Rgb(180, 83, 9),
+                    Color::Rgb(4, 120, 87),
+                    Color::Rgb(87, 83, 78),
+                ],
+            ),
+        ];
+        let heading_roles = [
+            ThemeRole::MarkdownHeading1,
+            ThemeRole::MarkdownHeading2,
+            ThemeRole::MarkdownHeading3,
+            ThemeRole::MarkdownHeading4,
+            ThemeRole::MarkdownHeading5,
+            ThemeRole::MarkdownHeading6,
+        ];
+
+        for (id, accents) in cases {
+            let theme = Theme::resolve(id);
+            for (role, accent) in heading_roles.into_iter().zip(accents) {
+                assert_eq!(theme.style(role).fg, Some(accent), "{id:?} {role:?}");
+            }
+            assert_eq!(theme.style(ThemeRole::MarkdownStrong).fg, Some(accents[3]));
+            assert_eq!(
+                theme.style(ThemeRole::MarkdownEmphasis).fg,
+                Some(accents[5])
+            );
+            assert_eq!(theme.style(ThemeRole::MarkdownLink).fg, Some(accents[1]));
+            assert_eq!(theme.style(ThemeRole::MarkdownQuote).fg, Some(accents[2]));
+            assert_eq!(theme.style(ThemeRole::CodeString).fg, Some(accents[4]));
+            assert_eq!(theme.style(ThemeRole::CodeType).fg, Some(accents[0]));
+        }
+    }
 }

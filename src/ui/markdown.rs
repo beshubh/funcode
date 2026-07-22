@@ -102,8 +102,60 @@ impl MarkdownLayout {
         self.rows.len()
     }
 
+    pub(super) fn literal(source: &str, width: usize) -> Self {
+        let mut layout = Self {
+            rows: vec![SemanticLine::default()],
+            bytes: std::mem::size_of::<SemanticLine>(),
+        };
+        layout.append_literal(source, width);
+        layout
+    }
+
+    pub(super) fn append_literal(&mut self, suffix: &str, width: usize) {
+        let width = width.max(1);
+        let mut column = self
+            .rows
+            .last()
+            .map(|line| spans_width(&line.spans))
+            .unwrap_or_default();
+        for grapheme in suffix.graphemes(true) {
+            if grapheme == "\n" {
+                self.rows.push(SemanticLine::default());
+                column = 0;
+                continue;
+            }
+            let text = if grapheme == "\t" { "    " } else { grapheme };
+            for grapheme in text.graphemes(true) {
+                let source_width = UnicodeWidthStr::width(grapheme).max(1);
+                let (grapheme, grapheme_width) = if source_width > width {
+                    ("\u{fffd}", 1)
+                } else {
+                    (grapheme, source_width)
+                };
+                if column.saturating_add(grapheme_width) > width {
+                    self.rows.push(SemanticLine::default());
+                    column = 0;
+                }
+                self.rows
+                    .last_mut()
+                    .expect("literal layout always has a row")
+                    .push(SemanticSpan::new(grapheme, ThemeRole::Text));
+                column = column.saturating_add(grapheme_width);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(suffix.len()).saturating_add(
+            self.rows
+                .len()
+                .saturating_mul(std::mem::size_of::<SemanticLine>()),
+        );
+    }
+
     pub(super) fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    pub(super) fn visually_eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
     }
 
     pub(super) fn line(&self, index: usize, theme: &Theme) -> Option<Line<'static>> {
@@ -134,6 +186,7 @@ struct LinkState {
     destination: String,
     visible: String,
     autolink: bool,
+    image_title: Option<String>,
 }
 
 #[derive(Debug)]
@@ -289,16 +342,23 @@ impl MarkdownBuilder {
                 link_type,
                 dest_url,
                 ..
-            }
-            | Tag::Image {
-                link_type,
-                dest_url,
-                ..
             } => self.links.push(LinkState {
                 destination: dest_url.into_string(),
                 visible: String::new(),
                 autolink: matches!(link_type, LinkType::Autolink | LinkType::Email),
+                image_title: None,
             }),
+            Tag::Image {
+                dest_url, title, ..
+            } => {
+                self.append_text("![", None);
+                self.links.push(LinkState {
+                    destination: dest_url.into_string(),
+                    visible: String::new(),
+                    autolink: false,
+                    image_title: Some(title.into_string()),
+                });
+            }
             Tag::HtmlBlock
             | Tag::FootnoteDefinition(_)
             | Tag::DefinitionList
@@ -463,7 +523,7 @@ impl MarkdownBuilder {
     fn inline_style(&self, forced_role: Option<ThemeRole>) -> (ThemeRole, Modifier) {
         let role = if let Some(role) = forced_role {
             role
-        } else if !self.links.is_empty() {
+        } else if self.links.iter().any(|link| link.image_title.is_none()) {
             ThemeRole::MarkdownLink
         } else if self.strong > 0 {
             ThemeRole::MarkdownStrong
@@ -484,7 +544,7 @@ impl MarkdownBuilder {
         if self.strikethrough > 0 {
             modifiers.insert(Modifier::CROSSED_OUT);
         }
-        if !self.links.is_empty() {
+        if self.links.iter().any(|link| link.image_title.is_none()) {
             modifiers.insert(Modifier::UNDERLINED);
         }
         (role, modifiers)
@@ -513,7 +573,17 @@ impl MarkdownBuilder {
         let Some(link) = self.links.pop() else {
             return;
         };
-        if !link.autolink && link.visible != link.destination {
+        if let Some(title) = link.image_title {
+            let title = (!title.is_empty()).then(|| format!(" \"{title}\""));
+            self.append_text(
+                &format!(
+                    "]({}{})",
+                    link.destination,
+                    title.as_deref().unwrap_or_default()
+                ),
+                None,
+            );
+        } else if !link.autolink && link.visible != link.destination {
             self.ensure_text_block();
             push_span(
                 &mut self.current,
@@ -539,11 +609,11 @@ impl MarkdownBuilder {
     }
 
     fn emit_code_block(&mut self, code: CodeBlock) {
-        let (base, _) = self.block_prefixes();
+        let (first, continuation) = self.block_prefixes();
         let label = code.language.as_deref().unwrap_or("code");
         self.logical.push(LogicalLine {
-            first_prefix: base.clone(),
-            continuation_prefix: base.clone(),
+            first_prefix: first,
+            continuation_prefix: continuation.clone(),
             content: vec![SemanticSpan::new(
                 format!("┌─ {label}"),
                 ThemeRole::MarkdownRule,
@@ -551,7 +621,7 @@ impl MarkdownBuilder {
         });
 
         let code_prefix = [
-            base.clone(),
+            continuation.clone(),
             vec![SemanticSpan::new("│ ", ThemeRole::MarkdownRule)],
         ]
         .concat();
@@ -564,8 +634,8 @@ impl MarkdownBuilder {
             });
         }
         self.logical.push(LogicalLine {
-            first_prefix: base.clone(),
-            continuation_prefix: base,
+            first_prefix: continuation.clone(),
+            continuation_prefix: continuation,
             content: vec![SemanticSpan::new("└─", ThemeRole::MarkdownRule)],
         });
         self.needs_gap = true;
@@ -643,14 +713,15 @@ fn wrap_logical(line: LogicalLine, width: usize) -> Vec<SemanticLine> {
             } else {
                 (grapheme, source_width)
             };
-            if !row_has_content && column > 0 && column.saturating_add(grapheme_width) > width {
-                row = SemanticLine::default();
-                column = 0;
-            }
             if row_has_content && column.saturating_add(grapheme_width) > width {
                 rows.push(row);
                 row = SemanticLine::default();
                 column = append_prefix(&mut row, &continuation_prefix);
+                row_has_content = false;
+            }
+            if !row_has_content && column > 0 && column.saturating_add(grapheme_width) > width {
+                row = SemanticLine::default();
+                column = 0;
             }
             row.push(SemanticSpan {
                 text: grapheme.to_owned(),
@@ -704,12 +775,7 @@ fn unclosed_fence_start(source: &str) -> Option<usize> {
     let mut offset = 0usize;
     for line_with_ending in source.split_inclusive('\n') {
         let line = line_with_ending.trim_end_matches(['\r', '\n']);
-        let indent = line
-            .chars()
-            .take_while(|character| *character == ' ')
-            .count();
-        if indent <= 3 {
-            let candidate = &line[indent..];
+        if let Some(candidate) = container_fence_candidate(line) {
             let character = candidate.chars().next();
             if matches!(character, Some('`' | '~')) {
                 let character = character.expect("fence character");
@@ -735,6 +801,44 @@ fn unclosed_fence_start(source: &str) -> Option<usize> {
         offset = offset.saturating_add(line_with_ending.len());
     }
     open.map(|(start, _, _)| start)
+}
+
+fn container_fence_candidate(mut line: &str) -> Option<&str> {
+    loop {
+        let indent = line
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        if indent > 3 {
+            return None;
+        }
+        line = &line[indent..];
+        if let Some(quoted) = line.strip_prefix('>') {
+            line = quoted.strip_prefix(' ').unwrap_or(quoted);
+            continue;
+        }
+        if let Some(list_item) = strip_list_marker(line) {
+            line = list_item;
+            continue;
+        }
+        return Some(line);
+    }
+}
+
+fn strip_list_marker(line: &str) -> Option<&str> {
+    let marker_end = if line.starts_with(['-', '+', '*']) {
+        1
+    } else {
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count().min(9);
+        (digits > 0 && matches!(line.as_bytes().get(digits), Some(b'.' | b')')))
+            .then_some(digits + 1)?
+    };
+    let rest = &line[marker_end..];
+    let spaces = rest
+        .chars()
+        .take_while(|character| matches!(character, ' ' | '\t'))
+        .count();
+    (spaces > 0).then(|| &rest[spaces..])
 }
 
 struct SyntaxSelectors {
@@ -942,6 +1046,30 @@ mod tests {
     }
 
     #[test]
+    fn unclosed_container_fences_remain_literal_until_their_matching_fence_arrives() {
+        for source in [
+            "> ```rust\n> fn main()",
+            "- ```rust\n  fn main()",
+            "> ~~~rust\n> fn main()",
+        ] {
+            assert_eq!(symbols(&MarkdownLayout::new(source, 80)).join("\n"), source);
+        }
+    }
+
+    #[test]
+    fn list_code_frames_use_the_item_marker_once_and_hang_following_rows() {
+        let rows = symbols(&MarkdownLayout::new(
+            "- ```rust\n  let value = 1;\n  ```",
+            80,
+        ));
+
+        assert!(rows[0].starts_with("• ┌─ rust"));
+        assert!(rows[1].starts_with("  │ "));
+        assert!(rows.last().is_some_and(|row| row.starts_with("  └─")));
+        assert_eq!(rows.iter().filter(|row| row.starts_with("• ")).count(), 1);
+    }
+
+    #[test]
     fn links_unknown_code_and_unsupported_constructs_preserve_content() {
         let source = "[docs](https://example.com) and <https://rust-lang.org>\n\n| a | b |\n| - | - |\n\n<div>literal html</div>\n\n```not-a-language\nvalue = 42\n```";
         let rendered = symbols(&MarkdownLayout::new(source, 80)).join("\n");
@@ -952,6 +1080,13 @@ mod tests {
         assert!(rendered.contains("<div>literal html</div>"));
         assert!(rendered.contains("┌─ not-a-language"));
         assert!(rendered.contains("│ value = 42"));
+    }
+
+    #[test]
+    fn unsupported_images_preserve_alt_destination_and_title_as_markdown_text() {
+        let source = "Before ![diagram](img.png \"architecture\") after";
+
+        assert_eq!(symbols(&MarkdownLayout::new(source, 80)).join(""), source);
     }
 
     #[test]
@@ -1017,6 +1152,81 @@ mod tests {
     }
 
     #[test]
+    fn inline_precedence_keeps_the_highest_role_and_accumulates_all_modifiers() {
+        let layout = MarkdownLayout::new("***~~[label](https://example.com)~~***", 80);
+        let span = layout.rows[0]
+            .spans
+            .iter()
+            .find(|span| span.text == "label")
+            .expect("styled link label");
+
+        assert_eq!(span.role, ThemeRole::MarkdownLink);
+        for modifier in [
+            ratatui::style::Modifier::BOLD,
+            ratatui::style::Modifier::ITALIC,
+            ratatui::style::Modifier::CROSSED_OUT,
+            ratatui::style::Modifier::UNDERLINED,
+        ] {
+            assert!(span.modifiers.contains(modifier), "missing {modifier:?}");
+        }
+    }
+
+    #[test]
+    fn recognized_rust_code_maps_every_practical_syntax_role() {
+        let layout = MarkdownLayout::new(
+            "```rust\nstruct Widget;\nfn calculate(value: i32) -> usize {\n    // note\n    let message = \"hello\";\n    value + 42\n}\n```",
+            100,
+        );
+        let roles = layout
+            .rows
+            .iter()
+            .flat_map(|row| row.spans.iter().map(|span| span.role))
+            .collect::<Vec<_>>();
+
+        for role in [
+            ThemeRole::CodeText,
+            ThemeRole::CodeKeyword,
+            ThemeRole::CodeString,
+            ThemeRole::CodeComment,
+            ThemeRole::CodeConstant,
+            ThemeRole::CodeType,
+            ThemeRole::CodeFunction,
+            ThemeRole::CodeOperator,
+        ] {
+            assert!(
+                roles.contains(&role),
+                "missing syntax role {role:?}: {roles:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn true_nested_lists_indent_each_level_and_hang_wrapped_rows() {
+        let layout = MarkdownLayout::new(
+            "- parent\n  - child with enough text to wrap\n    - grandchild",
+            18,
+        );
+        let rows = symbols(&layout);
+
+        assert!(
+            rows.iter().any(|row| row.starts_with("• parent")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with("  • child")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with("    • grandchild")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.starts_with("    ugh")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
     fn fenced_code_preserves_intentional_trailing_blank_lines_and_tabs() {
         let layout = MarkdownLayout::new("```rust\n\tlet value = 1;\n\n```", 40);
         let rows = symbols(&layout);
@@ -1032,6 +1242,15 @@ mod tests {
 
         assert!(rows.iter().all(|row| row.width() <= 3), "{rows:?}");
         assert!(rows.join("").contains('🦀'));
+    }
+
+    #[test]
+    fn continuation_prefixes_never_push_wide_graphemes_past_the_layout_width() {
+        let layout = MarkdownLayout::new("> a🦀", 3);
+
+        for row in symbols(&layout) {
+            assert!(row.width() <= 3, "row {row:?} exceeded width 3");
+        }
     }
 
     #[test]

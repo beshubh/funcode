@@ -19,9 +19,13 @@ use ratatui::{
 };
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
+    thread::{self, JoinHandle},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -49,6 +53,7 @@ const RENDERED_SLICE_CACHE_CAPACITY: usize = 32;
 const RENDERED_SLICE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const MARKDOWN_LAYOUT_CACHE_CAPACITY: usize = 32;
 const MARKDOWN_LAYOUT_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const MARKDOWN_SYNCHRONOUS_SOURCE_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeightKey {
@@ -84,10 +89,117 @@ struct CachedSlice {
     bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MarkdownLayoutKey {
     revision: u64,
     width: usize,
+}
+
+#[derive(Debug)]
+struct MarkdownLayoutRequest {
+    entry_id: EntryId,
+    key: MarkdownLayoutKey,
+    source: String,
+    content_width: usize,
+}
+
+#[derive(Debug)]
+struct MarkdownLayoutResult {
+    entry_id: EntryId,
+    key: MarkdownLayoutKey,
+    layout: Option<MarkdownLayout>,
+}
+
+struct MarkdownLayoutRunner {
+    requests: Option<Sender<MarkdownLayoutRequest>>,
+    results: Receiver<MarkdownLayoutResult>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for MarkdownLayoutRunner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MarkdownLayoutRunner")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for MarkdownLayoutRunner {
+    fn default() -> Self {
+        let (request_tx, request_rx) = mpsc::channel::<MarkdownLayoutRequest>();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut pending = VecDeque::new();
+            loop {
+                if pending.is_empty() {
+                    let Ok(request) = request_rx.recv() else {
+                        break;
+                    };
+                    pending.push_back(request);
+                }
+                while let Ok(request) = request_rx.try_recv() {
+                    if let Some(existing) = pending.iter_mut().find(|existing| {
+                        existing.entry_id == request.entry_id
+                            && existing.content_width == request.content_width
+                    }) {
+                        let superseded = std::mem::replace(existing, request);
+                        if result_tx
+                            .send(MarkdownLayoutResult {
+                                entry_id: superseded.entry_id,
+                                key: superseded.key,
+                                layout: None,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    } else {
+                        pending.push_back(request);
+                    }
+                }
+                let Some(request) = pending.pop_front() else {
+                    continue;
+                };
+                let layout = MarkdownLayout::new(&request.source, request.content_width);
+                if result_tx
+                    .send(MarkdownLayoutResult {
+                        entry_id: request.entry_id,
+                        key: request.key,
+                        layout: Some(layout),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests: Some(request_tx),
+            results: result_rx,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl MarkdownLayoutRunner {
+    fn request(&self, request: MarkdownLayoutRequest) -> bool {
+        self.requests
+            .as_ref()
+            .is_some_and(|requests| requests.send(request).is_ok())
+    }
+
+    fn try_result(&self) -> Option<MarkdownLayoutResult> {
+        self.results.try_recv().ok()
+    }
+}
+
+impl Drop for MarkdownLayoutRunner {
+    fn drop(&mut self) {
+        self.requests.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -98,6 +210,13 @@ struct CachedMarkdownLayout {
     bytes: usize,
 }
 
+#[derive(Debug)]
+struct LiteralMarkdownFallback {
+    revision: u64,
+    source: String,
+    layout: Arc<MarkdownLayout>,
+}
+
 #[derive(Debug, Default)]
 struct RenderCacheInner {
     heights: HashMap<EntryId, CachedHeight>,
@@ -105,6 +224,8 @@ struct RenderCacheInner {
     slice_bytes: usize,
     markdown_layouts: VecDeque<CachedMarkdownLayout>,
     markdown_layout_bytes: usize,
+    markdown_pending: HashSet<(EntryId, MarkdownLayoutKey)>,
+    markdown_fallbacks: HashMap<(EntryId, usize), LiteralMarkdownFallback>,
     height_builds: usize,
     slice_builds: usize,
     markdown_layout_builds: usize,
@@ -115,7 +236,6 @@ struct RenderCacheInner {
 struct IndexKey {
     width: usize,
     available_height: usize,
-    theme: ThemeId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +254,19 @@ struct LayoutIndex {
     entries_measured: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReflowAnchor {
+    entry_id: EntryId,
+    local_row: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollAnchor {
+    key: IndexKey,
+    reference_top: usize,
+    anchored_top: usize,
+}
+
 /// Retains transcript measurements and rendered viewport slices between frames.
 ///
 /// Historical entries dominate long conversations, so their wrapped heights
@@ -143,6 +276,8 @@ struct LayoutIndex {
 pub(crate) struct TranscriptRenderCache {
     inner: RefCell<RenderCacheInner>,
     index: RefCell<LayoutIndex>,
+    scroll_anchor: RefCell<Option<ScrollAnchor>>,
+    markdown_runner: MarkdownLayoutRunner,
 }
 
 impl TranscriptRenderCache {
@@ -262,17 +397,82 @@ impl TranscriptRenderCache {
             }
         }
 
-        let layout = Arc::new(MarkdownLayout::new(
-            &message.text,
-            width.saturating_sub(2).max(1),
-        ));
+        let content_width = width.saturating_sub(2).max(1);
+        let needs_background = message.text.len() > MARKDOWN_SYNCHRONOUS_SOURCE_BYTES
+            || message.text.lines().any(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("```") || trimmed.starts_with("~~~")
+            });
+        if !needs_background {
+            let layout = Arc::new(MarkdownLayout::new(&message.text, content_width));
+            self.store_markdown_layout(entry.id, key, Arc::clone(&layout));
+            return Some(layout);
+        }
+
+        let should_request = self
+            .inner
+            .borrow_mut()
+            .markdown_pending
+            .insert((entry.id, key));
+        if should_request
+            && !self.markdown_runner.request(MarkdownLayoutRequest {
+                entry_id: entry.id,
+                key,
+                source: message.text.clone(),
+                content_width,
+            })
+        {
+            self.inner
+                .borrow_mut()
+                .markdown_pending
+                .remove(&(entry.id, key));
+        }
+
+        let mut inner = self.inner.borrow_mut();
+        let fallback = inner
+            .markdown_fallbacks
+            .entry((entry.id, width))
+            .or_insert_with(|| LiteralMarkdownFallback {
+                revision: entry.revision(),
+                source: message.text.clone(),
+                layout: Arc::new(MarkdownLayout::literal(&message.text, content_width)),
+            });
+        if fallback.revision != entry.revision() {
+            if message.text.starts_with(&fallback.source) {
+                let suffix = &message.text[fallback.source.len()..];
+                Arc::make_mut(&mut fallback.layout).append_literal(suffix, content_width);
+                fallback.source.push_str(suffix);
+            } else {
+                fallback.source.clone_from(&message.text);
+                fallback.layout = Arc::new(MarkdownLayout::literal(&message.text, content_width));
+            }
+            fallback.revision = entry.revision();
+        }
+        Some(Arc::clone(&fallback.layout))
+    }
+
+    fn store_markdown_layout(
+        &self,
+        entry_id: EntryId,
+        key: MarkdownLayoutKey,
+        layout: Arc<MarkdownLayout>,
+    ) {
         let bytes = layout.bytes();
         let mut inner = self.inner.borrow_mut();
+        let is_current_fallback = inner
+            .markdown_fallbacks
+            .get(&(entry_id, key.width))
+            .is_some_and(|fallback| fallback.revision == key.revision);
+        let projection_changed = inner
+            .markdown_fallbacks
+            .get(&(entry_id, key.width))
+            .is_some_and(|fallback| !fallback.layout.visually_eq(&layout));
+        inner.markdown_pending.remove(&(entry_id, key));
         inner.markdown_layout_builds = inner.markdown_layout_builds.saturating_add(1);
         if let Some(index) = inner
             .markdown_layouts
             .iter()
-            .position(|cached| cached.entry_id == entry.id)
+            .position(|cached| cached.entry_id == entry_id && cached.key == key)
             && let Some(previous) = inner.markdown_layouts.remove(index)
         {
             inner.markdown_layout_bytes =
@@ -280,9 +480,9 @@ impl TranscriptRenderCache {
         }
         inner.markdown_layout_bytes = inner.markdown_layout_bytes.saturating_add(bytes);
         inner.markdown_layouts.push_back(CachedMarkdownLayout {
-            entry_id: entry.id,
+            entry_id,
             key,
-            layout: Arc::clone(&layout),
+            layout,
             bytes,
         });
         while inner.markdown_layouts.len() > MARKDOWN_LAYOUT_CACHE_CAPACITY
@@ -293,12 +493,95 @@ impl TranscriptRenderCache {
             };
             inner.markdown_layout_bytes = inner.markdown_layout_bytes.saturating_sub(evicted.bytes);
         }
-        Some(layout)
+        if is_current_fallback && projection_changed {
+            inner.heights.remove(&entry_id);
+            let mut retained = VecDeque::with_capacity(inner.slices.len());
+            while let Some(slice) = inner.slices.pop_front() {
+                if slice.entry_id == entry_id {
+                    inner.slice_bytes = inner.slice_bytes.saturating_sub(slice.bytes);
+                } else {
+                    retained.push_back(slice);
+                }
+            }
+            inner.slices = retained;
+        }
+        drop(inner);
+        if is_current_fallback && projection_changed {
+            let mut index = self.index.borrow_mut();
+            if let Some(position) = index.entries.iter().position(|entry| entry.id == entry_id) {
+                index.entries.truncate(position);
+            }
+        }
+    }
+
+    pub(crate) fn drain_markdown_results(&self) -> bool {
+        let mut changed = false;
+        while let Some(result) = self.markdown_runner.try_result() {
+            if let Some(layout) = result.layout {
+                self.store_markdown_layout(result.entry_id, result.key, Arc::new(layout));
+                changed = true;
+            } else {
+                self.inner
+                    .borrow_mut()
+                    .markdown_pending
+                    .remove(&(result.entry_id, result.key));
+            }
+        }
+        changed
     }
 
     #[cfg(test)]
     fn markdown_layout_builds(&self) -> usize {
         self.inner.borrow().markdown_layout_builds
+    }
+
+    #[cfg(test)]
+    fn markdown_cache_stats(&self) -> (usize, usize, usize, usize) {
+        let inner = self.inner.borrow();
+        (
+            inner.markdown_layouts.len(),
+            inner.markdown_layout_bytes,
+            inner.markdown_pending.len(),
+            inner.markdown_fallbacks.len(),
+        )
+    }
+
+    fn resolve_scroll_top(
+        &self,
+        key: IndexKey,
+        default_top: usize,
+        reflow_top: Option<usize>,
+        manual: bool,
+        maximum_top: usize,
+    ) -> usize {
+        if !manual {
+            *self.scroll_anchor.borrow_mut() = None;
+            return default_top;
+        }
+        if let Some(anchored_top) = reflow_top {
+            *self.scroll_anchor.borrow_mut() = Some(ScrollAnchor {
+                key,
+                reference_top: default_top,
+                anchored_top: anchored_top.min(maximum_top),
+            });
+        }
+        let mut anchor = self.scroll_anchor.borrow_mut();
+        let Some(state) = anchor.as_mut().filter(|state| state.key == key) else {
+            *anchor = None;
+            return default_top;
+        };
+        state.anchored_top = if default_top >= state.reference_top {
+            state
+                .anchored_top
+                .saturating_add(default_top - state.reference_top)
+        } else {
+            state
+                .anchored_top
+                .saturating_sub(state.reference_top - default_top)
+        }
+        .min(maximum_top);
+        state.reference_top = default_top;
+        state.anchored_top
     }
 }
 
@@ -426,6 +709,7 @@ pub(super) fn render(
     theme: &Theme,
     cache: &TranscriptRenderCache,
 ) -> RenderResult {
+    cache.drain_markdown_results();
     let content_area = area.inner(Margin::new(2, 0));
     if app.transcript.entries().is_empty() {
         frame.render_widget(
@@ -445,7 +729,7 @@ pub(super) fn render(
 
     let width = content_area.width.max(1) as usize;
     let available_height = content_area.height as usize;
-    ensure_layout_index(app, theme, width, available_height, cache);
+    let reflow_top = ensure_layout_index(app, width, available_height, cache);
     let index = cache.index.borrow();
     let next_line = index.entries.last().map_or(0, |entry| entry.end);
 
@@ -472,7 +756,17 @@ pub(super) fn render(
     let viewport_height = viewport_area.height as usize;
     let maximum_top = next_line.saturating_sub(viewport_height);
     let from_bottom = app.transcript_scroll_offset(maximum_top);
-    let top = maximum_top.saturating_sub(from_bottom);
+    let default_top = maximum_top.saturating_sub(from_bottom);
+    let top = cache.resolve_scroll_top(
+        IndexKey {
+            width,
+            available_height,
+        },
+        default_top,
+        reflow_top,
+        visibly_manual,
+        maximum_top,
+    );
     let viewport_end = top.saturating_add(viewport_height);
     let first_visible = index.entries.partition_point(|entry| entry.end <= top);
     let mut regions = Vec::new();
@@ -580,17 +874,35 @@ pub(super) fn render(
 
 fn ensure_layout_index(
     app: &App,
-    theme: &Theme,
     width: usize,
     available_height: usize,
     cache: &TranscriptRenderCache,
-) {
+) -> Option<usize> {
     let key = IndexKey {
         width,
         available_height,
-        theme: theme.id(),
     };
     let entries = app.transcript.entries();
+    let reflow_anchor = {
+        let index = cache.index.borrow();
+        index
+            .key
+            .filter(|previous| previous.width != width)
+            .and_then(|previous| {
+                let next_line = index.entries.last().map_or(0, |entry| entry.end);
+                let viewport_height = previous.available_height.saturating_sub(1);
+                let maximum = next_line.saturating_sub(viewport_height);
+                let top = maximum.saturating_sub(app.transcript_scroll_offset(maximum));
+                index
+                    .entries
+                    .iter()
+                    .find(|entry| entry.start <= top && top < entry.end)
+                    .map(|entry| ReflowAnchor {
+                        entry_id: entry.id,
+                        local_row: top.saturating_sub(entry.start),
+                    })
+            })
+    };
     let valid_prefix = {
         let index = cache.index.borrow();
         if index.key != Some(key) {
@@ -616,7 +928,7 @@ fn ensure_layout_index(
             && index.entries.len() == entries.len()
     };
     if already_complete {
-        return;
+        return None;
     }
 
     let mut updated = {
@@ -643,6 +955,19 @@ fn ensure_layout_index(
         .entries_measured
         .saturating_add(entries.len().saturating_sub(valid_prefix));
     index.entries = updated;
+    reflow_anchor.and_then(|anchor| {
+        index
+            .entries
+            .iter()
+            .find(|entry| entry.id == anchor.entry_id)
+            .map(|entry| {
+                entry.start.saturating_add(
+                    anchor
+                        .local_row
+                        .min(entry.end.saturating_sub(entry.start).saturating_sub(1)),
+                )
+            })
+    })
 }
 
 fn measured_entry_height(
@@ -1904,6 +2229,10 @@ mod tests {
         },
     };
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
 
     fn render_widget(widget: &dyn Render, width: u16) -> Buffer {
         let theme = Theme::default();
@@ -2583,6 +2912,284 @@ mod tests {
         });
         let _ = render_transcript(&app, &cache);
         assert_eq!(cache.markdown_layout_builds(), 2);
+    }
+
+    #[test]
+    fn markdown_layout_cache_reuses_an_older_width_as_a_true_lru_entry() {
+        let mut app = App::new();
+        app.transcript.submit(22, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 22 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 22,
+            text: "# Result\n\nA response that wraps at different widths.".into(),
+        });
+        let cache = TranscriptRenderCache::default();
+
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 60, 24);
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+
+        assert_eq!(cache.markdown_layout_builds(), 2);
+    }
+
+    #[test]
+    fn manual_scroll_keeps_the_same_entry_row_anchored_when_markdown_reflows() {
+        let mut app = App::new();
+        app.transcript.submit(31, "first".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 31 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 31,
+            text: "wrapping words ".repeat(80),
+        });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 31 });
+        app.transcript.submit(32, "second".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 32 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 32,
+            text: (0..40)
+                .map(|index| format!("anchor-{index:02}"))
+                .collect::<Vec<_>>()
+                .join("  \n"),
+        });
+        let cache = TranscriptRenderCache::default();
+
+        let (_, initial) = render_transcript_at(&app, &cache, &Theme::default(), 80, 12);
+        app.update_transcript_scroll_maximum(initial.scroll_maximum);
+        app.scroll_transcript_by(3);
+        let (wide, _) = render_transcript_at(&app, &cache, &Theme::default(), 80, 12);
+        let anchored = wide
+            .lines()
+            .find_map(|line| {
+                line.find("anchor-")
+                    .map(|start| line[start..start + "anchor-00".len()].to_owned())
+            })
+            .expect("an anchored second-message row is visible");
+
+        let (narrow, _) = render_transcript_at(&app, &cache, &Theme::default(), 60, 12);
+        let narrow_anchor = narrow
+            .lines()
+            .find_map(|line| {
+                line.find("anchor-")
+                    .map(|start| line[start..start + "anchor-00".len()].to_owned())
+            })
+            .expect("a second-message row remains visible after reflow");
+
+        assert_eq!(narrow_anchor, anchored);
+    }
+
+    #[test]
+    fn large_streaming_markdown_builds_off_thread_and_never_applies_a_stale_revision() {
+        let mut app = App::new();
+        app.transcript.submit(41, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 41 });
+        let source = format!(
+            "```rust\n{}\n```",
+            "fn value() -> usize { 1 }\n".repeat(800)
+        );
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 41,
+            text: source,
+        });
+        let cache = TranscriptRenderCache::default();
+        let entry = app.transcript.entries().last().expect("assistant entry");
+
+        let first = cache.markdown_layout(entry, 80).expect("literal fallback");
+        assert_eq!(cache.markdown_layout_builds(), 0);
+        assert!(
+            first
+                .line(0, &Theme::default())
+                .unwrap()
+                .to_string()
+                .contains("```rust")
+        );
+
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 41,
+            text: "\nlatest revision".into(),
+        });
+        let entry = app.transcript.entries().last().expect("updated assistant");
+        let pending = cache.markdown_layout(entry, 80).expect("updated fallback");
+        let pending_text = (0..pending.height())
+            .filter_map(|row| pending.line(row, &Theme::default()))
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(pending_text.contains("latest revision"));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let semantic = loop {
+            cache.drain_markdown_results();
+            let entry = app.transcript.entries().last().expect("updated assistant");
+            let layout = cache.markdown_layout(entry, 80).expect("current layout");
+            let text = (0..layout.height())
+                .filter_map(|row| layout.line(row, &Theme::default()))
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.contains("latest revision") && !text.contains("```rust") {
+                break text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background Markdown layout timed out"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(semantic.contains("┌─ rust"));
+        assert_eq!(cache.markdown_cache_stats().2, 0);
+    }
+
+    #[test]
+    fn completed_fenced_layout_replaces_and_remeasures_its_literal_frame() {
+        let mut app = App::new();
+        app.transcript.submit(42, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 42 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 42,
+            text: "```rust\nfn main() {}\n```".into(),
+        });
+        let cache = TranscriptRenderCache::default();
+
+        let literal = render_transcript(&app, &cache);
+        assert!(literal.contains("```rust"));
+        assert_eq!(cache.markdown_layout_builds(), 0);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let semantic = loop {
+            if cache.drain_markdown_results() {
+                let rendered = render_transcript(&app, &cache);
+                if rendered.contains("┌─ rust") {
+                    break rendered;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background Markdown layout timed out"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        assert!(!semantic.contains("```rust"));
+        assert_eq!(cache.markdown_layout_builds(), 1);
+    }
+
+    #[test]
+    fn markdown_layout_lru_enforces_both_entry_and_byte_bounds() {
+        let cache = TranscriptRenderCache::default();
+        for revision in 0..=super::MARKDOWN_LAYOUT_CACHE_CAPACITY {
+            cache.store_markdown_layout(
+                1,
+                super::MarkdownLayoutKey {
+                    revision: revision as u64,
+                    width: 80,
+                },
+                std::sync::Arc::new(MarkdownLayout::new("small", 78)),
+            );
+        }
+        let (entries, bytes, _, _) = cache.markdown_cache_stats();
+        assert_eq!(entries, super::MARKDOWN_LAYOUT_CACHE_CAPACITY);
+        assert!(bytes <= super::MARKDOWN_LAYOUT_CACHE_BYTES);
+
+        cache.store_markdown_layout(
+            2,
+            super::MarkdownLayoutKey {
+                revision: 99,
+                width: 1,
+            },
+            std::sync::Arc::new(MarkdownLayout::literal(&"x".repeat(170_000), 1)),
+        );
+        let (entries, bytes, _, _) = cache.markdown_cache_stats();
+        assert!(entries <= super::MARKDOWN_LAYOUT_CACHE_CAPACITY);
+        assert!(bytes <= super::MARKDOWN_LAYOUT_CACHE_BYTES);
+    }
+
+    #[test]
+    fn a_stream_delta_rebuilds_only_its_assistant_and_theme_changes_only_rendered_slices() {
+        let mut app = App::new();
+        for request_id in [51, 52] {
+            app.transcript
+                .submit(request_id, "prompt".into(), Vec::new());
+            app.handle_agent_event(AgentEvent::Started { request_id });
+            app.handle_agent_event(AgentEvent::TextDelta {
+                request_id,
+                text: format!("# Response {request_id}"),
+            });
+            if request_id == 51 {
+                app.handle_agent_event(AgentEvent::Completed { request_id });
+            }
+        }
+        let cache = TranscriptRenderCache::default();
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        assert_eq!(cache.markdown_layout_builds(), 2);
+
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 52,
+            text: " updated".into(),
+        });
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        assert_eq!(cache.markdown_layout_builds(), 3);
+        let before_theme = cache.stats();
+
+        let _ = render_transcript_at(&app, &cache, &Theme::resolve(ThemeId::Paper), 80, 24);
+        assert_eq!(cache.markdown_layout_builds(), 3);
+        assert_eq!(cache.stats().0, before_theme.0);
+        assert!(cache.stats().1 > before_theme.1);
+    }
+
+    #[test]
+    fn test_backend_renders_each_heading_with_its_exact_theme_role_in_every_theme() {
+        let mut app = App::new();
+        app.transcript.submit(61, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 61 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 61,
+            text: (1..=6)
+                .map(|level| format!("{} Heading {level}", "#".repeat(level)))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        });
+        let cache = TranscriptRenderCache::default();
+        let roles = [
+            ThemeRole::MarkdownHeading1,
+            ThemeRole::MarkdownHeading2,
+            ThemeRole::MarkdownHeading3,
+            ThemeRole::MarkdownHeading4,
+            ThemeRole::MarkdownHeading5,
+            ThemeRole::MarkdownHeading6,
+        ];
+
+        for theme_id in ThemeId::ALL {
+            let theme = Theme::resolve(theme_id);
+            let area = Rect::new(0, 0, 80, 24);
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render(frame, area, &app, &theme, &cache);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for (level, role) in (1..=6).zip(roles) {
+                let label = format!("Heading {level}");
+                let row = (0..area.height)
+                    .find(|row| {
+                        (0..area.width)
+                            .filter_map(|column| buffer.cell((column, *row)))
+                            .map(|cell| cell.symbol())
+                            .collect::<String>()
+                            .contains(&label)
+                    })
+                    .expect("heading row");
+                let cell = (0..area.width)
+                    .filter_map(|column| buffer.cell((column, row)))
+                    .find(|cell| cell.symbol() == "H")
+                    .expect("heading cell");
+                assert_eq!(
+                    cell.style().fg,
+                    theme.style(role).fg,
+                    "heading {level} in {theme_id:?}"
+                );
+            }
+        }
     }
 
     #[test]
