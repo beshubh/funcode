@@ -19,7 +19,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    sync::Arc,
+    ops::Range,
+    sync::{Arc, RwLock, Weak},
     time::{Duration, Instant},
 };
 
@@ -259,7 +260,7 @@ enum ToolOutputScrollPosition {
     Following,
     Manual {
         top: usize,
-        logical_line: usize,
+        anchor: Option<ToolOutputRowAnchor>,
     },
 }
 
@@ -267,7 +268,8 @@ enum ToolOutputScrollPosition {
 struct ToolOutputScroll {
     position: ToolOutputScrollPosition,
     maximum: usize,
-    logical_lines: Arc<[usize]>,
+    layout_id: Option<ToolOutputLayoutId>,
+    row_index: Weak<ToolOutputRowIndex>,
 }
 
 impl PartialEq for ToolOutputScroll {
@@ -282,18 +284,430 @@ impl Eq for ToolOutputScroll {}
 pub(crate) struct ToolOutputScrollMetrics {
     pub entry_id: EntryId,
     pub maximum: usize,
-    pub logical_lines: Arc<[usize]>,
+    pub layout_id: ToolOutputLayoutId,
+    pub row_index: Arc<ToolOutputRowIndex>,
 }
 
 impl PartialEq for ToolOutputScrollMetrics {
     fn eq(&self, other: &Self) -> bool {
         self.entry_id == other.entry_id
             && self.maximum == other.maximum
-            && Arc::ptr_eq(&self.logical_lines, &other.logical_lines)
+            && self.layout_id == other.layout_id
     }
 }
 
 impl Eq for ToolOutputScrollMetrics {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolOutputLayoutId {
+    pub revision: u64,
+    pub width: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ToolOutputRowAnchor {
+    pub artifact: usize,
+    pub logical_line: usize,
+    pub source_byte: usize,
+}
+
+const TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS: usize = 128;
+
+#[derive(Debug, Clone, Copy)]
+struct ToolOutputSparseCheckpoint {
+    row: usize,
+    byte: usize,
+    anchor: ToolOutputRowAnchor,
+}
+
+#[derive(Debug)]
+enum ToolOutputRowSegment {
+    Dense(Vec<ToolOutputRowAnchor>),
+    Sparse {
+        rows: Weak<String>,
+        row_count: usize,
+        checkpoints: Vec<ToolOutputSparseCheckpoint>,
+    },
+}
+
+impl ToolOutputRowSegment {
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(anchors) => anchors.len(),
+            Self::Sparse { row_count, .. } => *row_count,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ToolOutputRowIndex {
+    segments: RwLock<Vec<ToolOutputRowSegment>>,
+}
+
+impl ToolOutputRowIndex {
+    pub(crate) fn new(segments: Vec<Vec<ToolOutputRowAnchor>>) -> Self {
+        Self {
+            segments: RwLock::new(
+                segments
+                    .into_iter()
+                    .map(ToolOutputRowSegment::Dense)
+                    .collect(),
+            ),
+        }
+    }
+
+    pub(crate) fn new_sparse(segments: &[(Arc<String>, usize)]) -> Self {
+        Self {
+            segments: RwLock::new(
+                segments
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(artifact, (rows, row_count))| ToolOutputRowSegment::Sparse {
+                            rows: Arc::downgrade(rows),
+                            row_count: *row_count,
+                            checkpoints: sparse_row_checkpoints(rows, *row_count, artifact),
+                        },
+                    )
+                    .collect(),
+            ),
+        }
+    }
+
+    pub(crate) fn anchor_at(&self, mut row: usize) -> Option<ToolOutputRowAnchor> {
+        let segments = self.segments.read().ok()?;
+        for segment in segments.iter() {
+            if row < segment.len() {
+                return match segment {
+                    ToolOutputRowSegment::Dense(anchors) => anchors.get(row).copied(),
+                    ToolOutputRowSegment::Sparse {
+                        rows,
+                        row_count,
+                        checkpoints,
+                    } => sparse_anchor_at(&rows.upgrade()?, *row_count, checkpoints, row),
+                };
+            }
+            row = row.saturating_sub(segment.len());
+        }
+        None
+    }
+
+    fn row_for_anchor(&self, anchor: ToolOutputRowAnchor) -> usize {
+        self.segments.read().map_or(0, |segments| {
+            let preceding = segments
+                .iter()
+                .take(anchor.artifact)
+                .fold(0usize, |rows, segment| rows.saturating_add(segment.len()));
+            let Some(segment) = segments.get(anchor.artifact) else {
+                return preceding;
+            };
+            let local = match segment {
+                ToolOutputRowSegment::Dense(anchors) => anchors
+                    .partition_point(|candidate| *candidate <= anchor)
+                    .saturating_sub(1)
+                    .min(anchors.len().saturating_sub(1)),
+                ToolOutputRowSegment::Sparse {
+                    rows,
+                    row_count,
+                    checkpoints,
+                } => rows.upgrade().map_or(0, |rows| {
+                    sparse_row_for_anchor(&rows, *row_count, checkpoints, anchor)
+                }),
+            };
+            preceding.saturating_add(local)
+        })
+    }
+
+    pub(crate) fn sparse_row_ranges(
+        &self,
+        segment: usize,
+        range: Range<usize>,
+    ) -> Vec<Range<usize>> {
+        let Ok(segments) = self.segments.read() else {
+            return Vec::new();
+        };
+        let Some(ToolOutputRowSegment::Sparse {
+            rows,
+            row_count,
+            checkpoints,
+        }) = segments.get(segment)
+        else {
+            return Vec::new();
+        };
+        let Some(rows) = rows.upgrade() else {
+            return Vec::new();
+        };
+        sparse_row_ranges(&rows, *row_count, checkpoints, range)
+    }
+
+    pub(crate) fn replace_segment(
+        &self,
+        segment: usize,
+        anchors: impl IntoIterator<Item = ToolOutputRowAnchor>,
+    ) {
+        let Ok(mut segments) = self.segments.write() else {
+            return;
+        };
+        if segments.len() <= segment {
+            segments.resize_with(segment.saturating_add(1), || {
+                ToolOutputRowSegment::Dense(Vec::new())
+            });
+        }
+        segments[segment] = ToolOutputRowSegment::Dense(anchors.into_iter().collect());
+    }
+
+    pub(crate) fn replace_sparse_segment(
+        &self,
+        segment: usize,
+        rows: &Arc<String>,
+        row_count: usize,
+    ) {
+        let Ok(mut segments) = self.segments.write() else {
+            return;
+        };
+        if segments.len() <= segment {
+            segments.resize_with(segment.saturating_add(1), || {
+                ToolOutputRowSegment::Dense(Vec::new())
+            });
+        }
+        segments[segment] = ToolOutputRowSegment::Sparse {
+            rows: Arc::downgrade(rows),
+            row_count,
+            checkpoints: sparse_row_checkpoints(rows, row_count, segment),
+        };
+    }
+
+    pub(crate) fn refresh_dense_segment_tail(
+        &self,
+        segment: usize,
+        first_changed_row: usize,
+        anchors: impl IntoIterator<Item = ToolOutputRowAnchor>,
+    ) {
+        let Ok(mut segments) = self.segments.write() else {
+            return;
+        };
+        let Some(ToolOutputRowSegment::Dense(cached)) = segments.get_mut(segment) else {
+            return;
+        };
+        cached.truncate(first_changed_row.min(cached.len()));
+        cached.extend(anchors);
+    }
+
+    pub(crate) fn refresh_sparse_segment_tail(
+        &self,
+        segment: usize,
+        rows: &Arc<String>,
+        row_count: usize,
+        first_changed_row: usize,
+    ) {
+        let Ok(mut segments) = self.segments.write() else {
+            return;
+        };
+        let Some(ToolOutputRowSegment::Sparse {
+            rows: cached_rows,
+            row_count: cached_count,
+            checkpoints,
+        }) = segments.get_mut(segment)
+        else {
+            return;
+        };
+        *cached_rows = Arc::downgrade(rows);
+        *cached_count = row_count;
+        refresh_sparse_checkpoints(rows, row_count, segment, checkpoints, first_changed_row);
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        self.segments
+            .read()
+            .map_or(std::mem::size_of::<Self>(), |segments| {
+                std::mem::size_of::<Self>()
+                    .saturating_add(
+                        segments
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ToolOutputRowSegment>()),
+                    )
+                    .saturating_add(segments.iter().fold(0usize, |bytes, segment| {
+                        bytes.saturating_add(match segment {
+                            ToolOutputRowSegment::Dense(anchors) => anchors
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ToolOutputRowAnchor>()),
+                            ToolOutputRowSegment::Sparse { checkpoints, .. } => checkpoints
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<ToolOutputSparseCheckpoint>()),
+                        })
+                    }))
+            })
+    }
+}
+
+fn sparse_row_checkpoints(
+    rows: &str,
+    row_count: usize,
+    artifact: usize,
+) -> Vec<ToolOutputSparseCheckpoint> {
+    let mut checkpoints = Vec::with_capacity(
+        row_count.saturating_add(TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS - 1)
+            / TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS,
+    );
+    let mut byte = 0usize;
+    let mut anchor = ToolOutputRowAnchor {
+        artifact,
+        logical_line: 0,
+        source_byte: 0,
+    };
+    for row in 0..row_count {
+        if row.is_multiple_of(TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS) {
+            checkpoints.push(ToolOutputSparseCheckpoint { row, byte, anchor });
+        }
+        let _ = advance_sparse_row(rows, &mut byte, &mut anchor);
+    }
+    checkpoints
+}
+
+fn refresh_sparse_checkpoints(
+    rows: &str,
+    row_count: usize,
+    artifact: usize,
+    checkpoints: &mut Vec<ToolOutputSparseCheckpoint>,
+    first_changed_row: usize,
+) {
+    if row_count == 0 || checkpoints.is_empty() || first_changed_row == 0 {
+        *checkpoints = sparse_row_checkpoints(rows, row_count, artifact);
+        return;
+    }
+    let retained = checkpoints
+        .partition_point(|checkpoint| checkpoint.row <= first_changed_row)
+        .saturating_sub(1);
+    let checkpoint = checkpoints[retained];
+    checkpoints.truncate(retained.saturating_add(1));
+    let mut row = checkpoint.row;
+    let mut byte = checkpoint.byte;
+    let mut anchor = checkpoint.anchor;
+    while row < row_count {
+        if row != checkpoint.row && row.is_multiple_of(TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS) {
+            checkpoints.push(ToolOutputSparseCheckpoint { row, byte, anchor });
+        }
+        let _ = advance_sparse_row(rows, &mut byte, &mut anchor);
+        row = row.saturating_add(1);
+    }
+}
+
+fn sparse_anchor_at(
+    rows: &str,
+    row_count: usize,
+    checkpoints: &[ToolOutputSparseCheckpoint],
+    target: usize,
+) -> Option<ToolOutputRowAnchor> {
+    if target >= row_count {
+        return None;
+    }
+    let checkpoint = checkpoints
+        .get(target / TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS)
+        .copied()
+        .or_else(|| checkpoints.last().copied())?;
+    let mut row = checkpoint.row;
+    let mut byte = checkpoint.byte;
+    let mut anchor = checkpoint.anchor;
+    while row < target {
+        let _ = advance_sparse_row(rows, &mut byte, &mut anchor);
+        row = row.saturating_add(1);
+    }
+    Some(anchor)
+}
+
+fn sparse_row_for_anchor(
+    rows: &str,
+    row_count: usize,
+    checkpoints: &[ToolOutputSparseCheckpoint],
+    target: ToolOutputRowAnchor,
+) -> usize {
+    let Some(checkpoint) = checkpoints
+        .get(
+            checkpoints
+                .partition_point(|checkpoint| checkpoint.anchor <= target)
+                .saturating_sub(1),
+        )
+        .copied()
+    else {
+        return 0;
+    };
+    let mut row = checkpoint.row;
+    let mut byte = checkpoint.byte;
+    let mut anchor = checkpoint.anchor;
+    while row.saturating_add(1) < row_count {
+        let mut next_byte = byte;
+        let mut next_anchor = anchor;
+        let _ = advance_sparse_row(rows, &mut next_byte, &mut next_anchor);
+        if next_anchor > target {
+            break;
+        }
+        row = row.saturating_add(1);
+        byte = next_byte;
+        anchor = next_anchor;
+        if row.is_multiple_of(TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS) && anchor > target {
+            break;
+        }
+    }
+    row
+}
+
+fn sparse_row_ranges(
+    rows: &str,
+    row_count: usize,
+    checkpoints: &[ToolOutputSparseCheckpoint],
+    range: Range<usize>,
+) -> Vec<Range<usize>> {
+    let start = range.start.min(row_count);
+    let end = range.end.min(row_count);
+    if start >= end {
+        return Vec::new();
+    }
+    let Some(checkpoint) = checkpoints
+        .get(start / TOOL_OUTPUT_SPARSE_CHECKPOINT_ROWS)
+        .copied()
+        .or_else(|| checkpoints.last().copied())
+    else {
+        return Vec::new();
+    };
+    let mut row = checkpoint.row;
+    let mut byte = checkpoint.byte;
+    let mut anchor = checkpoint.anchor;
+    while row < start {
+        let _ = advance_sparse_row(rows, &mut byte, &mut anchor);
+        row = row.saturating_add(1);
+    }
+    let mut ranges = Vec::with_capacity(end.saturating_sub(start));
+    while row < end {
+        ranges.push(advance_sparse_row(rows, &mut byte, &mut anchor));
+        row = row.saturating_add(1);
+    }
+    ranges
+}
+
+fn advance_sparse_row(
+    rows: &str,
+    byte: &mut usize,
+    anchor: &mut ToolOutputRowAnchor,
+) -> Range<usize> {
+    let start = (*byte).min(rows.len());
+    let relative_end = rows.as_bytes()[start..]
+        .iter()
+        .position(|byte| matches!(*byte, b'\n' | b'\r'));
+    let end = relative_end.map_or(rows.len(), |end| start.saturating_add(end));
+    let delimiter = rows.as_bytes().get(end).copied();
+    *byte = end.saturating_add(usize::from(delimiter.is_some()));
+    match delimiter {
+        Some(b'\n') => {
+            anchor.source_byte = anchor.source_byte.saturating_add(end.saturating_sub(start));
+        }
+        Some(b'\r') => {
+            anchor.logical_line = anchor.logical_line.saturating_add(1);
+            anchor.source_byte = 0;
+        }
+        _ => {}
+    }
+    start..end
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct InputVisualState {
@@ -977,13 +1391,6 @@ impl App {
         matches!(self.transcript_scroll, TranscriptScroll::Following)
     }
 
-    pub(crate) fn transcript_has_manual_scroll_offset(&self) -> bool {
-        matches!(
-            self.transcript_scroll,
-            TranscriptScroll::Manual { from_bottom } if from_bottom > 0
-        )
-    }
-
     pub(crate) fn transcript_scroll_offset(&self, maximum: usize) -> usize {
         let TranscriptScroll::Manual { from_bottom } = self.transcript_scroll else {
             return 0;
@@ -1047,26 +1454,33 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn tool_output_scroll_offset(&self, entry_id: EntryId, maximum: usize) -> usize {
-        self.tool_output_scroll_offset_for_layout(entry_id, maximum, None)
+        let layout_id = self
+            .tool_output_scrolls
+            .get(&entry_id)
+            .and_then(|state| state.layout_id)
+            .unwrap_or(ToolOutputLayoutId {
+                revision: 0,
+                width: 0,
+            });
+        self.tool_output_scroll_offset_for_layout(entry_id, maximum, layout_id, None)
     }
 
     pub(crate) fn tool_output_scroll_offset_for_layout(
         &self,
         entry_id: EntryId,
         maximum: usize,
-        logical_lines: Option<&Arc<[usize]>>,
+        layout_id: ToolOutputLayoutId,
+        row_index: Option<&Arc<ToolOutputRowIndex>>,
     ) -> usize {
         let Some(state) = self.tool_output_scrolls.get(&entry_id) else {
             return 0;
         };
-        let ToolOutputScrollPosition::Manual { top, logical_line } = state.position else {
+        let ToolOutputScrollPosition::Manual { top, anchor } = state.position else {
             return 0;
         };
-        let top = logical_lines
-            .filter(|logical_lines| !Arc::ptr_eq(&state.logical_lines, logical_lines))
-            .map(|logical_lines| {
-                logical_lines.partition_point(|candidate| *candidate < logical_line)
-            })
+        let top = row_index
+            .filter(|_| state.layout_id != Some(layout_id))
+            .and_then(|row_index| anchor.map(|anchor| row_index.row_for_anchor(anchor)))
             .unwrap_or(top);
         maximum.saturating_sub(top.min(maximum))
     }
@@ -1081,19 +1495,23 @@ impl App {
                 .get(&metrics.entry_id)
                 .cloned()
                 .unwrap_or_default();
-            let layout_changed = !Arc::ptr_eq(&previous.logical_lines, &metrics.logical_lines);
+            let layout_changed = previous.layout_id != Some(metrics.layout_id);
             let position = match previous.position.clone() {
                 ToolOutputScrollPosition::Manual {
                     top: _,
-                    logical_line,
+                    anchor: Some(anchor),
                 } if layout_changed => {
-                    let remapped = metrics
-                        .logical_lines
-                        .partition_point(|candidate| *candidate < logical_line)
-                        .min(metrics.maximum);
+                    let remapped = metrics.row_index.row_for_anchor(anchor);
                     ToolOutputScrollPosition::Manual {
                         top: remapped,
-                        logical_line,
+                        anchor: Some(anchor),
+                    }
+                }
+                ToolOutputScrollPosition::Manual { top, anchor } => {
+                    ToolOutputScrollPosition::Manual {
+                        top,
+                        anchor: anchor
+                            .or_else(|| metrics.row_index.anchor_at(top.min(metrics.maximum))),
                     }
                 }
                 position => position,
@@ -1101,9 +1519,10 @@ impl App {
             let current = ToolOutputScroll {
                 position,
                 maximum: metrics.maximum,
-                logical_lines: Arc::clone(&metrics.logical_lines),
+                layout_id: Some(metrics.layout_id),
+                row_index: Arc::downgrade(&metrics.row_index),
             };
-            let entry_changed = current != previous || layout_changed;
+            let entry_changed = current != previous;
             self.tool_output_scrolls.insert(metrics.entry_id, current);
             entry_changed || changed
         })
@@ -1125,7 +1544,19 @@ impl App {
             .map(|(entry_id, maximum)| ToolOutputScrollMetrics {
                 entry_id: *entry_id,
                 maximum: *maximum,
-                logical_lines: (0..=maximum.saturating_add(1)).collect::<Vec<_>>().into(),
+                layout_id: ToolOutputLayoutId {
+                    revision: 0,
+                    width: 0,
+                },
+                row_index: Arc::new(ToolOutputRowIndex::new(vec![
+                    (0..=maximum.saturating_add(1))
+                        .map(|logical_line| ToolOutputRowAnchor {
+                            artifact: 0,
+                            logical_line,
+                            source_byte: 0,
+                        })
+                        .collect(),
+                ])),
             })
             .collect::<Vec<_>>();
         self.update_tool_output_scroll_metrics(&metrics)
@@ -1152,7 +1583,10 @@ impl App {
         } else {
             ToolOutputScrollPosition::Manual {
                 top,
-                logical_line: state.logical_lines.get(top).copied().unwrap_or(top),
+                anchor: state
+                    .row_index
+                    .upgrade()
+                    .and_then(|row_index| row_index.anchor_at(top)),
             }
         };
         top != current_top
@@ -1164,10 +1598,13 @@ impl App {
     }
 
     #[cfg(test)]
-    pub(crate) fn tool_output_scroll_anchor(&self, entry_id: EntryId) -> Option<usize> {
+    pub(crate) fn tool_output_source_anchor(
+        &self,
+        entry_id: EntryId,
+    ) -> Option<ToolOutputRowAnchor> {
         match self.tool_output_scrolls.get(&entry_id)?.position {
             ToolOutputScrollPosition::Following => None,
-            ToolOutputScrollPosition::Manual { logical_line, .. } => Some(logical_line),
+            ToolOutputScrollPosition::Manual { anchor, .. } => anchor,
         }
     }
 
@@ -3349,6 +3786,48 @@ mod tests {
 
         assert!(app.scroll_tool_output_by(42, -3));
         assert_eq!(app.tool_output_scroll_offset(42, 30), 0);
+    }
+
+    #[test]
+    fn tool_output_metrics_do_not_accumulate_row_index_ownership_in_app() {
+        let mut app = App::new();
+        let row_indexes = (0..4)
+            .map(|_| {
+                std::sync::Arc::new(super::ToolOutputRowIndex::new(vec![vec![
+                    super::ToolOutputRowAnchor {
+                        artifact: 0,
+                        logical_line: 0,
+                        source_byte: 0,
+                    },
+                ]]))
+            })
+            .collect::<Vec<_>>();
+        let weak = row_indexes
+            .iter()
+            .map(std::sync::Arc::downgrade)
+            .collect::<Vec<_>>();
+        let metrics = row_indexes
+            .iter()
+            .enumerate()
+            .map(|(index, row_index)| super::ToolOutputScrollMetrics {
+                entry_id: 42 + index as u64,
+                maximum: 10,
+                layout_id: super::ToolOutputLayoutId {
+                    revision: 1,
+                    width: 80,
+                },
+                row_index: std::sync::Arc::clone(row_index),
+            })
+            .collect::<Vec<_>>();
+
+        app.update_tool_output_scroll_metrics(&metrics);
+        drop(metrics);
+        drop(row_indexes);
+
+        assert!(
+            weak.iter().all(|row_index| row_index.upgrade().is_none()),
+            "App must retain only bounded scroll state, not the renderer's row index"
+        );
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub struct UiRegions {
     pub model_refresh: Option<Rect>,
     pub context_usage: Option<Rect>,
     pub(crate) transcript_scroll_maximum: usize,
-    pub(crate) tool_output_scroll_maxima: Vec<(crate::transcript::EntryId, usize)>,
+    pub(crate) tool_output_scroll_metrics: Vec<crate::app::ToolOutputScrollMetrics>,
 }
 
 #[derive(Debug, Default)]
@@ -846,7 +846,7 @@ fn render_chat(
         regions.transcript_entries = transcript.entries;
         regions.transcript_outputs = transcript.outputs;
         regions.transcript_scroll_maximum = transcript.scroll_maximum;
-        regions.tool_output_scroll_maxima = transcript.output_scroll_maxima;
+        regions.tool_output_scroll_metrics = transcript.output_scroll_metrics;
     }
     render_activity(frame, rows[1], app, theme);
     let composer_area = rows[2];
@@ -2462,7 +2462,7 @@ mod tests {
         let tool_id = app.transcript.entries()[2].id;
         let (bottom, _, regions, _) = render_to_string(&app, 60, 20);
         app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
-        app.update_tool_output_scroll_maxima(&regions.tool_output_scroll_maxima);
+        app.update_tool_output_scroll_metrics(&regions.tool_output_scroll_metrics);
         let output = regions
             .transcript_outputs
             .iter()

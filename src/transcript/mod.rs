@@ -327,8 +327,12 @@ impl Transcript {
             } => {
                 if self.is_active(turn_id) {
                     self.update_tool(turn_id, call_id, false, |tool| {
-                        let Some(ToolArtifact::Terminal(artifact)) = tool.artifacts.first_mut()
-                        else {
+                        let Some(artifact) = tool.artifacts.iter_mut().find_map(|artifact| {
+                            let ToolArtifact::Terminal(artifact) = artifact else {
+                                return None;
+                            };
+                            Some(artifact)
+                        }) else {
                             return false;
                         };
                         artifact.output.push_str(&chunk);
@@ -777,6 +781,49 @@ mod tests {
                 if matches!(
                     tool.artifacts.first(),
                     Some(ToolArtifact::Terminal(artifact)) if artifact.output == "test result: ok"
+                )
+        ));
+    }
+
+    #[test]
+    fn terminal_output_deltas_find_a_non_first_terminal_after_summary_artifacts() {
+        let mut transcript = Transcript::default();
+        transcript.submit(1, "run it".into(), Vec::new());
+        transcript.apply(TranscriptEvent::Started { turn_id: 1 });
+        transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 100,
+            name: "mixed_tool".into(),
+            summary: "Reading then streaming".into(),
+            artifacts: vec![
+                ToolArtifact::CodeRange(CodeRangeArtifact {
+                    path: "src/app.rs".into(),
+                    start_line: 1,
+                    end_line: 2,
+                    preview: Some("private preview".into()),
+                }),
+                ToolArtifact::Terminal(TerminalArtifact {
+                    description: "Running tests".into(),
+                    command: "cargo test".into(),
+                    output: String::new(),
+                    exit_code: None,
+                }),
+            ],
+        });
+
+        transcript.apply(TranscriptEvent::ToolOutputDelta {
+            turn_id: 1,
+            call_id: 100,
+            chunk: "streamed after summary".into(),
+        });
+
+        assert!(matches!(
+            &transcript.entries()[2].kind,
+            EntryKind::Tool(tool)
+                if matches!(
+                    tool.artifacts.get(1),
+                    Some(ToolArtifact::Terminal(artifact))
+                        if artifact.output == "streamed after summary"
                 )
         ));
     }

@@ -1,6 +1,8 @@
 use super::markdown::MarkdownLayout;
 use crate::{
-    app::{App, ToolOutputScrollMetrics},
+    app::{
+        App, ToolOutputLayoutId, ToolOutputRowAnchor, ToolOutputRowIndex, ToolOutputScrollMetrics,
+    },
     composer::DisplayRunKind,
     theme::{Theme, ThemeId, ThemeRole},
     transcript::{
@@ -18,6 +20,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     ops::Range,
@@ -56,6 +59,11 @@ const MARKDOWN_LAYOUT_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const MARKDOWN_FOREGROUND_SOURCE_BYTES: usize = 4 * 1024;
 const TOOL_OUTPUT_LAYOUT_CACHE_CAPACITY: usize = 32;
 const TOOL_OUTPUT_LAYOUT_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const TOOL_OUTPUT_SPARSE_SOURCE_BYTES: usize = 512 * 1024;
+// Keep dense admission conservative: each row owns styled text and an anchor in
+// addition to the row allocation itself. Sparse storage is preferable before
+// those allocations approach the shared cache budget.
+const TOOL_OUTPUT_DENSE_ROW_ESTIMATED_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeightKey {
@@ -101,6 +109,7 @@ struct ToolOutputLayoutKey {
 struct CachedToolOutputLayout {
     entry_id: EntryId,
     key: ToolOutputLayoutKey,
+    output_epoch: u64,
     layout: Arc<ToolOutputBodyLayout>,
     bytes: usize,
 }
@@ -109,43 +118,443 @@ struct CachedToolOutputLayout {
 struct ToolOutputRow {
     line: Line<'static>,
     role: ThemeRole,
-    logical_line: usize,
+    anchor: ToolOutputRowAnchor,
+}
+
+#[derive(Debug)]
+struct ToolOutputArtifactLayout {
+    rows: ToolOutputArtifactRows,
+}
+
+#[derive(Debug)]
+enum ToolOutputArtifactRows {
+    Dense(Vec<ToolOutputRow>),
+    Sparse {
+        encoded: Arc<String>,
+        row_count: usize,
+        default_role: ThemeRole,
+        line_roles: Vec<ThemeRole>,
+    },
+}
+
+impl ToolOutputArtifactLayout {
+    fn height(&self) -> usize {
+        match &self.rows {
+            ToolOutputArtifactRows::Dense(rows) => rows.len(),
+            ToolOutputArtifactRows::Sparse { row_count, .. } => *row_count,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(match &self.rows {
+            ToolOutputArtifactRows::Dense(rows) => rows
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ToolOutputRow>())
+                .saturating_add(rows.iter().fold(0usize, |bytes, row| {
+                    bytes
+                        .saturating_add(
+                            row.line
+                                .spans
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<Span<'static>>()),
+                        )
+                        .saturating_add(row.line.spans.iter().fold(0usize, |bytes, span| {
+                            bytes.saturating_add(match &span.content {
+                                Cow::Borrowed(_) => 0,
+                                Cow::Owned(content) => content.capacity(),
+                            })
+                        }))
+                })),
+            ToolOutputArtifactRows::Sparse {
+                encoded,
+                line_roles,
+                ..
+            } => encoded.capacity().saturating_add(
+                line_roles
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ThemeRole>()),
+            ),
+        })
+    }
 }
 
 #[derive(Debug, Default)]
 struct ToolOutputBodyLayout {
-    rows: Vec<ToolOutputRow>,
-    logical_lines: Arc<[usize]>,
+    artifacts: Vec<ToolOutputArtifactLayout>,
+    row_index: Arc<ToolOutputRowIndex>,
+    terminal: Option<TerminalOutputIndex>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalOutputIndex {
+    segment: usize,
+    artifact_index: usize,
+    source_len: usize,
+    logical_lines: usize,
+    tail_logical_column: usize,
+    tail_rendered_bytes: usize,
 }
 
 impl ToolOutputBodyLayout {
     fn height(&self) -> usize {
-        self.rows.len()
+        self.artifacts.iter().fold(0usize, |height, artifact| {
+            height.saturating_add(artifact.height())
+        })
     }
 
     fn bytes(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(self.rows.iter().fold(0usize, |bytes, row| {
-            bytes
-                .saturating_add(std::mem::size_of::<ToolOutputRow>())
-                .saturating_add(row.line.to_string().len())
-        }))
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.artifacts
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ToolOutputArtifactLayout>()),
+            )
+            .saturating_add(self.row_index.allocated_bytes())
+            .saturating_add(self.artifacts.iter().fold(0usize, |bytes, artifact| {
+                bytes.saturating_add(artifact.bytes())
+            }))
     }
 
-    fn logical_lines(&self) -> Arc<[usize]> {
-        Arc::clone(&self.logical_lines)
+    fn row_index(&self) -> Arc<ToolOutputRowIndex> {
+        Arc::clone(&self.row_index)
+    }
+
+    fn append_terminal_output(&mut self, tool: &ToolCall, width: usize) -> Option<usize> {
+        let terminal = *self.terminal.as_ref()?;
+        let ToolArtifact::Terminal(artifact) = tool.artifacts.get(terminal.artifact_index)? else {
+            return None;
+        };
+        let previous_len = terminal.source_len;
+        if artifact.output.len() < previous_len || !artifact.output.is_char_boundary(previous_len) {
+            return None;
+        }
+        if artifact.output.len() == previous_len {
+            return Some(0);
+        }
+        let suffix = &artifact.output[previous_len..];
+        if self
+            .artifacts
+            .iter()
+            .any(|artifact| matches!(artifact.rows, ToolOutputArtifactRows::Dense(_)))
+            && self.dense_append_should_promote(tool, suffix, width)
+        {
+            let replacement = build_sparse_tool_output_layout(tool, width);
+            let indexed_rows = replacement.height();
+            *self = replacement;
+            return Some(indexed_rows);
+        }
+
+        let segment = terminal.segment;
+        let appended = match &mut self.artifacts.get_mut(segment)?.rows {
+            ToolOutputArtifactRows::Dense(rows) => {
+                if previous_len == 0 {
+                    rows.clear();
+                    let mut logical_line = 0usize;
+                    for line in
+                        message_line_iter(&artifact.output, ratatui::style::Style::default())
+                    {
+                        push_indexed_output_line(
+                            rows,
+                            line,
+                            ThemeRole::Text,
+                            segment,
+                            logical_line,
+                            width,
+                        );
+                        logical_line = logical_line.saturating_add(1);
+                    }
+                    let mut state = terminal_tail_state(&artifact.output);
+                    state.indexed_rows = rows.len();
+                    self.row_index
+                        .replace_segment(segment, rows.iter().map(|row| row.anchor));
+                    state
+                } else {
+                    let previous_rows = rows.len();
+                    let changes_tail = suffix
+                        .split('\n')
+                        .next()
+                        .is_some_and(|part| !part.is_empty());
+                    let appended = append_terminal_suffix(rows, suffix, width, &terminal);
+                    let first_changed_row = if changes_tail {
+                        previous_rows.saturating_sub(1)
+                    } else {
+                        previous_rows
+                    };
+                    self.row_index.refresh_dense_segment_tail(
+                        segment,
+                        first_changed_row,
+                        rows.iter().skip(first_changed_row).map(|row| row.anchor),
+                    );
+                    appended
+                }
+            }
+            ToolOutputArtifactRows::Sparse {
+                encoded, row_count, ..
+            } => {
+                if previous_len == 0 {
+                    let (replacement, replacement_rows, _, _) = build_sparse_artifact_rows(
+                        tool.artifacts.get(terminal.artifact_index)?,
+                        width,
+                    );
+                    *encoded = Arc::new(replacement);
+                    *row_count = replacement_rows;
+                    self.row_index
+                        .replace_sparse_segment(segment, encoded, *row_count);
+                    let mut state = terminal_tail_state(&artifact.output);
+                    state.indexed_rows = *row_count;
+                    state
+                } else {
+                    let old_count = *row_count;
+                    let sparse = append_sparse_terminal_suffix(
+                        Arc::make_mut(encoded),
+                        row_count,
+                        suffix,
+                        width,
+                        &terminal,
+                    );
+                    self.row_index.refresh_sparse_segment_tail(
+                        segment,
+                        encoded,
+                        *row_count,
+                        sparse.first_changed_row.min(old_count),
+                    );
+                    sparse.appended
+                }
+            }
+        };
+        let terminal = self.terminal.as_mut()?;
+        terminal.source_len = artifact.output.len();
+        terminal.logical_lines = appended.logical_lines;
+        terminal.tail_logical_column = appended.tail_logical_column;
+        terminal.tail_rendered_bytes = appended.tail_rendered_bytes;
+        Some(appended.indexed_rows)
+    }
+
+    fn dense_append_should_promote(&self, tool: &ToolCall, suffix: &str, width: usize) -> bool {
+        if tool_output_source_bytes(tool) >= TOOL_OUTPUT_SPARSE_SOURCE_BYTES {
+            return true;
+        }
+        self.height()
+            .saturating_add(estimated_message_fragment_rows(suffix, width))
+            .saturating_mul(TOOL_OUTPUT_DENSE_ROW_ESTIMATED_BYTES)
+            >= TOOL_OUTPUT_LAYOUT_CACHE_BYTES
     }
 
     fn render(&self, context: RenderContext<'_>) {
-        let start = context.visible_rows.start.min(self.rows.len());
-        let end = context.visible_rows.end.min(self.rows.len());
-        for (destination_row, row) in self.rows[start..end].iter().enumerate() {
-            context.buffer.set_line(
-                context.area.x,
-                context.area.y.saturating_add(destination_row as u16),
-                &row.line.clone().style(context.theme.style(row.role)),
-                context.area.width,
-            );
+        let mut global_start = 0usize;
+        for (segment, artifact) in self.artifacts.iter().enumerate() {
+            let global_end = global_start.saturating_add(artifact.height());
+            if global_end <= context.visible_rows.start {
+                global_start = global_end;
+                continue;
+            }
+            if global_start >= context.visible_rows.end {
+                break;
+            }
+            let local_start = context.visible_rows.start.saturating_sub(global_start);
+            let local_end = context
+                .visible_rows
+                .end
+                .saturating_sub(global_start)
+                .min(artifact.height());
+            match &artifact.rows {
+                ToolOutputArtifactRows::Dense(rows) => {
+                    for (local_row, row) in rows[local_start..local_end].iter().enumerate() {
+                        let global_row = global_start
+                            .saturating_add(local_start)
+                            .saturating_add(local_row);
+                        let destination_row = global_row.saturating_sub(context.visible_rows.start);
+                        context.buffer.set_line(
+                            context.area.x,
+                            context.area.y.saturating_add(destination_row as u16),
+                            &row.line.clone().style(context.theme.style(row.role)),
+                            context.area.width,
+                        );
+                    }
+                }
+                ToolOutputArtifactRows::Sparse {
+                    encoded,
+                    default_role,
+                    line_roles,
+                    ..
+                } => {
+                    let ranges = self
+                        .row_index
+                        .sparse_row_ranges(segment, local_start..local_end);
+                    for (local_row, range) in ranges.into_iter().enumerate() {
+                        let global_row = global_start
+                            .saturating_add(local_start)
+                            .saturating_add(local_row);
+                        let destination_row = global_row.saturating_sub(context.visible_rows.start);
+                        let role = self
+                            .row_index
+                            .anchor_at(global_row)
+                            .and_then(|anchor| line_roles.get(anchor.logical_line).copied())
+                            .unwrap_or(*default_role);
+                        context.buffer.set_line(
+                            context.area.x,
+                            context.area.y.saturating_add(destination_row as u16),
+                            &Line::styled(encoded[range].to_owned(), context.theme.style(role)),
+                            context.area.width,
+                        );
+                    }
+                }
+            }
+            global_start = global_end;
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalAppendResult {
+    indexed_rows: usize,
+    logical_lines: usize,
+    tail_logical_column: usize,
+    tail_rendered_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SparseTerminalAppendResult {
+    appended: TerminalAppendResult,
+    first_changed_row: usize,
+}
+
+fn terminal_tail_state(output: &str) -> TerminalAppendResult {
+    let logical_lines = output
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        .saturating_add(1);
+    let tail = output.rsplit('\n').next().unwrap_or_default();
+    let initial_column = if logical_lines == 1 { 2 } else { 0 };
+    let safe = crate::composer::safe_single_line(tail, initial_column);
+    TerminalAppendResult {
+        indexed_rows: 0,
+        logical_lines,
+        tail_logical_column: initial_column.saturating_add(UnicodeWidthStr::width(safe.as_str())),
+        tail_rendered_bytes: "│ ".len().saturating_add(safe.len()),
+    }
+}
+
+fn append_terminal_suffix(
+    rows: &mut Vec<ToolOutputRow>,
+    suffix: &str,
+    width: usize,
+    terminal: &TerminalOutputIndex,
+) -> TerminalAppendResult {
+    let mut logical_lines = terminal.logical_lines;
+    let mut logical_column = terminal.tail_logical_column;
+    let mut rendered_bytes = terminal.tail_rendered_bytes;
+    let mut indexed_rows = 0usize;
+
+    for (part_index, part) in suffix.split('\n').enumerate() {
+        if part_index > 0 {
+            logical_lines = logical_lines.saturating_add(1);
+            logical_column = 0;
+            rendered_bytes = "│ ".len();
+            let line = Line::from(format!(
+                "│ {}",
+                crate::composer::safe_single_line(part, logical_column)
+            ));
+            let before = rows.len();
+            push_indexed_output_line(
+                rows,
+                line,
+                ThemeRole::Text,
+                terminal.segment,
+                logical_lines.saturating_sub(1),
+                width,
+            );
+            indexed_rows = indexed_rows.saturating_add(rows.len().saturating_sub(before));
+        } else if !part.is_empty() {
+            let safe = crate::composer::safe_single_line(part, logical_column);
+            let Some(previous) = rows.pop() else {
+                return terminal_tail_state(suffix);
+            };
+            let anchor = previous.anchor;
+            let line = Line::from(format!("{}{}", previous.line, safe));
+            let before = rows.len();
+            push_indexed_output_line_from(rows, line, ThemeRole::Text, anchor, width);
+            indexed_rows = indexed_rows.saturating_add(rows.len().saturating_sub(before));
+        }
+
+        let safe = crate::composer::safe_single_line(part, logical_column);
+        logical_column = logical_column.saturating_add(UnicodeWidthStr::width(safe.as_str()));
+        rendered_bytes = rendered_bytes.saturating_add(safe.len());
+    }
+
+    TerminalAppendResult {
+        indexed_rows,
+        logical_lines,
+        tail_logical_column: logical_column,
+        tail_rendered_bytes: rendered_bytes,
+    }
+}
+
+fn append_sparse_terminal_suffix(
+    encoded: &mut String,
+    row_count: &mut usize,
+    suffix: &str,
+    width: usize,
+    terminal: &TerminalOutputIndex,
+) -> SparseTerminalAppendResult {
+    let original_rows = *row_count;
+    let mut first_changed_row = original_rows;
+    let mut logical_lines = terminal.logical_lines;
+    let mut logical_column = terminal.tail_logical_column;
+    let mut rendered_bytes = terminal.tail_rendered_bytes;
+    let mut indexed_rows = 0usize;
+
+    for (part_index, part) in suffix.split('\n').enumerate() {
+        let initial_column = if part_index == 0 { logical_column } else { 0 };
+        let safe = crate::composer::safe_single_line(part, initial_column);
+        if part_index == 0 {
+            if !part.is_empty() {
+                let row_start = encoded
+                    .rfind(['\n', '\r'])
+                    .map_or(0, |delimiter| delimiter.saturating_add(1));
+                let mut replacement = encoded[row_start..].to_owned();
+                replacement.push_str(&safe);
+                encoded.truncate(row_start);
+                let replacement_rows = append_sparse_wrapped_line(encoded, &replacement, width);
+                *row_count = row_count.saturating_sub(1).saturating_add(replacement_rows);
+                indexed_rows = indexed_rows.saturating_add(replacement_rows);
+                first_changed_row = original_rows.saturating_sub(1);
+            }
+        } else {
+            logical_lines = logical_lines.saturating_add(1);
+            logical_column = 0;
+            rendered_bytes = "│ ".len();
+            encoded.push('\r');
+            let decorated = format!("│ {safe}");
+            let appended_rows = append_sparse_wrapped_line(encoded, &decorated, width);
+            *row_count = row_count.saturating_add(appended_rows);
+            indexed_rows = indexed_rows.saturating_add(appended_rows);
+        }
+        logical_column = logical_column.saturating_add(UnicodeWidthStr::width(safe.as_str()));
+        rendered_bytes = rendered_bytes.saturating_add(safe.len());
+    }
+
+    SparseTerminalAppendResult {
+        appended: TerminalAppendResult {
+            indexed_rows,
+            logical_lines,
+            tail_logical_column: logical_column,
+            tail_rendered_bytes: rendered_bytes,
+        },
+        first_changed_row,
+    }
+}
+
+fn enforce_tool_output_cache_bounds(inner: &mut RenderCacheInner) {
+    while inner.tool_output_layouts.len() > TOOL_OUTPUT_LAYOUT_CACHE_CAPACITY
+        || inner.tool_output_layout_bytes > TOOL_OUTPUT_LAYOUT_CACHE_BYTES
+    {
+        let Some(evicted) = inner.tool_output_layouts.pop_front() else {
+            break;
+        };
+        inner.tool_output_layout_bytes =
+            inner.tool_output_layout_bytes.saturating_sub(evicted.bytes);
     }
 }
 
@@ -700,6 +1109,7 @@ impl TranscriptRenderCache {
             revision: entry.revision(),
             width,
         };
+        let output_epoch = entry.tool_output_epoch();
         let mut inner = self.inner.borrow_mut();
         if let Some(index) = inner
             .tool_output_layouts
@@ -711,11 +1121,55 @@ impl TranscriptRenderCache {
             inner.tool_output_layouts.push_back(cached);
             return Some(layout);
         }
+        let incremental = inner
+            .tool_output_layouts
+            .iter()
+            .rposition(|cached| {
+                cached.entry_id == entry.id
+                    && cached.key.width == width
+                    && cached.output_epoch == output_epoch
+            })
+            .and_then(|index| inner.tool_output_layouts.remove(index));
+        if let Some(cached) = &incremental {
+            inner.tool_output_layout_bytes =
+                inner.tool_output_layout_bytes.saturating_sub(cached.bytes);
+        }
         drop(inner);
+
+        if let Some(cached) = incremental
+            && let Ok(mut layout) = Arc::try_unwrap(cached.layout)
+            && let Some(indexed_rows) = layout.append_terminal_output(tool, width)
+        {
+            let bytes = layout.bytes();
+            let layout = Arc::new(layout);
+            let mut inner = self.inner.borrow_mut();
+            inner.tool_output_rows_indexed =
+                inner.tool_output_rows_indexed.saturating_add(indexed_rows);
+            inner.tool_output_layout_bytes = inner.tool_output_layout_bytes.saturating_add(bytes);
+            inner.tool_output_layouts.push_back(CachedToolOutputLayout {
+                entry_id: entry.id,
+                key,
+                output_epoch,
+                layout: Arc::clone(&layout),
+                bytes,
+            });
+            enforce_tool_output_cache_bounds(&mut inner);
+            return Some(layout);
+        }
 
         let layout = Arc::new(build_tool_output_layout(tool, width));
         let bytes = layout.bytes();
         let mut inner = self.inner.borrow_mut();
+        let mut retained = VecDeque::with_capacity(inner.tool_output_layouts.len());
+        while let Some(cached) = inner.tool_output_layouts.pop_front() {
+            if cached.entry_id == entry.id && cached.key.width == width {
+                inner.tool_output_layout_bytes =
+                    inner.tool_output_layout_bytes.saturating_sub(cached.bytes);
+            } else {
+                retained.push_back(cached);
+            }
+        }
+        inner.tool_output_layouts = retained;
         inner.tool_output_layout_builds = inner.tool_output_layout_builds.saturating_add(1);
         inner.tool_output_rows_indexed = inner
             .tool_output_rows_indexed
@@ -724,19 +1178,11 @@ impl TranscriptRenderCache {
         inner.tool_output_layouts.push_back(CachedToolOutputLayout {
             entry_id: entry.id,
             key,
+            output_epoch,
             layout: Arc::clone(&layout),
             bytes,
         });
-        while (inner.tool_output_layouts.len() > TOOL_OUTPUT_LAYOUT_CACHE_CAPACITY
-            || inner.tool_output_layout_bytes > TOOL_OUTPUT_LAYOUT_CACHE_BYTES)
-            && inner.tool_output_layouts.len() > 1
-        {
-            let Some(evicted) = inner.tool_output_layouts.pop_front() else {
-                break;
-            };
-            inner.tool_output_layout_bytes =
-                inner.tool_output_layout_bytes.saturating_sub(evicted.bytes);
-        }
+        enforce_tool_output_cache_bounds(&mut inner);
         Some(layout)
     }
 
@@ -753,6 +1199,31 @@ impl TranscriptRenderCache {
             inner.tool_output_rows_indexed,
             inner.tool_output_rows_rendered,
         )
+    }
+
+    #[cfg(test)]
+    fn tool_output_cache_stats(&self) -> (usize, usize) {
+        let inner = self.inner.borrow();
+        (
+            inner.tool_output_layouts.len(),
+            inner.tool_output_layout_bytes,
+        )
+    }
+
+    #[cfg(test)]
+    fn tool_output_sparse_layouts(&self) -> usize {
+        self.inner
+            .borrow()
+            .tool_output_layouts
+            .iter()
+            .filter(|cached| {
+                cached
+                    .layout
+                    .artifacts
+                    .iter()
+                    .any(|artifact| matches!(artifact.rows, ToolOutputArtifactRows::Sparse { .. }))
+            })
+            .count()
     }
 
     #[cfg(test)]
@@ -1198,9 +1669,7 @@ impl<'a> EntryRenderer<'a> {
             .map(|layout| layout.maximum),
             _ => None,
         };
-        let output_logical_lines = output_body_layout
-            .as_ref()
-            .map(|layout| layout.logical_lines());
+        let output_row_index = output_body_layout.as_ref().map(|layout| layout.row_index());
         Self {
             entry,
             cache,
@@ -1213,7 +1682,11 @@ impl<'a> EntryRenderer<'a> {
                     app.tool_output_scroll_offset_for_layout(
                         entry.id,
                         maximum,
-                        output_logical_lines.as_ref(),
+                        ToolOutputLayoutId {
+                            revision: entry.revision(),
+                            width,
+                        },
+                        output_row_index.as_ref(),
                     )
                 })
                 .unwrap_or_default(),
@@ -1280,7 +1753,11 @@ impl<'a> EntryRenderer<'a> {
         Some(ToolOutputScrollMetrics {
             entry_id: self.entry.id,
             maximum: self.output_scroll_maximum(width)?,
-            logical_lines: self.output_body_layout.as_ref()?.logical_lines(),
+            layout_id: ToolOutputLayoutId {
+                revision: self.entry.revision(),
+                width,
+            },
+            row_index: self.output_body_layout.as_ref()?.row_index(),
         })
     }
 }
@@ -1330,9 +1807,32 @@ pub(super) fn render(
 
     let width = content_area.width.max(1) as usize;
     let full_available_height = content_area.height as usize;
-    let visibly_manual = app.transcript_has_manual_scroll_offset();
-    let available_height = full_available_height.saturating_sub(usize::from(visibly_manual));
-    let reflow_top = ensure_layout_index(app, width, available_height, cache);
+    let (visibly_manual, available_height, reflow_top) = if app.transcript_is_following() {
+        (
+            false,
+            full_available_height,
+            ensure_layout_index(app, width, full_available_height, cache),
+        )
+    } else {
+        let paused_height = full_available_height.saturating_sub(1);
+        let paused_reflow_top = ensure_layout_index(app, width, paused_height, cache);
+        let paused_next_line = cache
+            .index
+            .borrow()
+            .entries
+            .last()
+            .map_or(0, |entry| entry.end);
+        let paused_maximum = paused_next_line.saturating_sub(paused_height);
+        if app.transcript_scroll_offset(paused_maximum) > 0 {
+            (true, paused_height, paused_reflow_top)
+        } else {
+            (
+                false,
+                full_available_height,
+                ensure_layout_index(app, width, full_available_height, cache),
+            )
+        }
+    };
     let index = cache.index.borrow();
     let next_line = index.entries.last().map_or(0, |entry| entry.end);
     let viewport_area = if !visibly_manual {
@@ -1618,16 +2118,16 @@ fn measured_entry_height(
     available_height: usize,
     cache: &TranscriptRenderCache,
 ) -> usize {
-    let renderer = EntryRenderer::new(entry, app, cache, width, available_height);
     let key = HeightKey {
         revision: entry.revision(),
         width,
         available_height,
-        expanded: renderer.expanded,
+        expanded: app.transcript_entry_is_expanded(entry),
     };
     if let Some(height) = cache.height(entry.id, key) {
         return height;
     }
+    let renderer = EntryRenderer::new(entry, app, cache, width, available_height);
     let height = renderer.height(width);
     cache.store_height(entry.id, key, height);
     height
@@ -2489,9 +2989,91 @@ fn output_artifacts(tool: &ToolCall) -> impl Iterator<Item = &ToolArtifact> {
 }
 
 fn build_tool_output_layout(tool: &ToolCall, width: usize) -> ToolOutputBodyLayout {
+    if tool_output_should_be_sparse(tool, width) {
+        return build_sparse_tool_output_layout(tool, width);
+    }
+    build_dense_tool_output_layout(tool, width)
+}
+
+fn tool_output_should_be_sparse(tool: &ToolCall, width: usize) -> bool {
+    tool_output_source_bytes(tool) >= TOOL_OUTPUT_SPARSE_SOURCE_BYTES
+        || estimated_tool_output_rows(tool, width)
+            .saturating_mul(TOOL_OUTPUT_DENSE_ROW_ESTIMATED_BYTES)
+            >= TOOL_OUTPUT_LAYOUT_CACHE_BYTES
+}
+
+fn tool_output_source_bytes(tool: &ToolCall) -> usize {
+    output_artifacts(tool).fold(0usize, |bytes, artifact| {
+        bytes.saturating_add(match artifact {
+            ToolArtifact::Patch(artifact) => artifact.diff.len(),
+            ToolArtifact::SearchResults(artifact) => artifact.matches.len(),
+            ToolArtifact::Terminal(artifact) => artifact.output.len(),
+            ToolArtifact::TextDetail(artifact) => artifact.text.len(),
+            ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_) => 0,
+        })
+    })
+}
+
+fn estimated_tool_output_rows(tool: &ToolCall, width: usize) -> usize {
+    let width = width.max(1);
+    output_artifacts(tool).fold(0usize, |rows, artifact| {
+        let (source, logical_lines) = match artifact {
+            ToolArtifact::Patch(artifact) => {
+                (artifact.diff.as_str(), artifact.diff.lines().count())
+            }
+            ToolArtifact::SearchResults(artifact) => (
+                artifact.matches.as_str(),
+                message_logical_line_count(&artifact.matches),
+            ),
+            ToolArtifact::Terminal(artifact) => (
+                artifact.output.as_str(),
+                message_logical_line_count(&artifact.output),
+            ),
+            ToolArtifact::TextDetail(artifact) => (
+                artifact.text.as_str(),
+                message_logical_line_count(&artifact.text),
+            ),
+            ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_) => ("", 0),
+        };
+        let content_wraps = source.len().div_ceil(width);
+        let prefix_wraps = logical_lines.saturating_mul(2).div_ceil(width);
+        rows.saturating_add(logical_lines)
+            .saturating_add(content_wraps)
+            .saturating_add(prefix_wraps)
+    })
+}
+
+fn estimated_message_fragment_rows(source: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let logical_lines = message_logical_line_count(source);
+    logical_lines
+        .saturating_add(source.len().div_ceil(width))
+        .saturating_add(logical_lines.saturating_mul(2).div_ceil(width))
+}
+
+fn message_logical_line_count(source: &str) -> usize {
+    source
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        .saturating_add(1)
+}
+
+fn build_dense_tool_output_layout(tool: &ToolCall, width: usize) -> ToolOutputBodyLayout {
     let mut layout = ToolOutputBodyLayout::default();
-    let mut logical_line = 0usize;
-    for artifact in output_artifacts(tool) {
+    for (artifact_index, artifact) in tool.artifacts.iter().enumerate() {
+        if !matches!(
+            artifact,
+            ToolArtifact::Patch(_)
+                | ToolArtifact::SearchResults(_)
+                | ToolArtifact::Terminal(_)
+                | ToolArtifact::TextDetail(_)
+        ) {
+            continue;
+        }
+        let segment = layout.artifacts.len();
+        let mut rows = Vec::new();
+        let mut logical_line = 0usize;
         match artifact {
             ToolArtifact::Patch(artifact) => {
                 for source in artifact.diff.lines() {
@@ -2506,16 +3088,17 @@ fn build_tool_output_layout(tool: &ToolCall, width: usize) -> ToolOutputBodyLayo
                         "│ {}",
                         crate::composer::safe_single_line(source, 2)
                     ));
-                    push_indexed_output_line(&mut layout, line, role, logical_line, width);
+                    push_indexed_output_line(&mut rows, line, role, segment, logical_line, width);
                     logical_line = logical_line.saturating_add(1);
                 }
             }
             ToolArtifact::SearchResults(artifact) => {
                 for line in message_line_iter(&artifact.matches, ratatui::style::Style::default()) {
                     push_indexed_output_line(
-                        &mut layout,
+                        &mut rows,
                         line,
                         ThemeRole::MutedText,
+                        segment,
                         logical_line,
                         width,
                     );
@@ -2525,21 +3108,34 @@ fn build_tool_output_layout(tool: &ToolCall, width: usize) -> ToolOutputBodyLayo
             ToolArtifact::Terminal(artifact) => {
                 for line in message_line_iter(&artifact.output, ratatui::style::Style::default()) {
                     push_indexed_output_line(
-                        &mut layout,
+                        &mut rows,
                         line,
                         ThemeRole::Text,
+                        segment,
                         logical_line,
                         width,
                     );
                     logical_line = logical_line.saturating_add(1);
                 }
+                if layout.terminal.is_none() {
+                    let tail = terminal_tail_state(&artifact.output);
+                    layout.terminal = Some(TerminalOutputIndex {
+                        segment,
+                        artifact_index,
+                        source_len: artifact.output.len(),
+                        logical_lines: tail.logical_lines,
+                        tail_logical_column: tail.tail_logical_column,
+                        tail_rendered_bytes: tail.tail_rendered_bytes,
+                    });
+                }
             }
             ToolArtifact::TextDetail(artifact) => {
                 for line in message_line_iter(&artifact.text, ratatui::style::Style::default()) {
                     push_indexed_output_line(
-                        &mut layout,
+                        &mut rows,
                         line,
                         ThemeRole::MutedText,
+                        segment,
                         logical_line,
                         width,
                     );
@@ -2548,30 +3144,183 @@ fn build_tool_output_layout(tool: &ToolCall, width: usize) -> ToolOutputBodyLayo
             }
             ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_) => {}
         }
+        layout.artifacts.push(ToolOutputArtifactLayout {
+            rows: ToolOutputArtifactRows::Dense(rows),
+        });
     }
-    layout.logical_lines = layout
-        .rows
-        .iter()
-        .map(|row| row.logical_line)
-        .collect::<Vec<_>>()
-        .into();
+    layout.row_index = Arc::new(ToolOutputRowIndex::new(
+        layout
+            .artifacts
+            .iter()
+            .map(|artifact| match &artifact.rows {
+                ToolOutputArtifactRows::Dense(rows) => rows.iter().map(|row| row.anchor).collect(),
+                ToolOutputArtifactRows::Sparse { .. } => Vec::new(),
+            })
+            .collect(),
+    ));
     layout
 }
 
+fn build_sparse_tool_output_layout(tool: &ToolCall, width: usize) -> ToolOutputBodyLayout {
+    let mut layout = ToolOutputBodyLayout::default();
+    let mut sparse_segments = Vec::new();
+    for (artifact_index, artifact) in tool.artifacts.iter().enumerate() {
+        if !matches!(
+            artifact,
+            ToolArtifact::Patch(_)
+                | ToolArtifact::SearchResults(_)
+                | ToolArtifact::Terminal(_)
+                | ToolArtifact::TextDetail(_)
+        ) {
+            continue;
+        }
+        let segment = layout.artifacts.len();
+        let (encoded, row_count, default_role, line_roles) =
+            build_sparse_artifact_rows(artifact, width);
+        let encoded = Arc::new(encoded);
+        sparse_segments.push((Arc::clone(&encoded), row_count));
+        layout.artifacts.push(ToolOutputArtifactLayout {
+            rows: ToolOutputArtifactRows::Sparse {
+                encoded,
+                row_count,
+                default_role,
+                line_roles,
+            },
+        });
+        if layout.terminal.is_none()
+            && let ToolArtifact::Terminal(artifact) = artifact
+        {
+            let tail = terminal_tail_state(&artifact.output);
+            layout.terminal = Some(TerminalOutputIndex {
+                segment,
+                artifact_index,
+                source_len: artifact.output.len(),
+                logical_lines: tail.logical_lines,
+                tail_logical_column: tail.tail_logical_column,
+                tail_rendered_bytes: tail.tail_rendered_bytes,
+            });
+        }
+    }
+    layout.row_index = Arc::new(ToolOutputRowIndex::new_sparse(&sparse_segments));
+    layout
+}
+
+fn build_sparse_artifact_rows(
+    artifact: &ToolArtifact,
+    width: usize,
+) -> (String, usize, ThemeRole, Vec<ThemeRole>) {
+    let mut encoded = String::new();
+    let mut row_count = 0usize;
+    let mut line_roles = Vec::new();
+    let (source, default_role, patch) = match artifact {
+        ToolArtifact::Patch(artifact) => (artifact.diff.as_str(), ThemeRole::MutedText, true),
+        ToolArtifact::SearchResults(artifact) => {
+            (artifact.matches.as_str(), ThemeRole::MutedText, false)
+        }
+        ToolArtifact::Terminal(artifact) => (artifact.output.as_str(), ThemeRole::Text, false),
+        ToolArtifact::TextDetail(artifact) => (artifact.text.as_str(), ThemeRole::MutedText, false),
+        ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_) => {
+            return (encoded, row_count, ThemeRole::MutedText, line_roles);
+        }
+    };
+    let empty_message = !patch && source.is_empty();
+    let lines: Box<dyn Iterator<Item = &str>> = if patch {
+        Box::new(source.lines())
+    } else if empty_message {
+        Box::new(std::iter::once(""))
+    } else {
+        Box::new(source.split('\n'))
+    };
+    for (logical_line, source) in lines.enumerate() {
+        if logical_line > 0 {
+            encoded.push('\r');
+        }
+        let role = if patch {
+            if source.starts_with('+') && !source.starts_with("+++") {
+                ThemeRole::DiffAdded
+            } else if source.starts_with('-') && !source.starts_with("---") {
+                ThemeRole::DiffRemoved
+            } else {
+                ThemeRole::MutedText
+            }
+        } else {
+            default_role
+        };
+        if patch {
+            line_roles.push(role);
+        }
+        let decorated = if empty_message {
+            "│".to_owned()
+        } else {
+            format!(
+                "│ {}",
+                crate::composer::safe_single_line(
+                    source,
+                    if patch || logical_line == 0 { 2 } else { 0 }
+                )
+            )
+        };
+        row_count =
+            row_count.saturating_add(append_sparse_wrapped_line(&mut encoded, &decorated, width));
+    }
+    (encoded, row_count, default_role, line_roles)
+}
+
+fn append_sparse_wrapped_line(encoded: &mut String, line: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut column = 0usize;
+    for grapheme in line.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+        if column > 0 && column.saturating_add(grapheme_width) > width {
+            encoded.push('\n');
+            rows = rows.saturating_add(1);
+            column = 0;
+        }
+        encoded.push_str(grapheme);
+        column = column.saturating_add(grapheme_width);
+    }
+    rows
+}
+
 fn push_indexed_output_line(
-    layout: &mut ToolOutputBodyLayout,
+    rows: &mut Vec<ToolOutputRow>,
     line: Line<'static>,
     role: ThemeRole,
+    artifact: usize,
     logical_line: usize,
     width: usize,
 ) {
-    layout.rows.extend(
-        wrap_lines(&[line], width)
+    push_indexed_output_line_from(
+        rows,
+        line,
+        role,
+        ToolOutputRowAnchor {
+            artifact,
+            logical_line,
+            source_byte: 0,
+        },
+        width,
+    );
+}
+
+fn push_indexed_output_line_from(
+    rows: &mut Vec<ToolOutputRow>,
+    line: Line<'static>,
+    role: ThemeRole,
+    base_anchor: ToolOutputRowAnchor,
+    width: usize,
+) {
+    rows.extend(
+        wrap_indexed_line(line, width)
             .into_iter()
-            .map(|line| ToolOutputRow {
+            .map(|(line, source_byte)| ToolOutputRow {
                 line,
                 role,
-                logical_line,
+                anchor: ToolOutputRowAnchor {
+                    source_byte: base_anchor.source_byte.saturating_add(source_byte),
+                    ..base_anchor
+                },
             }),
     );
 }
@@ -2721,13 +3470,7 @@ fn generic_tool_lines(tool: &ToolCall, theme: &Theme) -> Vec<Line<'static>> {
 }
 
 fn tool_is_summary_only(tool: &ToolCall) -> bool {
-    tool.name == "read_file"
-        || tool.artifacts.iter().any(|artifact| {
-            matches!(
-                artifact,
-                ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_)
-            )
-        })
+    tool.name == "read_file" || output_artifacts(tool).next().is_none()
 }
 
 fn tool_summary_lines(tool: &ToolCall, theme: &Theme) -> Vec<Line<'static>> {
@@ -2860,12 +3603,21 @@ fn message_line_iter(
     text: &str,
     style: ratatui::style::Style,
 ) -> Box<dyn Iterator<Item = Line<'static>> + '_> {
+    message_line_iter_from(text, style, 0)
+}
+
+fn message_line_iter_from(
+    text: &str,
+    style: ratatui::style::Style,
+    starting_line: usize,
+) -> Box<dyn Iterator<Item = Line<'static>> + '_> {
     if text.is_empty() {
         return Box::new(std::iter::once(Line::styled("│", style)));
     }
     Box::new(text.split('\n').enumerate().flat_map(move |(index, text)| {
+        let logical_line = starting_line.saturating_add(index);
         crate::composer::SubmittedContent::plain(text)
-            .display_lines(if index == 0 { 2 } else { 0 })
+            .display_lines(if logical_line == 0 { 2 } else { 0 })
             .into_iter()
             .map(move |line| {
                 let mut spans = vec![Span::styled("│ ", style)];
@@ -2986,6 +3738,37 @@ fn wrap_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
         }
         output.push(Line::from(spans));
     }
+    output
+}
+
+fn wrap_indexed_line(line: Line<'static>, width: usize) -> Vec<(Line<'static>, usize)> {
+    let width = width.max(1);
+    let mut output = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut column = 0usize;
+    let mut source_byte = 0usize;
+    let mut row_source_byte = 0usize;
+    for span in line.spans {
+        let style = line.style.patch(span.style);
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+            if column > 0 && column.saturating_add(grapheme_width) > width {
+                output.push((Line::from(std::mem::take(&mut spans)), row_source_byte));
+                column = 0;
+                row_source_byte = source_byte;
+            }
+            if let Some(previous) = spans.last_mut()
+                && previous.style == style
+            {
+                previous.content.to_mut().push_str(grapheme);
+            } else {
+                spans.push(Span::styled(grapheme.to_owned(), style));
+            }
+            column = column.saturating_add(grapheme_width);
+            source_byte = source_byte.saturating_add(grapheme.len());
+        }
+    }
+    output.push((Line::from(spans), row_source_byte));
     output
 }
 
@@ -3595,12 +4378,21 @@ mod tests {
             summary: "Inspect outputs".into(),
             status: ActivityStatus::Completed,
             artifacts: vec![
+                ToolArtifact::CodeRange(CodeRangeArtifact {
+                    path: "src/main.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    preview: Some("private read preview".into()),
+                }),
                 ToolArtifact::TextDetail(TextDetailArtifact {
                     text: "first output".into(),
                 }),
                 ToolArtifact::SearchResults(SearchResultsArtifact {
                     query: "second".into(),
                     matches: "second output".into(),
+                }),
+                ToolArtifact::FileReference(FileReferenceArtifact {
+                    path: "src/other.rs".into(),
                 }),
             ],
         };
@@ -3617,6 +4409,8 @@ mod tests {
         assert!(text.contains("first output"));
         assert!(text.contains("Search /second/"));
         assert!(text.contains("second output"));
+        assert!(!text.contains("private read preview"));
+        assert!(!text.contains("Read File:"));
     }
 
     #[test]
@@ -3710,6 +4504,54 @@ mod tests {
         assert!(paused.contains("End to follow"));
         assert_eq!(index.key.expect("index key").available_height, 19);
         assert_eq!(measured.end.saturating_sub(measured.start), 19);
+    }
+
+    #[test]
+    fn retained_outer_scroll_anchor_at_the_tail_hides_the_follow_banner() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 95,
+            name: "terminal".into(),
+            summary: "Run output".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Run output".into(),
+                command: "generate-output".into(),
+                output: (1..=40)
+                    .map(|line| format!("output {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                exit_code: None,
+            })],
+        });
+        let tool_id = app
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry.kind, crate::transcript::EntryKind::Tool(_)))
+            .expect("tool entry")
+            .id;
+        app.activate_transcript_entry(tool_id);
+
+        app.update_transcript_scroll_maximum(100);
+        assert!(app.scroll_transcript_up());
+        assert_eq!(app.transcript_scroll_offset(100), 5);
+
+        let (rendered, result) = render_transcript_at(&app, &cache, &Theme::default(), 80, 20);
+        assert_eq!(app.transcript_scroll_offset(result.scroll_maximum), 0);
+        assert!(!rendered.contains("End to follow"));
+        let index = cache.index.borrow();
+        let measured = index
+            .entries
+            .iter()
+            .find(|entry| entry.id == tool_id)
+            .expect("indexed tool entry");
+        assert_eq!(index.key.expect("index key").available_height, 20);
+        assert_eq!(measured.end.saturating_sub(measured.start), 20);
     }
 
     #[test]
@@ -3860,13 +4702,446 @@ mod tests {
     }
 
     #[test]
-    fn paused_output_reflows_to_the_same_logical_source_line() {
+    fn oversized_output_reuses_bounded_indexing_across_redraw_and_scroll() {
         let mut app = App::new();
         let cache = TranscriptRenderCache::default();
-        let output = (1..=40)
-            .map(|line| format!("source line {line}: {}", "content ".repeat(18)))
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 98,
+            name: "terminal".into(),
+            summary: "Render oversized output".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Oversized output".into(),
+                command: "generate-oversized-output".into(),
+                output: (0..100_000)
+                    .map(|line| {
+                        if line >= 99_980 {
+                            format!("oversized {line}")
+                        } else {
+                            "oversized".to_owned()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                exit_code: None,
+            })],
+        });
+
+        let tool_id = app
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry.kind, crate::transcript::EntryKind::Tool(_)))
+            .expect("tool entry")
+            .id;
+
+        let (rendered, first) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        app.update_tool_output_scroll_metrics(&first.output_scroll_metrics);
+        let first_stats = cache.tool_output_stats();
+        app.scroll_tool_output_by(tool_id, 1);
+        let (scrolled, _) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        let second_stats = cache.tool_output_stats();
+        let (entries, bytes) = cache.tool_output_cache_stats();
+
+        assert!(rendered.contains("oversized 99999"));
+        assert!(scrolled.contains("oversized 99994"));
+        assert!(!scrolled.contains("oversized 99999"));
+        assert_eq!(first_stats.0, 1);
+        assert_eq!(second_stats.0, first_stats.0);
+        assert_eq!(second_stats.1, first_stats.1);
+        assert!(second_stats.2.saturating_sub(first_stats.2) <= super::COMPACT_OUTPUT_ROWS);
+        assert_eq!(entries, 1);
+        assert!(bytes <= super::TOOL_OUTPUT_LAYOUT_CACHE_BYTES);
+    }
+
+    #[test]
+    fn sparse_terminal_streaming_indexes_only_appended_chunks() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 99,
+            name: "terminal".into(),
+            summary: "Stream oversized output".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Oversized stream".into(),
+                command: "stream-oversized-output".into(),
+                output: "seed\n".repeat(105_000),
+                exit_code: None,
+            })],
+        });
+
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        let initial = cache.tool_output_stats();
+        assert_eq!(initial.0, 1);
+
+        let mut rendered = String::new();
+        for chunk in 0..5 {
+            app.transcript.apply(TranscriptEvent::ToolOutputDelta {
+                turn_id: 1,
+                call_id: 99,
+                chunk: format!("{}delta-{chunk}\n", "x\n".repeat(2_000)),
+            });
+            rendered = render_transcript_at(&app, &cache, &Theme::default(), 80, 24).0;
+        }
+        for chunk in ["partial-sparse-tail", "-continued"] {
+            app.transcript.apply(TranscriptEvent::ToolOutputDelta {
+                turn_id: 1,
+                call_id: 99,
+                chunk: chunk.into(),
+            });
+            rendered = render_transcript_at(&app, &cache, &Theme::default(), 80, 24).0;
+        }
+
+        let final_stats = cache.tool_output_stats();
+        let (entries, bytes) = cache.tool_output_cache_stats();
+        assert!(rendered.contains("partial-sparse-tail-continued"));
+        assert_eq!(
+            final_stats.0, initial.0,
+            "sparse deltas must not trigger whole-layout rebuilds"
+        );
+        assert!(
+            final_stats.1.saturating_sub(initial.1) <= 10_055,
+            "only appended sparse rows should be indexed: {initial:?} -> {final_stats:?}"
+        );
+        assert_eq!(entries, 1);
+        assert!(bytes <= super::TOOL_OUTPUT_LAYOUT_CACHE_BYTES);
+    }
+
+    #[test]
+    fn row_heavy_subthreshold_output_reuses_a_bounded_sparse_index() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        let output = "x\n".repeat(250_000);
+        assert!(output.len() < super::TOOL_OUTPUT_SPARSE_SOURCE_BYTES);
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 100,
+            name: "terminal".into(),
+            summary: "Render row-heavy output".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Row-heavy output".into(),
+                command: "generate-short-lines".into(),
+                output,
+                exit_code: None,
+            })],
+        });
+
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        let first = cache.tool_output_stats();
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        let second = cache.tool_output_stats();
+        let (entries, bytes) = cache.tool_output_cache_stats();
+
+        assert_eq!(first.0, 1);
+        assert_eq!(second.0, first.0, "unchanged redraw must reuse its index");
+        assert_eq!(second.1, first.1);
+        assert_eq!(entries, 1);
+        assert!(bytes <= super::TOOL_OUTPUT_LAYOUT_CACHE_BYTES);
+    }
+
+    #[test]
+    fn dense_terminal_stream_promotes_once_before_exceeding_the_memory_bound() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 101,
+            name: "terminal".into(),
+            summary: "Grow a row-heavy stream".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Growing row-heavy stream".into(),
+                command: "stream-short-lines".into(),
+                output: "x\n".repeat(10_000),
+                exit_code: None,
+            })],
+        });
+
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        let initial = cache.tool_output_stats();
+        assert_eq!(initial.0, 1);
+        assert_eq!(
+            cache.tool_output_sparse_layouts(),
+            0,
+            "the regression must begin with a dense layout"
+        );
+
+        let mut rendered = String::new();
+        for chunk in 0..10 {
+            app.transcript.apply(TranscriptEvent::ToolOutputDelta {
+                turn_id: 1,
+                call_id: 101,
+                chunk: format!("{}promotion-{chunk}\n", "x\n".repeat(2_000)),
+            });
+            rendered = render_transcript_at(&app, &cache, &Theme::default(), 80, 24).0;
+        }
+
+        let final_stats = cache.tool_output_stats();
+        let (entries, bytes) = cache.tool_output_cache_stats();
+        assert!(rendered.contains("promotion-9"));
+        assert_eq!(
+            final_stats.0, initial.0,
+            "dense-to-sparse promotion must stay inside the incremental layout path"
+        );
+        assert!(
+            final_stats.1.saturating_sub(initial.1) <= 65_000,
+            "promotion may index the current body once, never once per later delta"
+        );
+        assert_eq!(entries, 1);
+        assert!(bytes <= super::TOOL_OUTPUT_LAYOUT_CACHE_BYTES);
+        assert_eq!(
+            cache.tool_output_sparse_layouts(),
+            1,
+            "the growing layout must promote to sparse storage"
+        );
+    }
+
+    #[test]
+    fn dense_terminal_stream_crosses_the_source_byte_threshold_once() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        let initial_output = "x".repeat(super::TOOL_OUTPUT_SPARSE_SOURCE_BYTES - 16 * 1024);
+        assert!(initial_output.len() < super::TOOL_OUTPUT_SPARSE_SOURCE_BYTES);
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 102,
+            name: "terminal".into(),
+            summary: "Cross the sparse source threshold".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Low-row-cost growing stream".into(),
+                command: "stream-long-lines".into(),
+                output: initial_output,
+                exit_code: None,
+            })],
+        });
+
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        let dense = cache.tool_output_stats();
+        assert_eq!(dense.0, 1);
+        assert_eq!(
+            cache.tool_output_sparse_layouts(),
+            0,
+            "low-row-cost output below 512 KiB must begin dense"
+        );
+
+        app.transcript.apply(TranscriptEvent::ToolOutputDelta {
+            turn_id: 1,
+            call_id: 102,
+            chunk: format!("{}\nsource-threshold-crossed\n", "y".repeat(16 * 1024)),
+        });
+        let promoted_render = render_transcript_at(&app, &cache, &Theme::default(), 80, 24).0;
+        let promoted = cache.tool_output_stats();
+        assert!(promoted_render.contains("source-threshold-crossed"));
+        assert_eq!(promoted.0, dense.0, "promotion must not rebuild the layout");
+        assert_eq!(
+            cache.tool_output_sparse_layouts(),
+            1,
+            "crossing 512 KiB must promote the cached layout exactly once"
+        );
+        assert!(
+            promoted.1.saturating_sub(dense.1) <= 7_000,
+            "promotion should index the current body once: {dense:?} -> {promoted:?}"
+        );
+
+        let mut rendered = String::new();
+        for chunk in 0..4 {
+            app.transcript.apply(TranscriptEvent::ToolOutputDelta {
+                turn_id: 1,
+                call_id: 102,
+                chunk: format!("{}\ntail-{chunk}\n", "z".repeat(4 * 1024)),
+            });
+            rendered = render_transcript_at(&app, &cache, &Theme::default(), 80, 24).0;
+        }
+
+        let final_stats = cache.tool_output_stats();
+        let (entries, bytes) = cache.tool_output_cache_stats();
+        assert!(rendered.contains("tail-3"));
+        assert_eq!(final_stats.0, dense.0);
+        assert_eq!(cache.tool_output_sparse_layouts(), 1);
+        assert!(
+            final_stats.1.saturating_sub(promoted.1) <= 240,
+            "post-promotion deltas must index only their tails: {promoted:?} -> {final_stats:?}"
+        );
+        assert_eq!(entries, 1);
+        assert!(bytes <= super::TOOL_OUTPUT_LAYOUT_CACHE_BYTES);
+    }
+
+    #[test]
+    fn streaming_output_growth_indexes_only_each_new_chunk() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 94,
+            name: "terminal".into(),
+            summary: "Stream output".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Stream output".into(),
+                command: "stream-output".into(),
+                output: String::new(),
+                exit_code: None,
+            })],
+        });
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+
+        for chunk in 0..100 {
+            app.transcript.apply(TranscriptEvent::ToolOutputDelta {
+                turn_id: 1,
+                call_id: 94,
+                chunk: format!("chunk {chunk}\n"),
+            });
+            let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        }
+        app.transcript.apply(TranscriptEvent::ToolOutputDelta {
+            turn_id: 1,
+            call_id: 94,
+            chunk: "continued without a newline".into(),
+        });
+        let (continued, _) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        let stats = cache.tool_output_stats();
+
+        assert_eq!(stats.0, 1, "the full output should be indexed once");
+        assert!(
+            stats.1 <= 204,
+            "only the appended rows should be indexed: {stats:?}"
+        );
+        assert!(continued.contains("continued without a newline"));
+
+        app.transcript.apply(TranscriptEvent::ToolFinished {
+            turn_id: 1,
+            call_id: 94,
+            summary: None,
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Stream output".into(),
+                command: "stream-output".into(),
+                output: "replacement final output".into(),
+                exit_code: Some(0),
+            })],
+        });
+        let (replaced, _) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        assert!(replaced.contains("replacement final output"));
+        assert_eq!(cache.tool_output_stats().0, 2);
+    }
+
+    #[test]
+    fn mixed_artifact_terminal_stream_updates_only_its_output_segment() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 96,
+            name: "terminal".into(),
+            summary: "Stream mixed output".into(),
+            artifacts: vec![
+                ToolArtifact::CodeRange(CodeRangeArtifact {
+                    path: "src/app.rs".into(),
+                    start_line: 1,
+                    end_line: 2,
+                    preview: Some("summary content stays out of the body".into()),
+                }),
+                ToolArtifact::Terminal(TerminalArtifact {
+                    description: "Stream output".into(),
+                    command: "stream-output".into(),
+                    output: String::new(),
+                    exit_code: None,
+                }),
+                ToolArtifact::TextDetail(TextDetailArtifact {
+                    text: (0..2_000)
+                        .map(|line| format!("stable detail {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                }),
+            ],
+        });
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+
+        for chunk in 0..100 {
+            app.transcript.apply(TranscriptEvent::ToolOutputDelta {
+                turn_id: 1,
+                call_id: 96,
+                chunk: format!("chunk {chunk}\n"),
+            });
+            let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        }
+
+        let stats = cache.tool_output_stats();
+        assert_eq!(stats.0, 1, "mixed output should keep one full layout build");
+        assert!(
+            stats.1 <= 2_250,
+            "stable detail rows must not be reindexed for each terminal delta"
+        );
+    }
+
+    #[test]
+    fn newline_free_terminal_stream_rewraps_only_the_trailing_visual_row() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 97,
+            name: "terminal".into(),
+            summary: "Stream one long line".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Stream output".into(),
+                command: "stream-output".into(),
+                output: String::new(),
+                exit_code: None,
+            })],
+        });
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+
+        for _ in 0..100 {
+            app.transcript.apply(TranscriptEvent::ToolOutputDelta {
+                turn_id: 1,
+                call_id: 97,
+                chunk: "abcdefghij".repeat(10),
+            });
+            let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        }
+
+        let stats = cache.tool_output_stats();
+        assert_eq!(
+            stats.0, 1,
+            "the growing logical line should not fully rebuild"
+        );
+        assert!(
+            stats.1 <= 450,
+            "each delta should touch only its suffix and trailing visual row"
+        );
+    }
+
+    #[test]
+    fn paused_output_reflows_to_the_same_position_inside_one_long_source_line() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        let output = (0..800)
+            .map(|word| format!("word-{word:03}"))
             .collect::<Vec<_>>()
-            .join("\n");
+            .join(" ");
         app.transcript.submit(1, "run it".into(), Vec::new());
         app.transcript
             .apply(TranscriptEvent::Started { turn_id: 1 });
@@ -3892,10 +5167,12 @@ mod tests {
 
         let (_, wide) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
         app.update_tool_output_scroll_metrics(&wide.output_scroll_metrics);
-        app.scroll_tool_output_by(tool_id, 3);
+        app.scroll_tool_output_by(tool_id, 8);
         let anchor = app
-            .tool_output_scroll_anchor(tool_id)
-            .expect("paused logical-line anchor");
+            .tool_output_source_anchor(tool_id)
+            .expect("paused source anchor");
+        assert_eq!(anchor.logical_line, 0);
+        assert!(anchor.source_byte > 0);
 
         let (_, narrow) = render_transcript_at(&app, &cache, &Theme::default(), 36, 24);
         let metrics = narrow
@@ -3906,11 +5183,19 @@ mod tests {
         let from_bottom = app.tool_output_scroll_offset_for_layout(
             tool_id,
             metrics.maximum,
-            Some(&metrics.logical_lines),
+            metrics.layout_id,
+            Some(&metrics.row_index),
         );
         let top = metrics.maximum.saturating_sub(from_bottom);
+        let remapped = metrics.row_index.anchor_at(top).expect("remapped anchor");
+        let next = metrics.row_index.anchor_at(top.saturating_add(1));
 
-        assert_eq!(metrics.logical_lines[top], anchor);
+        assert_eq!(remapped.artifact, anchor.artifact);
+        assert_eq!(remapped.logical_line, anchor.logical_line);
+        assert!(remapped.source_byte <= anchor.source_byte);
+        assert!(next.is_none_or(|next| {
+            next.logical_line != anchor.logical_line || next.source_byte > anchor.source_byte
+        }));
     }
 
     #[test]
