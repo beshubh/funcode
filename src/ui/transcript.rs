@@ -1,6 +1,6 @@
 use super::markdown::MarkdownLayout;
 use crate::{
-    app::App,
+    app::{App, ToolOutputScrollMetrics},
     composer::DisplayRunKind,
     theme::{Theme, ThemeId, ThemeRole},
     transcript::{
@@ -41,7 +41,7 @@ pub struct OutputRegion {
 pub(super) struct RenderResult {
     pub entries: Vec<EntryRegion>,
     pub outputs: Vec<OutputRegion>,
-    pub output_scroll_maxima: Vec<(EntryId, usize)>,
+    pub output_scroll_metrics: Vec<ToolOutputScrollMetrics>,
     pub scroll_maximum: usize,
 }
 
@@ -49,6 +49,8 @@ const RENDERED_SLICE_CACHE_CAPACITY: usize = 32;
 const RENDERED_SLICE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const MARKDOWN_LAYOUT_CACHE_CAPACITY: usize = 32;
 const MARKDOWN_LAYOUT_CACHE_BYTES: usize = 4 * 1024 * 1024;
+const TOOL_OUTPUT_LAYOUT_CACHE_CAPACITY: usize = 32;
+const TOOL_OUTPUT_LAYOUT_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeightKey {
@@ -85,6 +87,64 @@ struct CachedSlice {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolOutputLayoutKey {
+    revision: u64,
+    width: usize,
+}
+
+#[derive(Debug)]
+struct CachedToolOutputLayout {
+    entry_id: EntryId,
+    key: ToolOutputLayoutKey,
+    layout: Arc<ToolOutputBodyLayout>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct ToolOutputRow {
+    line: Line<'static>,
+    role: ThemeRole,
+    logical_line: usize,
+}
+
+#[derive(Debug, Default)]
+struct ToolOutputBodyLayout {
+    rows: Vec<ToolOutputRow>,
+    logical_lines: Arc<[usize]>,
+}
+
+impl ToolOutputBodyLayout {
+    fn height(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.rows.iter().fold(0usize, |bytes, row| {
+            bytes
+                .saturating_add(std::mem::size_of::<ToolOutputRow>())
+                .saturating_add(row.line.to_string().len())
+        }))
+    }
+
+    fn logical_lines(&self) -> Arc<[usize]> {
+        Arc::clone(&self.logical_lines)
+    }
+
+    fn render(&self, context: RenderContext<'_>) {
+        let start = context.visible_rows.start.min(self.rows.len());
+        let end = context.visible_rows.end.min(self.rows.len());
+        for (destination_row, row) in self.rows[start..end].iter().enumerate() {
+            context.buffer.set_line(
+                context.area.x,
+                context.area.y.saturating_add(destination_row as u16),
+                &row.line.clone().style(context.theme.style(row.role)),
+                context.area.width,
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MarkdownLayoutKey {
     revision: u64,
     width: usize,
@@ -105,10 +165,15 @@ struct RenderCacheInner {
     slice_bytes: usize,
     markdown_layouts: VecDeque<CachedMarkdownLayout>,
     markdown_layout_bytes: usize,
+    tool_output_layouts: VecDeque<CachedToolOutputLayout>,
+    tool_output_layout_bytes: usize,
     height_builds: usize,
     slice_builds: usize,
     markdown_layout_builds: usize,
     visible_rows_copied: usize,
+    tool_output_layout_builds: usize,
+    tool_output_rows_indexed: usize,
+    tool_output_rows_rendered: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +273,72 @@ impl TranscriptRenderCache {
             inner.slice_bytes = inner.slice_bytes.saturating_sub(evicted.bytes);
         }
         buffer
+    }
+
+    fn tool_output_layout(&self, entry: &Entry, width: usize) -> Option<Arc<ToolOutputBodyLayout>> {
+        let EntryKind::Tool(tool) = &entry.kind else {
+            return None;
+        };
+        if tool_is_summary_only(tool) || output_artifacts(tool).next().is_none() {
+            return None;
+        }
+        let key = ToolOutputLayoutKey {
+            revision: entry.revision(),
+            width,
+        };
+        let mut inner = self.inner.borrow_mut();
+        if let Some(index) = inner
+            .tool_output_layouts
+            .iter()
+            .position(|cached| cached.entry_id == entry.id && cached.key == key)
+            && let Some(cached) = inner.tool_output_layouts.remove(index)
+        {
+            let layout = Arc::clone(&cached.layout);
+            inner.tool_output_layouts.push_back(cached);
+            return Some(layout);
+        }
+        drop(inner);
+
+        let layout = Arc::new(build_tool_output_layout(tool, width));
+        let bytes = layout.bytes();
+        let mut inner = self.inner.borrow_mut();
+        inner.tool_output_layout_builds = inner.tool_output_layout_builds.saturating_add(1);
+        inner.tool_output_rows_indexed = inner
+            .tool_output_rows_indexed
+            .saturating_add(layout.height());
+        inner.tool_output_layout_bytes = inner.tool_output_layout_bytes.saturating_add(bytes);
+        inner.tool_output_layouts.push_back(CachedToolOutputLayout {
+            entry_id: entry.id,
+            key,
+            layout: Arc::clone(&layout),
+            bytes,
+        });
+        while (inner.tool_output_layouts.len() > TOOL_OUTPUT_LAYOUT_CACHE_CAPACITY
+            || inner.tool_output_layout_bytes > TOOL_OUTPUT_LAYOUT_CACHE_BYTES)
+            && inner.tool_output_layouts.len() > 1
+        {
+            let Some(evicted) = inner.tool_output_layouts.pop_front() else {
+                break;
+            };
+            inner.tool_output_layout_bytes =
+                inner.tool_output_layout_bytes.saturating_sub(evicted.bytes);
+        }
+        Some(layout)
+    }
+
+    fn record_tool_output_rows(&self, count: usize) {
+        let mut inner = self.inner.borrow_mut();
+        inner.tool_output_rows_rendered = inner.tool_output_rows_rendered.saturating_add(count);
+    }
+
+    #[cfg(test)]
+    fn tool_output_stats(&self) -> (usize, usize, usize) {
+        let inner = self.inner.borrow();
+        (
+            inner.tool_output_layout_builds,
+            inner.tool_output_rows_indexed,
+            inner.tool_output_rows_rendered,
+        )
     }
 
     #[cfg(test)]
@@ -324,37 +455,58 @@ trait Render {
 
 struct EntryRenderer<'a> {
     entry: &'a Entry,
+    cache: &'a TranscriptRenderCache,
     expanded: bool,
     animation_frame: usize,
     markdown_layout: Option<Arc<MarkdownLayout>>,
     available_height: usize,
     output_scroll_from_bottom: usize,
+    output_body_layout: Option<Arc<ToolOutputBodyLayout>>,
 }
 
 impl<'a> EntryRenderer<'a> {
     fn new(
         entry: &'a Entry,
         app: &App,
-        cache: &TranscriptRenderCache,
+        cache: &'a TranscriptRenderCache,
         width: usize,
         available_height: usize,
     ) -> Self {
         let expanded = app.transcript_entry_is_expanded(entry);
+        let output_body_layout = cache.tool_output_layout(entry, width);
         let output_maximum = match &entry.kind {
-            EntryKind::Tool(tool) => {
-                tool_output_scroll_maximum(tool, expanded, available_height, width)
+            EntryKind::Tool(tool) => ToolRenderer {
+                tool,
+                expanded,
+                available_height,
+                scroll_from_bottom: 0,
+                body_layout: output_body_layout.as_deref(),
+                cache: Some(cache),
             }
+            .output_layout(width)
+            .map(|layout| layout.maximum),
             _ => None,
         };
+        let output_logical_lines = output_body_layout
+            .as_ref()
+            .map(|layout| layout.logical_lines());
         Self {
             entry,
+            cache,
             expanded,
             animation_frame: app.animation_frame,
             markdown_layout: cache.markdown_layout(entry, width),
             available_height,
             output_scroll_from_bottom: output_maximum
-                .map(|maximum| app.tool_output_scroll_offset(entry.id, maximum))
+                .map(|maximum| {
+                    app.tool_output_scroll_offset_for_layout(
+                        entry.id,
+                        maximum,
+                        output_logical_lines.as_ref(),
+                    )
+                })
                 .unwrap_or_default(),
+            output_body_layout,
         }
     }
 
@@ -375,6 +527,8 @@ impl<'a> EntryRenderer<'a> {
                 expanded: self.expanded,
                 available_height: self.available_height,
                 scroll_from_bottom: self.output_scroll_from_bottom,
+                body_layout: self.output_body_layout.as_deref(),
+                cache: Some(self.cache),
             }),
             EntryKind::Retry(retry) => dispatch(retry),
         }
@@ -389,6 +543,8 @@ impl<'a> EntryRenderer<'a> {
             expanded: self.expanded,
             available_height: self.available_height,
             scroll_from_bottom: self.output_scroll_from_bottom,
+            body_layout: self.output_body_layout.as_deref(),
+            cache: Some(self.cache),
         }
         .output_viewport(width)
     }
@@ -397,7 +553,24 @@ impl<'a> EntryRenderer<'a> {
         let EntryKind::Tool(tool) = &self.entry.kind else {
             return None;
         };
-        tool_output_scroll_maximum(tool, self.expanded, self.available_height, width)
+        ToolRenderer {
+            tool,
+            expanded: self.expanded,
+            available_height: self.available_height,
+            scroll_from_bottom: self.output_scroll_from_bottom,
+            body_layout: self.output_body_layout.as_deref(),
+            cache: Some(self.cache),
+        }
+        .output_layout(width)
+        .map(|layout| layout.maximum)
+    }
+
+    fn output_scroll_metrics(&self, width: usize) -> Option<ToolOutputScrollMetrics> {
+        Some(ToolOutputScrollMetrics {
+            entry_id: self.entry.id,
+            maximum: self.output_scroll_maximum(width)?,
+            logical_lines: self.output_body_layout.as_ref()?.logical_lines(),
+        })
     }
 }
 
@@ -438,20 +611,18 @@ pub(super) fn render(
         return RenderResult {
             entries: Vec::new(),
             outputs: Vec::new(),
-            output_scroll_maxima: Vec::new(),
+            output_scroll_metrics: Vec::new(),
             scroll_maximum: 0,
         };
     }
 
     let width = content_area.width.max(1) as usize;
-    let available_height = content_area.height as usize;
+    let full_available_height = content_area.height as usize;
+    let visibly_manual = app.transcript_has_manual_scroll_offset();
+    let available_height = full_available_height.saturating_sub(usize::from(visibly_manual));
     ensure_layout_index(app, theme, width, available_height, cache);
     let index = cache.index.borrow();
     let next_line = index.entries.last().map_or(0, |entry| entry.end);
-
-    let full_viewport_maximum = next_line.saturating_sub(content_area.height as usize);
-    let visibly_manual =
-        !app.transcript_is_following() && app.transcript_scroll_offset(full_viewport_maximum) > 0;
     let viewport_area = if !visibly_manual {
         content_area
     } else {
@@ -477,17 +648,7 @@ pub(super) fn render(
     let first_visible = index.entries.partition_point(|entry| entry.end <= top);
     let mut regions = Vec::new();
     let mut outputs = Vec::new();
-    let output_scroll_maxima = app
-        .transcript
-        .entries()
-        .iter()
-        .filter_map(|entry| {
-            let renderer = EntryRenderer::new(entry, app, cache, width, available_height);
-            renderer
-                .output_scroll_maximum(width)
-                .map(|maximum| (entry.id, maximum))
-        })
-        .collect();
+    let mut output_scroll_metrics = Vec::new();
 
     for (entry_index, measured) in index.entries.iter().enumerate().skip(first_visible) {
         if measured.start >= viewport_end {
@@ -501,6 +662,9 @@ pub(super) fn render(
 
         let entry = &app.transcript.entries()[entry_index];
         let renderer = EntryRenderer::new(entry, app, cache, width, available_height);
+        if let Some(metrics) = renderer.output_scroll_metrics(width) {
+            output_scroll_metrics.push(metrics);
+        }
         let local = visible_start.saturating_sub(measured.start)
             ..visible_end.saturating_sub(measured.start);
         let area = Rect::new(
@@ -573,7 +737,7 @@ pub(super) fn render(
     RenderResult {
         entries: regions,
         outputs,
-        output_scroll_maxima,
+        output_scroll_metrics,
         scroll_maximum: maximum_top,
     }
 }
@@ -593,9 +757,12 @@ fn ensure_layout_index(
     let entries = app.transcript.entries();
     let valid_prefix = {
         let index = cache.index.borrow();
-        if index.key != Some(key) {
+        if index.key.is_some_and(|previous| previous.width != width) {
             0
         } else {
+            let available_height_changed = index
+                .key
+                .is_some_and(|previous| previous.available_height != available_height);
             index
                 .entries
                 .iter()
@@ -604,6 +771,8 @@ fn ensure_layout_index(
                     cached.id == entry.id
                         && cached.revision == entry.revision()
                         && cached.expanded == app.transcript_entry_is_expanded(entry)
+                        && !(available_height_changed
+                            && entry_height_depends_on_available_height(entry, app))
                 })
                 .count()
         }
@@ -643,6 +812,15 @@ fn ensure_layout_index(
         .entries_measured
         .saturating_add(entries.len().saturating_sub(valid_prefix));
     index.entries = updated;
+}
+
+fn entry_height_depends_on_available_height(entry: &Entry, app: &App) -> bool {
+    app.transcript_entry_is_expanded(entry)
+        && matches!(
+            &entry.kind,
+            EntryKind::Tool(tool)
+                if !tool_is_summary_only(tool) && output_artifacts(tool).next().is_some()
+        )
 }
 
 fn measured_entry_height(
@@ -896,6 +1074,8 @@ struct ToolRenderer<'a> {
     expanded: bool,
     available_height: usize,
     scroll_from_bottom: usize,
+    body_layout: Option<&'a ToolOutputBodyLayout>,
+    cache: Option<&'a TranscriptRenderCache>,
 }
 
 impl Render for ToolRenderer<'_> {
@@ -930,13 +1110,20 @@ impl Render for ToolRenderer<'_> {
         ));
         let mut cursor = render_child(&header, 0, &mut context);
         cursor = render_child(
-            &LinesRenderer::new(output_artifact_header_lines(self.tool, context.theme)),
+            &LinesRenderer::new(bounded_output_artifact_header_lines(
+                self.tool,
+                context.area.width as usize,
+                layout.artifact_header_limit,
+                context.theme,
+            )),
             cursor,
             &mut context,
         );
         cursor = render_child(
             &OutputViewportRenderer {
                 body,
+                body_layout: self.body_layout,
+                cache: self.cache,
                 height: layout.viewport_height,
                 scroll_from_bottom,
             },
@@ -960,6 +1147,7 @@ impl Render for ToolRenderer<'_> {
 }
 
 const COMPACT_OUTPUT_ROWS: usize = 10;
+const MAX_ARTIFACT_HEADER_ROWS: usize = 4;
 
 impl ToolRenderer<'_> {
     fn output_viewport(&self, width: usize) -> Option<Range<usize>> {
@@ -976,11 +1164,14 @@ impl ToolRenderer<'_> {
     }
 
     fn output_layout(&self, width: usize) -> Option<ToolOutputLayout> {
+        if tool_is_summary_only(self.tool) {
+            return None;
+        }
         output_artifacts(self.tool).next()?;
-        let body_height = ToolOutputBodyRenderer { tool: self.tool }.height(width);
-        let artifact_header_height =
-            LinesRenderer::new(output_artifact_header_lines(self.tool, &Theme::default()))
-                .height(width);
+        let body_height = self.body_layout.map_or_else(
+            || ToolOutputBodyRenderer { tool: self.tool }.height(width),
+            ToolOutputBodyLayout::height,
+        );
         let base_header_height = LinesRenderer::new(output_tool_header_lines(
             self.tool,
             self.expanded,
@@ -988,8 +1179,17 @@ impl ToolRenderer<'_> {
             &Theme::default(),
         ))
         .height(width);
+        let base_artifact_header_limit =
+            artifact_header_limit(self.available_height, base_header_height);
+        let base_artifact_header_height = LinesRenderer::new(bounded_output_artifact_header_lines(
+            self.tool,
+            width,
+            base_artifact_header_limit,
+            &Theme::default(),
+        ))
+        .height(width);
         let base_chrome = base_header_height
-            .saturating_add(artifact_header_height)
+            .saturating_add(base_artifact_header_height)
             .saturating_add(1);
         let base_compact_height = output_viewport_height(false, self.available_height, base_chrome);
         let can_expand = body_height > base_compact_height;
@@ -1000,6 +1200,14 @@ impl ToolRenderer<'_> {
             &Theme::default(),
         ))
         .height(width);
+        let artifact_header_limit = artifact_header_limit(self.available_height, header_height);
+        let artifact_header_height = LinesRenderer::new(bounded_output_artifact_header_lines(
+            self.tool,
+            width,
+            artifact_header_limit,
+            &Theme::default(),
+        ))
+        .height(width);
         let chrome_height = header_height
             .saturating_add(artifact_header_height)
             .saturating_add(1);
@@ -1007,6 +1215,7 @@ impl ToolRenderer<'_> {
             output_viewport_height(self.expanded, self.available_height, chrome_height);
         Some(ToolOutputLayout {
             header_height,
+            artifact_header_limit,
             artifact_header_height,
             chrome_height,
             viewport_height,
@@ -1019,6 +1228,7 @@ impl ToolRenderer<'_> {
 
 struct ToolOutputLayout {
     header_height: usize,
+    artifact_header_limit: usize,
     artifact_header_height: usize,
     chrome_height: usize,
     viewport_height: usize,
@@ -1027,20 +1237,12 @@ struct ToolOutputLayout {
     can_expand: bool,
 }
 
-fn tool_output_scroll_maximum(
-    tool: &ToolCall,
-    expanded: bool,
-    available_height: usize,
-    width: usize,
-) -> Option<usize> {
-    ToolRenderer {
-        tool,
-        expanded,
-        available_height,
-        scroll_from_bottom: 0,
-    }
-    .output_layout(width)
-    .map(|layout| layout.maximum)
+fn artifact_header_limit(available_height: usize, header_height: usize) -> usize {
+    let body_rows =
+        COMPACT_OUTPUT_ROWS.min(available_height.saturating_sub(header_height.saturating_add(1)));
+    available_height
+        .saturating_sub(header_height.saturating_add(1).saturating_add(body_rows))
+        .min(MAX_ARTIFACT_HEADER_ROWS)
 }
 
 struct ArtifactBodyRenderer<'a> {
@@ -1106,6 +1308,8 @@ impl Render for ToolOutputBodyRenderer<'_> {
 
 struct OutputViewportRenderer<'a> {
     body: ToolOutputBodyRenderer<'a>,
+    body_layout: Option<&'a ToolOutputBodyLayout>,
+    cache: Option<&'a TranscriptRenderCache>,
     height: usize,
     scroll_from_bottom: usize,
 }
@@ -1116,7 +1320,10 @@ impl Render for OutputViewportRenderer<'_> {
     }
 
     fn render(&self, context: RenderContext<'_>) {
-        let body_height = self.body.height(context.area.width as usize);
+        let body_height = self.body_layout.map_or_else(
+            || self.body.height(context.area.width as usize),
+            ToolOutputBodyLayout::height,
+        );
         let maximum = body_height.saturating_sub(self.height);
         let top = maximum.saturating_sub(self.scroll_from_bottom.min(maximum));
         let source_start = top.saturating_add(context.visible_rows.start);
@@ -1124,12 +1331,20 @@ impl Render for OutputViewportRenderer<'_> {
             .saturating_add(context.visible_rows.end)
             .min(body_height);
         if source_start < source_end {
-            self.body.render(RenderContext {
+            let body_context = RenderContext {
                 theme: context.theme,
                 area: context.area,
                 buffer: context.buffer,
                 visible_rows: source_start..source_end,
-            });
+            };
+            if let Some(layout) = self.body_layout {
+                layout.render(body_context);
+                if let Some(cache) = self.cache {
+                    cache.record_tool_output_rows(source_end.saturating_sub(source_start));
+                }
+            } else {
+                self.body.render(body_context);
+            }
         }
     }
 }
@@ -1485,6 +1700,94 @@ fn output_artifacts(tool: &ToolCall) -> impl Iterator<Item = &ToolArtifact> {
     })
 }
 
+fn build_tool_output_layout(tool: &ToolCall, width: usize) -> ToolOutputBodyLayout {
+    let mut layout = ToolOutputBodyLayout::default();
+    let mut logical_line = 0usize;
+    for artifact in output_artifacts(tool) {
+        match artifact {
+            ToolArtifact::Patch(artifact) => {
+                for source in artifact.diff.lines() {
+                    let role = if source.starts_with('+') && !source.starts_with("+++") {
+                        ThemeRole::DiffAdded
+                    } else if source.starts_with('-') && !source.starts_with("---") {
+                        ThemeRole::DiffRemoved
+                    } else {
+                        ThemeRole::MutedText
+                    };
+                    let line = Line::from(format!(
+                        "│ {}",
+                        crate::composer::safe_single_line(source, 2)
+                    ));
+                    push_indexed_output_line(&mut layout, line, role, logical_line, width);
+                    logical_line = logical_line.saturating_add(1);
+                }
+            }
+            ToolArtifact::SearchResults(artifact) => {
+                for line in message_line_iter(&artifact.matches, ratatui::style::Style::default()) {
+                    push_indexed_output_line(
+                        &mut layout,
+                        line,
+                        ThemeRole::MutedText,
+                        logical_line,
+                        width,
+                    );
+                    logical_line = logical_line.saturating_add(1);
+                }
+            }
+            ToolArtifact::Terminal(artifact) => {
+                for line in message_line_iter(&artifact.output, ratatui::style::Style::default()) {
+                    push_indexed_output_line(
+                        &mut layout,
+                        line,
+                        ThemeRole::Text,
+                        logical_line,
+                        width,
+                    );
+                    logical_line = logical_line.saturating_add(1);
+                }
+            }
+            ToolArtifact::TextDetail(artifact) => {
+                for line in message_line_iter(&artifact.text, ratatui::style::Style::default()) {
+                    push_indexed_output_line(
+                        &mut layout,
+                        line,
+                        ThemeRole::MutedText,
+                        logical_line,
+                        width,
+                    );
+                    logical_line = logical_line.saturating_add(1);
+                }
+            }
+            ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_) => {}
+        }
+    }
+    layout.logical_lines = layout
+        .rows
+        .iter()
+        .map(|row| row.logical_line)
+        .collect::<Vec<_>>()
+        .into();
+    layout
+}
+
+fn push_indexed_output_line(
+    layout: &mut ToolOutputBodyLayout,
+    line: Line<'static>,
+    role: ThemeRole,
+    logical_line: usize,
+    width: usize,
+) {
+    layout.rows.extend(
+        wrap_lines(&[line], width)
+            .into_iter()
+            .map(|line| ToolOutputRow {
+                line,
+                role,
+                logical_line,
+            }),
+    );
+}
+
 fn output_viewport_height(expanded: bool, available_height: usize, chrome: usize) -> usize {
     let available = available_height.saturating_sub(chrome);
     if expanded {
@@ -1532,6 +1835,29 @@ fn output_artifact_header_lines(tool: &ToolCall, theme: &Theme) -> Vec<Line<'sta
             ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_) => Vec::new(),
         })
         .collect()
+}
+
+fn bounded_output_artifact_header_lines(
+    tool: &ToolCall,
+    width: usize,
+    maximum_rows: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    if maximum_rows == 0 {
+        return Vec::new();
+    }
+    let mut rows = wrap_lines(&output_artifact_header_lines(tool, theme), width);
+    if rows.len() <= maximum_rows {
+        return rows;
+    }
+    rows.truncate(maximum_rows);
+    if let Some(last) = rows.last_mut() {
+        *last = Line::styled(
+            if width >= 3 { "│ …" } else { "…" },
+            theme.style(ThemeRole::MutedText),
+        );
+    }
+    rows
 }
 
 fn output_footer_lines(
@@ -1607,14 +1933,13 @@ fn generic_tool_lines(tool: &ToolCall, theme: &Theme) -> Vec<Line<'static>> {
 }
 
 fn tool_is_summary_only(tool: &ToolCall) -> bool {
-    output_artifacts(tool).next().is_none()
-        && (tool.name == "read_file"
-            || tool.artifacts.iter().any(|artifact| {
-                matches!(
-                    artifact,
-                    ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_)
-                )
-            }))
+    tool.name == "read_file"
+        || tool.artifacts.iter().any(|artifact| {
+            matches!(
+                artifact,
+                ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_)
+            )
+        })
 }
 
 fn tool_summary_lines(tool: &ToolCall, theme: &Theme) -> Vec<Line<'static>> {
@@ -2076,12 +2401,16 @@ mod tests {
             expanded: false,
             available_height: 24,
             scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
         };
         let expanded = ToolRenderer {
             tool: &tool,
             expanded: true,
             available_height: 24,
             scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
         };
         assert!(symbols(&render_widget(&collapsed, 80)).contains("file contents"));
         assert!(symbols(&render_widget(&expanded, 80)).contains("file contents"));
@@ -2144,6 +2473,70 @@ mod tests {
         assert!(rendered.contains("Read File: src/main.rs"));
         assert!(!rendered.contains("secret file contents"));
         assert!(!renderer.clickable(80));
+    }
+
+    #[test]
+    fn read_file_stays_path_only_for_adversarial_mixed_artifacts() {
+        let mut app = App::new();
+        app.transcript.submit(1, "inspect it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 7,
+            name: "read_file".into(),
+            summary: "Reading src/secret.rs".into(),
+            artifacts: Vec::new(),
+        });
+        app.transcript.apply(TranscriptEvent::ToolFinished {
+            turn_id: 1,
+            call_id: 7,
+            summary: None,
+            artifacts: vec![
+                ToolArtifact::Terminal(TerminalArtifact {
+                    description: "malformed terminal detail".into(),
+                    command: "cat src/secret.rs".into(),
+                    output: "terminal leaked contents".into(),
+                    exit_code: Some(0),
+                }),
+                ToolArtifact::TextDetail(TextDetailArtifact {
+                    text: "text leaked contents".into(),
+                }),
+                ToolArtifact::Patch(PatchArtifact {
+                    path: "src/secret.rs".into(),
+                    diff: "+patch leaked contents".into(),
+                }),
+                ToolArtifact::SearchResults(SearchResultsArtifact {
+                    query: "secret".into(),
+                    matches: "search leaked contents".into(),
+                }),
+                ToolArtifact::CodeRange(CodeRangeArtifact {
+                    path: "src/secret.rs".into(),
+                    start_line: 1,
+                    end_line: 20,
+                    preview: Some("preview leaked contents".into()),
+                }),
+                ToolArtifact::FileReference(FileReferenceArtifact {
+                    path: "src/secret.rs".into(),
+                }),
+            ],
+        });
+
+        let cache = TranscriptRenderCache::default();
+        let rendered = render_transcript(&app, &cache);
+        let tool_entry = app
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry.kind, crate::transcript::EntryKind::Tool(_)))
+            .expect("tool entry");
+        let renderer = super::EntryRenderer::new(tool_entry, &app, &cache, 80, 24);
+
+        assert!(rendered.contains("Read File: src/secret.rs"));
+        assert!(!rendered.contains("leaked contents"));
+        assert!(!rendered.contains("cat src/secret.rs"));
+        assert!(!renderer.clickable(80));
+        assert!(renderer.output_scroll_maximum(80).is_none());
     }
 
     #[test]
@@ -2234,6 +2627,8 @@ mod tests {
             expanded: false,
             available_height: 24,
             scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
         };
 
         let rendered = render_widget(&renderer, 80);
@@ -2265,6 +2660,8 @@ mod tests {
             expanded: false,
             available_height: 24,
             scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
         };
         let rendered = render_widget(&renderer, 80);
         let text = symbols(&rendered);
@@ -2292,6 +2689,8 @@ mod tests {
             expanded: false,
             available_height: 24,
             scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
         };
         assert_eq!(render_widget(&empty, 80).area.height, 14);
         assert!(!empty.clickable(80));
@@ -2332,6 +2731,8 @@ mod tests {
                 expanded: false,
                 available_height: 24,
                 scroll_from_bottom: 0,
+                body_layout: None,
+                cache: None,
             };
             let rendered = render_widget(&renderer, 80);
             let text = symbols(&rendered);
@@ -2343,19 +2744,49 @@ mod tests {
     }
 
     #[test]
-    fn mixed_and_multiple_artifacts_keep_every_output_in_one_viewport() {
+    fn many_artifact_headers_are_bounded_without_consuming_the_output_body() {
+        let tool = ToolCall {
+            call_id: 71,
+            name: "terminal".into(),
+            summary: "Run many commands".into(),
+            status: ActivityStatus::Completed,
+            artifacts: (1..=8)
+                .map(|command| {
+                    ToolArtifact::Terminal(TerminalArtifact {
+                        description: format!("Command {command}"),
+                        command: format!("command-{command}"),
+                        output: format!("output {command}"),
+                        exit_code: Some(0),
+                    })
+                })
+                .collect(),
+        };
+        let renderer = ToolRenderer {
+            tool: &tool,
+            expanded: false,
+            available_height: 16,
+            scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
+        };
+
+        let layout = renderer.output_layout(80).expect("output layout");
+        let text = symbols(&render_widget(&renderer, 80));
+
+        assert_eq!(layout.viewport_height, super::COMPACT_OUTPUT_ROWS);
+        assert!(layout.artifact_header_height <= 4);
+        assert!(text.contains("output 8"));
+        assert!(text.contains('…'));
+    }
+
+    #[test]
+    fn multiple_output_artifacts_share_one_viewport() {
         let tool = ToolCall {
             call_id: 8,
             name: "inspect".into(),
             summary: "Inspect outputs".into(),
             status: ActivityStatus::Completed,
             artifacts: vec![
-                ToolArtifact::CodeRange(CodeRangeArtifact {
-                    path: "src/main.rs".into(),
-                    start_line: 1,
-                    end_line: 1,
-                    preview: Some("hidden read preview".into()),
-                }),
                 ToolArtifact::TextDetail(TextDetailArtifact {
                     text: "first output".into(),
                 }),
@@ -2370,14 +2801,14 @@ mod tests {
             expanded: true,
             available_height: 24,
             scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
         };
         let text = symbols(&render_widget(&renderer, 80));
 
         assert!(text.contains("first output"));
         assert!(text.contains("Search /second/"));
         assert!(text.contains("second output"));
-        assert!(!text.contains("hidden read preview"));
-        assert!(!text.contains("Read File:"));
     }
 
     #[test]
@@ -2403,12 +2834,16 @@ mod tests {
             expanded: true,
             available_height: 20,
             scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
         };
         let paused = ToolRenderer {
             tool: &tool,
             expanded: false,
             available_height: 20,
             scroll_from_bottom: 5,
+            body_layout: None,
+            cache: None,
         };
 
         let expanded = render_widget(&expanded, 80);
@@ -2419,6 +2854,54 @@ mod tests {
         assert!(paused.contains("output 25"));
         assert!(!paused.contains("output 26"));
         assert!(paused.contains("paused · End to follow"));
+    }
+
+    #[test]
+    fn paused_outer_transcript_resizes_expanded_widget_below_follow_banner() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        let output = (1..=80)
+            .map(|line| format!("output {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 93,
+            name: "terminal".into(),
+            summary: "Run output".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Run output".into(),
+                command: "generate-output".into(),
+                output,
+                exit_code: None,
+            })],
+        });
+        let tool_id = app
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry.kind, crate::transcript::EntryKind::Tool(_)))
+            .expect("tool entry")
+            .id;
+        app.activate_transcript_entry(tool_id);
+
+        let (_, following) = render_transcript_at(&app, &cache, &Theme::default(), 80, 20);
+        app.update_transcript_scroll_maximum(following.scroll_maximum);
+        assert!(app.scroll_transcript_up());
+        let (paused, _) = render_transcript_at(&app, &cache, &Theme::default(), 80, 20);
+        let index = cache.index.borrow();
+        let measured = index
+            .entries
+            .iter()
+            .find(|entry| entry.id == tool_id)
+            .expect("indexed tool entry");
+
+        assert!(paused.contains("End to follow"));
+        assert_eq!(index.key.expect("index key").available_height, 19);
+        assert_eq!(measured.end.saturating_sub(measured.start), 19);
     }
 
     #[test]
@@ -2453,18 +2936,18 @@ mod tests {
             .id;
 
         let (_, compact) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
-        app.update_tool_output_scroll_maxima(&compact.output_scroll_maxima);
+        app.update_tool_output_scroll_metrics(&compact.output_scroll_metrics);
         app.scroll_tool_output_by(tool_id, 1);
         assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 5);
 
         app.activate_transcript_entry(tool_id);
         let (_, expanded) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
-        app.update_tool_output_scroll_maxima(&expanded.output_scroll_maxima);
+        app.update_tool_output_scroll_metrics(&expanded.output_scroll_metrics);
         assert_eq!(app.tool_output_scroll_offset(tool_id, 20), 0);
 
         app.activate_transcript_entry(tool_id);
         let (_, collapsed) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
-        app.update_tool_output_scroll_maxima(&collapsed.output_scroll_maxima);
+        app.update_tool_output_scroll_metrics(&collapsed.output_scroll_metrics);
         assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 5);
     }
 
@@ -2500,7 +2983,7 @@ mod tests {
             .id;
 
         let (tail, result) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
-        app.update_tool_output_scroll_maxima(&result.output_scroll_maxima);
+        app.update_tool_output_scroll_metrics(&result.output_scroll_metrics);
         let before_scroll = cache.stats();
         app.scroll_tool_output_by(tool_id, 1);
         let (history, _) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
@@ -2518,6 +3001,108 @@ mod tests {
         let before_theme = cache.stats();
         let _ = render_transcript_at(&app, &cache, &Theme::resolve(ThemeId::Paper), 80, 30);
         assert!(cache.stats().1 > before_theme.1);
+    }
+
+    #[test]
+    fn cached_large_output_redraw_and_scroll_only_touch_viewport_rows() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        let output = (1..=20_000)
+            .map(|line| format!("large output {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 91,
+            name: "terminal".into(),
+            summary: "Run large output".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Run large output".into(),
+                command: "generate-large-output".into(),
+                output,
+                exit_code: None,
+            })],
+        });
+        let tool_id = app
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry.kind, crate::transcript::EntryKind::Tool(_)))
+            .expect("tool entry")
+            .id;
+
+        let (_, first) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        app.update_tool_output_scroll_metrics(&first.output_scroll_metrics);
+        let indexed = cache.tool_output_stats();
+        assert_eq!(indexed.0, 1);
+        assert!(indexed.1 >= 20_000);
+
+        app.scroll_tool_output_by(tool_id, 1);
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        let scrolled = cache.tool_output_stats();
+        assert_eq!(scrolled.0, indexed.0);
+        assert_eq!(scrolled.1, indexed.1);
+        assert!(scrolled.2.saturating_sub(indexed.2) <= super::COMPACT_OUTPUT_ROWS);
+
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        assert_eq!(cache.tool_output_stats(), scrolled);
+    }
+
+    #[test]
+    fn paused_output_reflows_to_the_same_logical_source_line() {
+        let mut app = App::new();
+        let cache = TranscriptRenderCache::default();
+        let output = (1..=40)
+            .map(|line| format!("source line {line}: {}", "content ".repeat(18)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.transcript.submit(1, "run it".into(), Vec::new());
+        app.transcript
+            .apply(TranscriptEvent::Started { turn_id: 1 });
+        app.transcript.apply(TranscriptEvent::ToolStarted {
+            turn_id: 1,
+            call_id: 92,
+            name: "terminal".into(),
+            summary: "Run wrapped output".into(),
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Run wrapped output".into(),
+                command: "generate-wrapped-output".into(),
+                output,
+                exit_code: None,
+            })],
+        });
+        let tool_id = app
+            .transcript
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry.kind, crate::transcript::EntryKind::Tool(_)))
+            .expect("tool entry")
+            .id;
+
+        let (_, wide) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        app.update_tool_output_scroll_metrics(&wide.output_scroll_metrics);
+        app.scroll_tool_output_by(tool_id, 3);
+        let anchor = app
+            .tool_output_scroll_anchor(tool_id)
+            .expect("paused logical-line anchor");
+
+        let (_, narrow) = render_transcript_at(&app, &cache, &Theme::default(), 36, 24);
+        let metrics = narrow
+            .output_scroll_metrics
+            .iter()
+            .find(|metrics| metrics.entry_id == tool_id)
+            .expect("narrow output metrics");
+        let from_bottom = app.tool_output_scroll_offset_for_layout(
+            tool_id,
+            metrics.maximum,
+            Some(&metrics.logical_lines),
+        );
+        let top = metrics.maximum.saturating_sub(from_bottom);
+
+        assert_eq!(metrics.logical_lines[top], anchor);
     }
 
     #[test]
