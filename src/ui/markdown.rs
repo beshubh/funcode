@@ -461,10 +461,9 @@ impl MarkdownBuilder {
     }
 
     fn inline_style(&self, forced_role: Option<ThemeRole>) -> (ThemeRole, Modifier) {
-        if let Some(role) = forced_role {
-            return (role, Modifier::empty());
-        }
-        let role = if !self.links.is_empty() {
+        let role = if let Some(role) = forced_role {
+            role
+        } else if !self.links.is_empty() {
             ThemeRole::MarkdownLink
         } else if self.strong > 0 {
             ThemeRole::MarkdownStrong
@@ -639,6 +638,10 @@ fn wrap_logical(line: LogicalLine, width: usize) -> Vec<SemanticLine> {
     for span in line.content {
         for grapheme in span.text.graphemes(true) {
             let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+            if !row_has_content && column > 0 && column.saturating_add(grapheme_width) > width {
+                row = SemanticLine::default();
+                column = 0;
+            }
             if row_has_content && column.saturating_add(grapheme_width) > width {
                 rows.push(row);
                 row = SemanticLine::default();
@@ -818,9 +821,6 @@ fn code_lines_with_endings(source: &str) -> Vec<&str> {
         return vec![""];
     }
     let mut lines = source.split_inclusive('\n').collect::<Vec<_>>();
-    if source.ends_with('\n') {
-        lines.pop();
-    }
     if lines.is_empty() {
         lines.push("");
     }
@@ -977,6 +977,80 @@ mod tests {
                 .filter_map(|line| line.spans.first().and_then(|span| span.style.fg))
                 .collect::<std::collections::HashSet<_>>();
             assert_eq!(colors.len(), 6, "heading palette for {id:?}: {colors:?}");
+        }
+    }
+
+    #[test]
+    fn inline_code_keeps_enclosing_markdown_modifiers() {
+        let layout = MarkdownLayout::new("**_`code`_** and ~~`old`~~", 40);
+        let line = layout.line(0, &Theme::default()).unwrap();
+        let code = line
+            .spans
+            .iter()
+            .find(|span| span.content == "code")
+            .expect("nested inline code");
+        assert!(
+            code.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert!(
+            code.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::ITALIC)
+        );
+        let old = line
+            .spans
+            .iter()
+            .find(|span| span.content == "old")
+            .expect("struck inline code");
+        assert!(
+            old.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::CROSSED_OUT)
+        );
+    }
+
+    #[test]
+    fn fenced_code_preserves_intentional_trailing_blank_lines_and_tabs() {
+        let layout = MarkdownLayout::new("```rust\n\tlet value = 1;\n\n```", 40);
+        let rows = symbols(&layout);
+
+        assert!(rows.iter().any(|row| row == "│     let value = 1;"));
+        let footer = rows.iter().position(|row| row == "└─").unwrap();
+        assert_eq!(rows[footer - 1], "│ ");
+    }
+
+    #[test]
+    fn narrow_prefixes_never_clip_a_wide_grapheme() {
+        let rows = symbols(&MarkdownLayout::new("> 🦀", 3));
+
+        assert!(rows.iter().all(|row| row.width() <= 3), "{rows:?}");
+        assert!(rows.join("").contains('🦀'));
+    }
+
+    #[test]
+    fn empty_escaped_entity_and_incomplete_inline_input_remain_readable() {
+        assert_eq!(symbols(&MarkdownLayout::new("", 20)), [""]);
+
+        let source = r"\*literal\* &amp; [unfinished](https://example.com and `open";
+        assert_eq!(
+            symbols(&MarkdownLayout::new(source, 80)),
+            ["*literal* & [unfinished](https://example.com and `open"]
+        );
+    }
+
+    #[test]
+    fn every_layout_row_matches_measurement_at_common_terminal_widths() {
+        let source = "## Heading\n\n> Wrapped **content** with 🦀 unicode.\n\n```rust\nfn main() { println!(\"hello\"); }\n```";
+        for width in [20, 40, 80] {
+            let layout = MarkdownLayout::new(source, width);
+            let rows = symbols(&layout);
+            assert_eq!(layout.height(), rows.len());
+            assert!(
+                rows.iter().all(|row| row.width() <= width),
+                "width {width}: {rows:?}"
+            );
         }
     }
 }
