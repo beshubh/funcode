@@ -428,9 +428,29 @@ mod tests {
                 Some(accents[5])
             );
             assert_eq!(theme.style(ThemeRole::MarkdownLink).fg, Some(accents[1]));
+            assert_eq!(
+                theme.style(ThemeRole::MarkdownInlineCode).fg,
+                Some(accents[1])
+            );
             assert_eq!(theme.style(ThemeRole::MarkdownQuote).fg, Some(accents[2]));
             assert_eq!(theme.style(ThemeRole::CodeString).fg, Some(accents[4]));
             assert_eq!(theme.style(ThemeRole::CodeType).fg, Some(accents[0]));
+            assert_eq!(theme.style(ThemeRole::CodeKeyword).fg, Some(accents[5]));
+            assert_eq!(theme.style(ThemeRole::CodeConstant).fg, Some(accents[3]));
+            assert_eq!(theme.style(ThemeRole::CodeFunction).fg, Some(accents[1]));
+            assert_eq!(theme.style(ThemeRole::CodeOperator).fg, Some(accents[2]));
+            assert_eq!(
+                theme.style(ThemeRole::CodeComment).fg,
+                theme.style(ThemeRole::MutedText).fg
+            );
+            assert_eq!(
+                theme.style(ThemeRole::MarkdownRule).fg,
+                theme.style(ThemeRole::MutedText).fg
+            );
+            assert_eq!(
+                theme.style(ThemeRole::CodeText).fg,
+                theme.style(ThemeRole::Text).fg
+            );
         }
     }
 }

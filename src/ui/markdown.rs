@@ -38,6 +38,7 @@ impl SemanticSpan {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct SemanticLine {
     spans: Vec<SemanticSpan>,
+    anchor: usize,
 }
 
 impl SemanticLine {
@@ -73,7 +74,9 @@ impl MarkdownLayout {
     pub(super) fn new(source: &str, width: usize) -> Self {
         let width = width.max(1);
         let mut builder = MarkdownBuilder::new(width);
-        if let Some(unclosed) = unclosed_fence_start(source) {
+        if contains_image(source) {
+            builder.append_literal_block(source);
+        } else if let Some(unclosed) = unclosed_fence_start(source) {
             builder.parse(&source[..unclosed]);
             builder.append_literal_block(&source[unclosed..]);
         } else {
@@ -120,7 +123,14 @@ impl MarkdownLayout {
             .unwrap_or_default();
         for grapheme in suffix.graphemes(true) {
             if grapheme == "\n" {
-                self.rows.push(SemanticLine::default());
+                let anchor = self
+                    .rows
+                    .last()
+                    .map_or(0, |line| line.anchor.saturating_add(1));
+                self.rows.push(SemanticLine {
+                    spans: Vec::new(),
+                    anchor,
+                });
                 column = 0;
                 continue;
             }
@@ -133,7 +143,14 @@ impl MarkdownLayout {
                     (grapheme, source_width)
                 };
                 if column.saturating_add(grapheme_width) > width {
-                    self.rows.push(SemanticLine::default());
+                    let anchor = self
+                        .rows
+                        .last()
+                        .map_or(0, |line| line.anchor.saturating_add(1));
+                    self.rows.push(SemanticLine {
+                        spans: Vec::new(),
+                        anchor,
+                    });
                     column = 0;
                 }
                 self.rows
@@ -155,7 +172,22 @@ impl MarkdownLayout {
     }
 
     pub(super) fn visually_eq(&self, other: &Self) -> bool {
-        self.rows == other.rows
+        self.rows.len() == other.rows.len()
+            && self
+                .rows
+                .iter()
+                .zip(&other.rows)
+                .all(|(left, right)| left.spans == right.spans)
+    }
+
+    pub(super) fn anchor_for_row(&self, row: usize) -> usize {
+        self.rows.get(row).map_or(0, |line| line.anchor)
+    }
+
+    pub(super) fn row_for_anchor(&self, anchor: usize) -> usize {
+        self.rows
+            .partition_point(|line| line.anchor <= anchor)
+            .saturating_sub(1)
     }
 
     pub(super) fn line(&self, index: usize, theme: &Theme) -> Option<Line<'static>> {
@@ -172,6 +204,18 @@ impl MarkdownLayout {
                 .collect::<Vec<_>>(),
         ))
     }
+}
+
+fn contains_image(source: &str) -> bool {
+    source.match_indices("![").any(|(index, _)| {
+        source[..index]
+            .bytes()
+            .rev()
+            .take_while(|byte| *byte == b'\\')
+            .count()
+            % 2
+            == 0
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -654,10 +698,20 @@ impl MarkdownBuilder {
     }
 
     fn finish(self) -> Vec<SemanticLine> {
-        self.logical
-            .into_iter()
-            .flat_map(|line| wrap_logical(line, self.width))
-            .collect()
+        let mut rows = Vec::new();
+        let mut anchor = 0usize;
+        for line in self.logical {
+            let content_length = line
+                .content
+                .iter()
+                .map(|span| span.text.graphemes(true).count())
+                .sum::<usize>();
+            rows.extend(wrap_logical(line, self.width, anchor));
+            anchor = anchor
+                .saturating_add(content_length.max(1))
+                .saturating_add(1);
+        }
+        rows
     }
 }
 
@@ -696,14 +750,18 @@ fn spans_width(spans: &[SemanticSpan]) -> usize {
     spans.iter().map(|span| span.text.width()).sum()
 }
 
-fn wrap_logical(line: LogicalLine, width: usize) -> Vec<SemanticLine> {
+fn wrap_logical(line: LogicalLine, width: usize, anchor: usize) -> Vec<SemanticLine> {
     let width = width.max(1);
     let mut rows = Vec::new();
-    let mut row = SemanticLine::default();
+    let mut row = SemanticLine {
+        spans: Vec::new(),
+        anchor,
+    };
     let first_prefix = fit_prefix(line.first_prefix, width);
     let continuation_prefix = fit_prefix(line.continuation_prefix, width);
     let mut column = append_prefix(&mut row, &first_prefix);
     let mut row_has_content = false;
+    let mut consumed = 0usize;
 
     for span in line.content {
         for grapheme in span.text.graphemes(true) {
@@ -715,12 +773,18 @@ fn wrap_logical(line: LogicalLine, width: usize) -> Vec<SemanticLine> {
             };
             if row_has_content && column.saturating_add(grapheme_width) > width {
                 rows.push(row);
-                row = SemanticLine::default();
+                row = SemanticLine {
+                    spans: Vec::new(),
+                    anchor: anchor.saturating_add(consumed),
+                };
                 column = append_prefix(&mut row, &continuation_prefix);
                 row_has_content = false;
             }
             if !row_has_content && column > 0 && column.saturating_add(grapheme_width) > width {
-                row = SemanticLine::default();
+                row = SemanticLine {
+                    spans: Vec::new(),
+                    anchor: anchor.saturating_add(consumed),
+                };
                 column = 0;
             }
             row.push(SemanticSpan {
@@ -730,6 +794,7 @@ fn wrap_logical(line: LogicalLine, width: usize) -> Vec<SemanticLine> {
             });
             column = column.saturating_add(grapheme_width);
             row_has_content = true;
+            consumed = consumed.saturating_add(1);
         }
     }
     rows.push(row);
@@ -771,25 +836,27 @@ fn fit_prefix(prefix: Vec<SemanticSpan>, width: usize) -> Vec<SemanticSpan> {
 }
 
 fn unclosed_fence_start(source: &str) -> Option<usize> {
-    let mut open: Option<(usize, char, usize)> = None;
+    let mut open: Option<(usize, char, usize, FenceContainer)> = None;
     let mut offset = 0usize;
     for line_with_ending in source.split_inclusive('\n') {
         let line = line_with_ending.trim_end_matches(['\r', '\n']);
         if let Some(candidate) = container_fence_candidate(line) {
-            let character = candidate.chars().next();
+            let character = candidate.text.chars().next();
             if matches!(character, Some('`' | '~')) {
                 let character = character.expect("fence character");
                 let length = candidate
+                    .text
                     .chars()
                     .take_while(|current| *current == character)
                     .count();
                 if length >= 3 {
                     match open {
-                        None => open = Some((offset, character, length)),
-                        Some((_, open_character, open_length))
+                        None => open = Some((offset, character, length, candidate.container)),
+                        Some((_, open_character, open_length, open_container))
                             if open_character == character
                                 && length >= open_length
-                                && candidate[length..].trim().is_empty() =>
+                                && candidate.text[length..].trim().is_empty()
+                                && open_container.matches(candidate.container) =>
                         {
                             open = None;
                         }
@@ -800,32 +867,69 @@ fn unclosed_fence_start(source: &str) -> Option<usize> {
         }
         offset = offset.saturating_add(line_with_ending.len());
     }
-    open.map(|(start, _, _)| start)
+    open.map(|(start, _, _, _)| start)
 }
 
-fn container_fence_candidate(mut line: &str) -> Option<&str> {
-    loop {
-        let indent = line
-            .chars()
-            .take_while(|character| *character == ' ')
-            .count();
-        if indent > 3 {
-            return None;
-        }
-        line = &line[indent..];
-        if let Some(quoted) = line.strip_prefix('>') {
-            line = quoted.strip_prefix(' ').unwrap_or(quoted);
-            continue;
-        }
-        if let Some(list_item) = strip_list_marker(line) {
-            line = list_item;
-            continue;
-        }
-        return Some(line);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FenceContainer {
+    quote_depth: usize,
+    indent: usize,
+    list_indent: Option<usize>,
+}
+
+impl FenceContainer {
+    fn matches(self, closing: Self) -> bool {
+        self.quote_depth == closing.quote_depth
+            && match self.list_indent {
+                Some(required) => {
+                    closing.list_indent == Some(required) || closing.indent >= required
+                }
+                None => closing.list_indent.is_none(),
+            }
     }
 }
 
-fn strip_list_marker(line: &str) -> Option<&str> {
+struct FenceCandidate<'a> {
+    text: &'a str,
+    container: FenceContainer,
+}
+
+fn container_fence_candidate(mut line: &str) -> Option<FenceCandidate<'_>> {
+    let mut quote_depth = 0usize;
+    let mut indent = 0usize;
+    loop {
+        let spaces = line
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        if spaces > 3 {
+            return None;
+        }
+        indent = indent.saturating_add(spaces);
+        line = &line[spaces..];
+        let Some(quoted) = line.strip_prefix('>') else {
+            break;
+        };
+        quote_depth = quote_depth.saturating_add(1);
+        line = quoted.strip_prefix(' ').unwrap_or(quoted);
+        indent = 0;
+    }
+    let list = strip_list_marker(line);
+    let (text, list_indent) = match list {
+        Some((item, marker_width)) => (item, Some(indent.saturating_add(marker_width))),
+        None => (line, None),
+    };
+    Some(FenceCandidate {
+        text,
+        container: FenceContainer {
+            quote_depth,
+            indent,
+            list_indent,
+        },
+    })
+}
+
+fn strip_list_marker(line: &str) -> Option<(&str, usize)> {
     let marker_end = if line.starts_with(['-', '+', '*']) {
         1
     } else {
@@ -838,7 +942,7 @@ fn strip_list_marker(line: &str) -> Option<&str> {
         .chars()
         .take_while(|character| matches!(character, ' ' | '\t'))
         .count();
-    (spaces > 0).then(|| &rest[spaces..])
+    (spaces > 0).then(|| (&rest[spaces..], marker_end.saturating_add(spaces)))
 }
 
 struct SyntaxSelectors {
@@ -1054,6 +1158,16 @@ mod tests {
         ] {
             assert_eq!(symbols(&MarkdownLayout::new(source, 80)).join("\n"), source);
         }
+        let mismatched = "> ```rust\n> fn main()\n```";
+        assert_eq!(
+            symbols(&MarkdownLayout::new(mismatched, 80)).join("\n"),
+            mismatched
+        );
+
+        let nested_closed = "> - ~~~rust\n>   fn main()\n>   ~~~";
+        let rendered = symbols(&MarkdownLayout::new(nested_closed, 80)).join("\n");
+        assert!(rendered.contains("┌─ rust"), "{rendered:?}");
+        assert!(!rendered.contains("~~~"), "{rendered:?}");
     }
 
     #[test]
@@ -1083,10 +1197,37 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_images_preserve_alt_destination_and_title_as_markdown_text() {
-        let source = "Before ![diagram](img.png \"architecture\") after";
+    fn unsupported_footnotes_math_and_definition_lists_preserve_their_text() {
+        let source = "term\n: definition\n\nFootnote[^note] and $x + y$.\n\n[^note]: details";
+        let rendered = symbols(&MarkdownLayout::new(source, 120)).join("\n");
 
-        assert_eq!(symbols(&MarkdownLayout::new(source, 80)).join(""), source);
+        for content in [
+            "term",
+            ": definition",
+            "Footnote",
+            "note",
+            "$x + y$",
+            "details",
+        ] {
+            assert!(
+                rendered.contains(content),
+                "missing {content:?}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_images_preserve_alt_destination_and_title_as_markdown_text() {
+        for source in [
+            "Before ![diagram](img.png \"architecture\") after",
+            "![escaped](img\\(1\\).png 'single title')",
+            "![reference][diagram]\n\n[diagram]: img.png (parenthesized)",
+        ] {
+            assert_eq!(
+                symbols(&MarkdownLayout::new(source, 120)).join("\n"),
+                source
+            );
+        }
     }
 
     #[test]
