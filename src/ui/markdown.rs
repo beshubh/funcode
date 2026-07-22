@@ -637,7 +637,12 @@ fn wrap_logical(line: LogicalLine, width: usize) -> Vec<SemanticLine> {
 
     for span in line.content {
         for grapheme in span.text.graphemes(true) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+            let source_width = UnicodeWidthStr::width(grapheme).max(1);
+            let (grapheme, grapheme_width) = if source_width > width {
+                ("\u{fffd}", 1)
+            } else {
+                (grapheme, source_width)
+            };
             if !row_has_content && column > 0 && column.saturating_add(grapheme_width) > width {
                 row = SemanticLine::default();
                 column = 0;
@@ -1027,6 +1032,11 @@ mod tests {
 
         assert!(rows.iter().all(|row| row.width() <= 3), "{rows:?}");
         assert!(rows.join("").contains('🦀'));
+    }
+
+    #[test]
+    fn one_cell_layouts_use_a_safe_placeholder_for_wide_graphemes() {
+        assert_eq!(symbols(&MarkdownLayout::new("🦀", 1)), ["�"]);
     }
 
     #[test]
