@@ -830,6 +830,7 @@ mod tests {
                         input_tokens: 100,
                         output_tokens: 25,
                         total_tokens: 125,
+                        reasoning_tokens: 0,
                     })),
                     Ok(ProviderEvent::Completed(history)),
                 ])) as ProviderStream)
@@ -854,6 +855,7 @@ mod tests {
                     input_tokens: 100,
                     output_tokens: 25,
                     total_tokens: 125,
+                    reasoning_tokens: 0,
                 }
         )));
         runner.shutdown();
@@ -1366,6 +1368,7 @@ mod tests {
                     input_tokens: 1,
                     output_tokens: 1,
                     total_tokens: 2,
+                    reasoning_tokens: 0,
                 },
             })
             .unwrap();

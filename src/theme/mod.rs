@@ -93,6 +93,7 @@ struct ThemeDefinition {
     id: ThemeId,
     appearance: ThemeAppearance,
     background: Color,
+    transcript_surface: Color,
     foreground: Color,
     muted: Color,
     border: Color,
@@ -111,6 +112,7 @@ const TERMINAL: ThemeDefinition = ThemeDefinition {
     id: ThemeId::Terminal,
     appearance: ThemeAppearance::Terminal,
     background: Color::Reset,
+    transcript_surface: Color::DarkGray,
     foreground: Color::Reset,
     muted: Color::DarkGray,
     border: Color::DarkGray,
@@ -136,6 +138,7 @@ const FUN_DARK: ThemeDefinition = ThemeDefinition {
     id: ThemeId::FunDark,
     appearance: ThemeAppearance::Dark,
     background: Color::Rgb(13, 17, 23),
+    transcript_surface: Color::Rgb(40, 43, 50),
     foreground: Color::Rgb(230, 237, 243),
     muted: Color::Rgb(139, 148, 158),
     border: Color::Rgb(48, 54, 61),
@@ -161,6 +164,7 @@ const MIDNIGHT: ThemeDefinition = ThemeDefinition {
     id: ThemeId::Midnight,
     appearance: ThemeAppearance::Dark,
     background: Color::Rgb(11, 16, 32),
+    transcript_surface: Color::Rgb(30, 41, 59),
     foreground: Color::Rgb(229, 231, 235),
     muted: Color::Rgb(148, 163, 184),
     border: Color::Rgb(51, 65, 85),
@@ -186,6 +190,7 @@ const PAPER: ThemeDefinition = ThemeDefinition {
     id: ThemeId::Paper,
     appearance: ThemeAppearance::Light,
     background: Color::Rgb(250, 250, 249),
+    transcript_surface: Color::Rgb(231, 229, 228),
     foreground: Color::Rgb(28, 25, 23),
     muted: Color::Rgb(120, 113, 108),
     border: Color::Rgb(214, 211, 209),
@@ -212,6 +217,7 @@ pub struct Theme {
     id: ThemeId,
     appearance: ThemeAppearance,
     styles: [Style; THEME_ROLE_COUNT],
+    transcript_surface: Style,
     border_set: border::Set<'static>,
 }
 
@@ -267,6 +273,7 @@ impl Theme {
             id,
             appearance: definition.appearance,
             styles,
+            transcript_surface: Style::default().bg(definition.transcript_surface),
             border_set: border::ROUNDED,
         }
     }
@@ -281,6 +288,10 @@ impl Theme {
 
     pub fn style(&self, role: ThemeRole) -> Style {
         self.styles[role as usize]
+    }
+
+    pub(crate) fn transcript_surface(&self) -> Style {
+        self.transcript_surface
     }
 
     pub const fn border_set(&self) -> border::Set<'static> {

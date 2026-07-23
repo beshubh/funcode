@@ -1,4 +1,4 @@
-use super::markdown::MarkdownLayout;
+use super::markdown::{MarkdownAnchor, MarkdownLayout};
 use crate::{
     app::{
         App, ToolOutputLayoutId, ToolOutputRowAnchor, ToolOutputRowIndex, ToolOutputScrollMetrics,
@@ -7,15 +7,14 @@ use crate::{
     theme::{Theme, ThemeId, ThemeRole},
     transcript::{
         ActivityStatus, AssistantMessage, AssistantStatus, CodeRangeArtifact, Entry, EntryId,
-        EntryKind, FileReferenceArtifact, PatchArtifact, Reasoning, RetryAttempt,
-        SearchResultsArtifact, TerminalArtifact, TextDetailArtifact, ToolArtifact, ToolCall,
-        UserMessage,
+        EntryKind, FileReferenceArtifact, PatchArtifact, RetryAttempt, SearchResultsArtifact,
+        TerminalArtifact, TextDetailArtifact, ToolArtifact, ToolCall, UserMessage,
     },
 };
 use ratatui::{
     Frame,
     buffer::Buffer,
-    layout::{Margin, Rect},
+    layout::Rect,
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -24,10 +23,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     ops::Range,
-    sync::{
-        Arc, Condvar, Mutex,
-        mpsc::{self, Receiver},
-    },
+    sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -56,7 +52,8 @@ const RENDERED_SLICE_CACHE_CAPACITY: usize = 32;
 const RENDERED_SLICE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const MARKDOWN_LAYOUT_CACHE_CAPACITY: usize = 32;
 const MARKDOWN_LAYOUT_CACHE_BYTES: usize = 4 * 1024 * 1024;
-const MARKDOWN_FOREGROUND_SOURCE_BYTES: usize = 4 * 1024;
+const MARKDOWN_STREAM_REBUILD_MIN_GROWTH: usize = 4 * 1024;
+const MARKDOWN_FOREGROUND_REPROJECT_BYTES: usize = 4 * 1024;
 const TOOL_OUTPUT_LAYOUT_CACHE_CAPACITY: usize = 32;
 const TOOL_OUTPUT_LAYOUT_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const TOOL_OUTPUT_SPARSE_SOURCE_BYTES: usize = 512 * 1024;
@@ -64,6 +61,7 @@ const TOOL_OUTPUT_SPARSE_SOURCE_BYTES: usize = 512 * 1024;
 // addition to the row allocation itself. Sparse storage is preferable before
 // those allocations approach the shared cache budget.
 const TOOL_OUTPUT_DENSE_ROW_ESTIMATED_BYTES: usize = 512;
+const TOOL_ADJACENT_GAP_ROWS: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeightKey {
@@ -251,7 +249,7 @@ impl ToolOutputBodyLayout {
                     rows.clear();
                     let mut logical_line = 0usize;
                     for line in
-                        message_line_iter(&artifact.output, ratatui::style::Style::default())
+                        output_message_line_iter(&artifact.output, ratatui::style::Style::default())
                     {
                         push_indexed_output_line(
                             rows,
@@ -426,13 +424,13 @@ fn terminal_tail_state(output: &str) -> TerminalAppendResult {
         .count()
         .saturating_add(1);
     let tail = output.rsplit('\n').next().unwrap_or_default();
-    let initial_column = if logical_lines == 1 { 2 } else { 0 };
+    let initial_column = if logical_lines == 1 { 1 } else { 0 };
     let safe = crate::composer::safe_single_line(tail, initial_column);
     TerminalAppendResult {
         indexed_rows: 0,
         logical_lines,
         tail_logical_column: initial_column.saturating_add(UnicodeWidthStr::width(safe.as_str())),
-        tail_rendered_bytes: "│ ".len().saturating_add(safe.len()),
+        tail_rendered_bytes: " ".len().saturating_add(safe.len()),
     }
 }
 
@@ -451,9 +449,9 @@ fn append_terminal_suffix(
         if part_index > 0 {
             logical_lines = logical_lines.saturating_add(1);
             logical_column = 0;
-            rendered_bytes = "│ ".len();
+            rendered_bytes = " ".len();
             let line = Line::from(format!(
-                "│ {}",
+                " {}",
                 crate::composer::safe_single_line(part, logical_column)
             ));
             let before = rows.len();
@@ -524,9 +522,9 @@ fn append_sparse_terminal_suffix(
         } else {
             logical_lines = logical_lines.saturating_add(1);
             logical_column = 0;
-            rendered_bytes = "│ ".len();
+            rendered_bytes = " ".len();
             encoded.push('\r');
-            let decorated = format!("│ {safe}");
+            let decorated = format!(" {safe}");
             let appended_rows = append_sparse_wrapped_line(encoded, &decorated, width);
             *row_count = row_count.saturating_add(appended_rows);
             indexed_rows = indexed_rows.saturating_add(appended_rows);
@@ -610,6 +608,14 @@ impl MarkdownSourceUpdate {
             Self::Reuse { .. } => 0,
         }
     }
+
+    fn assembled_bytes(&self) -> usize {
+        match self {
+            Self::Replace(source) => source.len(),
+            Self::Append { from_len, suffix } => from_len.saturating_add(suffix.len()),
+            Self::Reuse { source_len } => *source_len,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -617,11 +623,11 @@ struct MarkdownLayoutResult {
     entry_id: EntryId,
     key: MarkdownLayoutKey,
     layout: Option<MarkdownLayout>,
+    retry: bool,
 }
 
 struct MarkdownLayoutRunner {
     requests: Arc<(Mutex<MarkdownRunnerState>, Condvar)>,
-    results: Option<Receiver<MarkdownLayoutResult>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -632,14 +638,35 @@ struct MarkdownWorkerSource {
     source: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MarkdownRunnerState {
     pending: VecDeque<MarkdownLayoutRequest>,
     pending_bytes: usize,
+    active: Option<(EntryId, MarkdownLayoutKey)>,
     sources: VecDeque<MarkdownWorkerSource>,
     source_bytes: usize,
+    results: VecDeque<MarkdownLayoutResult>,
+    result_bytes: usize,
+    accept_results: bool,
     shutdown: bool,
     stopped: bool,
+}
+
+impl Default for MarkdownRunnerState {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            active: None,
+            sources: VecDeque::new(),
+            source_bytes: 0,
+            results: VecDeque::new(),
+            result_bytes: 0,
+            accept_results: true,
+            shutdown: false,
+            stopped: false,
+        }
+    }
 }
 
 impl std::fmt::Debug for MarkdownLayoutRunner {
@@ -660,7 +687,6 @@ impl MarkdownLayoutRunner {
     fn spawn_with(build: impl Fn(&str, usize) -> MarkdownLayout + Send + 'static) -> Self {
         let requests = Arc::new((Mutex::new(MarkdownRunnerState::default()), Condvar::new()));
         let worker_requests = Arc::clone(&requests);
-        let (result_tx, result_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
             loop {
                 let (request, source) = {
@@ -678,51 +704,80 @@ impl MarkdownLayoutRunner {
                         state.stopped = true;
                         return;
                     }
-                    let Some(request) = state.pending.pop_front() else {
+                    let Some(mut request) = state.pending.pop_front() else {
                         continue;
                     };
                     state.pending_bytes =
                         state.pending_bytes.saturating_sub(request.source.bytes());
-                    let source = take_worker_source(&mut state, &request);
+                    state.active = Some((request.entry_id, request.key));
+                    let source = take_worker_source(&mut state, &mut request);
                     (request, source)
                 };
-                let layout = source.as_ref().and_then(|source| {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        build(&source.source, request.content_width)
-                    }))
-                    .ok()
-                });
+                let (layout, retry) = match source.as_ref() {
+                    Some(source) => {
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            build(&source.source, request.content_width)
+                        })) {
+                            Ok(layout) => (Some(layout), false),
+                            Err(_) => (None, false),
+                        }
+                    }
+                    None => (None, true),
+                };
+                let layout = layout.filter(|layout| layout.bytes() <= MARKDOWN_LAYOUT_CACHE_BYTES);
                 {
                     let (state, _) = &*worker_requests;
                     let Ok(mut state) = state.lock() else {
                         return;
                     };
+                    state.active = None;
                     if let Some(source) = source {
                         store_worker_source(&mut state, source);
                     }
-                    if state.shutdown {
+                    if state.shutdown || !state.accept_results {
                         state.stopped = true;
                         return;
                     }
-                }
-                if result_tx
-                    .send(MarkdownLayoutResult {
+                    let superseded = state.pending.iter().any(|pending| {
+                        pending.entry_id == request.entry_id
+                            && pending.content_width == request.content_width
+                            && pending.key.revision > request.key.revision
+                    });
+                    if superseded {
+                        continue;
+                    }
+                    let result = MarkdownLayoutResult {
                         entry_id: request.entry_id,
                         key: request.key,
                         layout,
-                    })
-                    .is_err()
-                {
-                    if let Ok(mut state) = worker_requests.0.lock() {
-                        state.stopped = true;
+                        retry,
+                    };
+                    let bytes = result.layout.as_ref().map_or(0, MarkdownLayout::bytes);
+                    if let Some(index) = state.results.iter().position(|queued| {
+                        queued.entry_id == result.entry_id && queued.key.width == result.key.width
+                    }) && let Some(previous) = state.results.remove(index)
+                    {
+                        state.result_bytes = state.result_bytes.saturating_sub(
+                            previous.layout.as_ref().map_or(0, MarkdownLayout::bytes),
+                        );
                     }
-                    break;
+                    state.result_bytes = state.result_bytes.saturating_add(bytes);
+                    state.results.push_back(result);
+                    while state.results.len() > MARKDOWN_LAYOUT_CACHE_CAPACITY
+                        || state.result_bytes > MARKDOWN_LAYOUT_CACHE_BYTES
+                    {
+                        let Some(evicted) = state.results.pop_front() else {
+                            break;
+                        };
+                        state.result_bytes = state.result_bytes.saturating_sub(
+                            evicted.layout.as_ref().map_or(0, MarkdownLayout::bytes),
+                        );
+                    }
                 }
             }
         });
         Self {
             requests,
-            results: Some(result_rx),
             worker: Some(worker),
         }
     }
@@ -736,7 +791,19 @@ impl MarkdownLayoutRunner {
         if state.shutdown || state.stopped {
             return Err(());
         }
+        if request.source.bytes() > MARKDOWN_LAYOUT_CACHE_BYTES
+            || request.source.assembled_bytes() > MARKDOWN_LAYOUT_CACHE_BYTES
+        {
+            return Err(());
+        }
         let mut superseded = Vec::new();
+        if let Some((entry_id, key)) = state.active
+            && entry_id == request.entry_id
+            && key.width == request.key.width
+            && key != request.key
+        {
+            superseded.push((entry_id, key));
+        }
         if let Some(pending) = state.pending.iter_mut().find(|pending| {
             pending.entry_id == request.entry_id && pending.content_width == request.content_width
         }) {
@@ -754,9 +821,8 @@ impl MarkdownLayoutRunner {
             state.pending_bytes = state.pending_bytes.saturating_add(request.source.bytes());
             state.pending.push_back(request);
         }
-        while (state.pending.len() > MARKDOWN_LAYOUT_CACHE_CAPACITY
-            || state.pending_bytes > MARKDOWN_LAYOUT_CACHE_BYTES)
-            && state.pending.len() > 1
+        while state.pending.len() > MARKDOWN_LAYOUT_CACHE_CAPACITY
+            || state.pending_bytes > MARKDOWN_LAYOUT_CACHE_BYTES
         {
             let Some(evicted) = state.pending.pop_front() else {
                 break;
@@ -769,7 +835,30 @@ impl MarkdownLayoutRunner {
     }
 
     fn try_result(&self) -> Option<MarkdownLayoutResult> {
-        self.results.as_ref()?.try_recv().ok()
+        let mut state = self.requests.0.lock().ok()?;
+        let result = state.results.pop_front()?;
+        state.result_bytes = state
+            .result_bytes
+            .saturating_sub(result.layout.as_ref().map_or(0, MarkdownLayout::bytes));
+        Some(result)
+    }
+
+    fn outstanding(&self) -> HashSet<(EntryId, MarkdownLayoutKey)> {
+        let Ok(state) = self.requests.0.lock() else {
+            return HashSet::new();
+        };
+        state
+            .pending
+            .iter()
+            .map(|request| (request.entry_id, request.key))
+            .chain(state.active)
+            .chain(
+                state
+                    .results
+                    .iter()
+                    .map(|result| (result.entry_id, result.key)),
+            )
+            .collect()
     }
 
     fn stop(&mut self, join: bool) {
@@ -801,7 +890,17 @@ impl MarkdownLayoutRunner {
 
     #[cfg(test)]
     fn disconnect_results(&mut self) {
-        self.results.take();
+        if let Ok(mut state) = self.requests.0.lock() {
+            state.accept_results = false;
+            state.results.clear();
+            state.result_bytes = 0;
+        }
+    }
+
+    #[cfg(test)]
+    fn result_stats(&self) -> (usize, usize) {
+        let state = self.requests.0.lock().expect("Markdown runner state");
+        (state.results.len(), state.result_bytes)
     }
 }
 
@@ -813,7 +912,7 @@ impl Drop for MarkdownLayoutRunner {
 
 fn take_worker_source(
     state: &mut MarkdownRunnerState,
-    request: &MarkdownLayoutRequest,
+    request: &mut MarkdownLayoutRequest,
 ) -> Option<MarkdownWorkerSource> {
     let existing = state
         .sources
@@ -823,7 +922,11 @@ fn take_worker_source(
     if let Some(existing) = &existing {
         state.source_bytes = state.source_bytes.saturating_sub(existing.source.len());
     }
-    let mut source = match (existing, &request.source) {
+    let update = std::mem::replace(
+        &mut request.source,
+        MarkdownSourceUpdate::Reuse { source_len: 0 },
+    );
+    let mut source = match (existing, update) {
         (Some(existing), _) if existing.revision > request.key.revision => {
             store_worker_source(state, existing);
             return None;
@@ -831,18 +934,18 @@ fn take_worker_source(
         (_, MarkdownSourceUpdate::Replace(source)) => MarkdownWorkerSource {
             entry_id: request.entry_id,
             revision: request.key.revision,
-            source: source.clone(),
+            source,
         },
         (Some(existing), _) if existing.revision == request.key.revision => existing,
         (Some(mut existing), MarkdownSourceUpdate::Append { from_len, suffix })
-            if existing.revision < request.key.revision && existing.source.len() == *from_len =>
+            if existing.revision < request.key.revision && existing.source.len() == from_len =>
         {
-            existing.source.push_str(suffix);
+            existing.source.push_str(&suffix);
             existing.revision = request.key.revision;
             existing
         }
         (Some(mut existing), MarkdownSourceUpdate::Reuse { source_len })
-            if existing.revision < request.key.revision && existing.source.len() == *source_len =>
+            if existing.revision < request.key.revision && existing.source.len() == source_len =>
         {
             existing.revision = request.key.revision;
             existing
@@ -901,12 +1004,20 @@ struct LiteralMarkdownFallback {
     source_len: usize,
     layout: Arc<MarkdownLayout>,
     bytes: usize,
+    pending_syntax: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarkdownDispatch {
+    revision: u64,
+    source_len: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MarkdownCacheToken {
     Semantic(EntryId, MarkdownLayoutKey),
     Fallback(EntryId, usize),
+    OversizedFallback(EntryId, usize),
 }
 
 #[derive(Debug, Default)]
@@ -918,7 +1029,10 @@ struct RenderCacheInner {
     markdown_layout_bytes: usize,
     markdown_pending: HashSet<(EntryId, MarkdownLayoutKey)>,
     markdown_force_replace: HashSet<EntryId>,
+    markdown_dispatches: HashMap<(EntryId, usize), MarkdownDispatch>,
+    markdown_skipped: HashSet<(EntryId, MarkdownLayoutKey)>,
     markdown_fallbacks: VecDeque<LiteralMarkdownFallback>,
+    markdown_oversized_fallback: Option<LiteralMarkdownFallback>,
     markdown_fallback_bytes: usize,
     markdown_recency: VecDeque<MarkdownCacheToken>,
     tool_output_layouts: VecDeque<CachedToolOutputLayout>,
@@ -926,6 +1040,8 @@ struct RenderCacheInner {
     height_builds: usize,
     slice_builds: usize,
     markdown_layout_builds: usize,
+    markdown_requests: usize,
+    markdown_request_bytes: usize,
     visible_rows_copied: usize,
     tool_output_layout_builds: usize,
     tool_output_rows_indexed: usize,
@@ -978,8 +1094,31 @@ impl RenderCacheInner {
                             self.markdown_fallback_bytes.saturating_sub(evicted.bytes);
                     }
                 }
+                MarkdownCacheToken::OversizedFallback(entry_id, width) => {
+                    if self
+                        .markdown_oversized_fallback
+                        .as_ref()
+                        .is_some_and(|cached| cached.entry_id == entry_id && cached.width == width)
+                        && let Some(evicted) = self.markdown_oversized_fallback.take()
+                    {
+                        self.markdown_fallback_bytes =
+                            self.markdown_fallback_bytes.saturating_sub(evicted.bytes);
+                    }
+                }
             }
         }
+    }
+
+    fn skip_markdown(&mut self, entry_id: EntryId, key: MarkdownLayoutKey) {
+        self.markdown_skipped.retain(|(cached_id, cached_key)| {
+            *cached_id != entry_id || cached_key.width != key.width || *cached_key == key
+        });
+        if self.markdown_skipped.len() >= MARKDOWN_LAYOUT_CACHE_CAPACITY
+            && let Some(evicted) = self.markdown_skipped.iter().next().copied()
+        {
+            self.markdown_skipped.remove(&evicted);
+        }
+        self.markdown_skipped.insert((entry_id, key));
     }
 }
 
@@ -1005,11 +1144,11 @@ struct LayoutIndex {
     entries_measured: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ReflowAnchor {
     entry_id: EntryId,
     local_row: usize,
-    markdown_anchor: Option<usize>,
+    markdown_anchor: Option<MarkdownAnchor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1250,6 +1389,27 @@ impl TranscriptRenderCache {
         inner.slice_builds = inner.slice_builds.saturating_add(1);
     }
 
+    fn prune_markdown_pending(&self) {
+        let outstanding = self.markdown_runner.outstanding();
+        let mut inner = self.inner.borrow_mut();
+        let expired = inner
+            .markdown_pending
+            .iter()
+            .filter(|pending| !outstanding.contains(pending))
+            .copied()
+            .collect::<Vec<_>>();
+        for (entry_id, key) in expired {
+            inner.markdown_pending.remove(&(entry_id, key));
+            if inner
+                .markdown_dispatches
+                .get(&(entry_id, key.width))
+                .is_some_and(|dispatch| dispatch.revision == key.revision)
+            {
+                inner.markdown_dispatches.remove(&(entry_id, key.width));
+            }
+        }
+    }
+
     fn markdown_layout(&self, entry: &Entry, width: usize) -> Option<Arc<MarkdownLayout>> {
         let EntryKind::Assistant(message) = &entry.kind else {
             return None;
@@ -1279,21 +1439,39 @@ impl TranscriptRenderCache {
             }
         }
 
-        let content_width = width.saturating_sub(2).max(1);
-        let should_request = self
-            .inner
-            .borrow_mut()
-            .markdown_pending
-            .insert((entry.id, key));
+        let content_width = width.max(1);
+        self.prune_markdown_pending();
         let (fallback_layout, source_update) = {
             let mut inner = self.inner.borrow_mut();
             let force_replace = inner.markdown_force_replace.remove(&entry.id);
+            inner.markdown_skipped.retain(|(cached_id, cached_key)| {
+                *cached_id != entry.id || cached_key.width != width || *cached_key == key
+            });
+            let skipped = inner.markdown_skipped.contains(&(entry.id, key));
+            let previous_dispatch = inner.markdown_dispatches.get(&(entry.id, width)).copied();
+            let final_revision = !matches!(message.status, AssistantStatus::Streaming);
+            let growth_allows_dispatch = previous_dispatch.is_none_or(|previous| {
+                previous.revision != key.revision
+                    && (final_revision
+                        || message.text.len()
+                            >= previous.source_len.saturating_add(
+                                previous.source_len.max(MARKDOWN_STREAM_REBUILD_MIN_GROWTH),
+                            ))
+            });
+            let should_dispatch = !skipped && (force_replace || growth_allows_dispatch);
             let existing = inner
                 .markdown_fallbacks
                 .iter()
                 .position(|fallback| fallback.entry_id == entry.id && fallback.width == width)
-                .and_then(|index| inner.markdown_fallbacks.remove(index));
-            let had_existing = existing.is_some();
+                .and_then(|index| inner.markdown_fallbacks.remove(index))
+                .or_else(|| {
+                    inner
+                        .markdown_oversized_fallback
+                        .as_ref()
+                        .filter(|fallback| fallback.entry_id == entry.id && fallback.width == width)
+                        .map(|_| ())?;
+                    inner.markdown_oversized_fallback.take()
+                });
             let mut fallback = if let Some(fallback) = existing {
                 inner.markdown_fallback_bytes =
                     inner.markdown_fallback_bytes.saturating_sub(fallback.bytes);
@@ -1307,45 +1485,111 @@ impl TranscriptRenderCache {
                     source_len: message.text.len(),
                     bytes: layout.bytes(),
                     layout,
+                    pending_syntax: foreground_has_incomplete_syntax(&message.text),
                 }
             };
-            let source_update = if force_replace {
-                MarkdownSourceUpdate::Replace(message.text.clone())
-            } else if fallback.revision == entry.revision() {
-                MarkdownSourceUpdate::Reuse {
-                    source_len: message.text.len(),
-                }
-            } else if message.text.len() >= fallback.source_len
+            if fallback.revision != entry.revision()
+                && message.text.len() >= fallback.source_len
                 && message.text.is_char_boundary(fallback.source_len)
             {
-                let from_len = fallback.source_len;
                 let suffix = message.text[fallback.source_len..].to_owned();
-                Arc::make_mut(&mut fallback.layout).append_literal(&suffix, content_width);
+                if !fallback.layout.is_literal_projection()
+                    || (fallback.pending_syntax && foreground_suffix_may_close_syntax(&suffix))
+                {
+                    fallback.layout =
+                        Arc::new(markdown_foreground_layout(&message.text, content_width));
+                } else if suffix.len() <= MARKDOWN_FOREGROUND_REPROJECT_BYTES
+                    || foreground_suffix_requires_rebuild(&suffix)
+                {
+                    let projected = super::markdown::foreground_suffix(&suffix);
+                    Arc::make_mut(&mut fallback.layout).append_literal(&projected, content_width);
+                } else {
+                    Arc::make_mut(&mut fallback.layout).append_literal(&suffix, content_width);
+                }
                 fallback.source_len = message.text.len();
                 fallback.revision = entry.revision();
-                MarkdownSourceUpdate::Append { from_len, suffix }
-            } else {
+                fallback.pending_syntax = foreground_has_incomplete_syntax(&message.text);
+            } else if fallback.revision != entry.revision() {
                 fallback.source_len = message.text.len();
                 fallback.layout =
                     Arc::new(markdown_foreground_layout(&message.text, content_width));
                 fallback.revision = entry.revision();
-                MarkdownSourceUpdate::Replace(message.text.clone())
-            };
+                fallback.pending_syntax = foreground_has_incomplete_syntax(&message.text);
+            }
             fallback.bytes = fallback.layout.bytes();
             let layout = Arc::clone(&fallback.layout);
-            inner.markdown_fallback_bytes =
-                inner.markdown_fallback_bytes.saturating_add(fallback.bytes);
-            inner.markdown_fallbacks.push_back(fallback);
-            inner.touch_markdown(MarkdownCacheToken::Fallback(entry.id, width));
-            inner.enforce_markdown_bounds();
-            let source_update = if !had_existing || force_replace {
-                MarkdownSourceUpdate::Replace(message.text.clone())
+            if fallback.bytes <= MARKDOWN_LAYOUT_CACHE_BYTES {
+                inner.markdown_fallback_bytes =
+                    inner.markdown_fallback_bytes.saturating_add(fallback.bytes);
+                inner.markdown_fallbacks.push_back(fallback);
+                inner.touch_markdown(MarkdownCacheToken::Fallback(entry.id, width));
+                inner.enforce_markdown_bounds();
             } else {
-                source_update
+                if let Some(previous) = inner.markdown_oversized_fallback.take() {
+                    inner.markdown_fallback_bytes =
+                        inner.markdown_fallback_bytes.saturating_sub(previous.bytes);
+                }
+                inner.markdown_oversized_fallback = Some(fallback);
+                let oversized_bytes = inner
+                    .markdown_oversized_fallback
+                    .as_ref()
+                    .map_or(0, |item| item.bytes);
+                if oversized_bytes <= MARKDOWN_LAYOUT_CACHE_BYTES {
+                    inner.markdown_fallback_bytes = inner
+                        .markdown_fallback_bytes
+                        .saturating_add(oversized_bytes);
+                    inner.touch_markdown(MarkdownCacheToken::OversizedFallback(entry.id, width));
+                    inner.enforce_markdown_bounds();
+                } else {
+                    inner.markdown_oversized_fallback = None;
+                }
+            }
+            let source_update = if should_dispatch {
+                let update = if force_replace {
+                    MarkdownSourceUpdate::Replace(message.text.clone())
+                } else if let Some(previous) = previous_dispatch {
+                    if message.text.len() < previous.source_len
+                        || !message.text.is_char_boundary(previous.source_len)
+                    {
+                        MarkdownSourceUpdate::Replace(message.text.clone())
+                    } else {
+                        MarkdownSourceUpdate::Append {
+                            from_len: previous.source_len,
+                            suffix: message.text[previous.source_len..].to_owned(),
+                        }
+                    }
+                } else {
+                    MarkdownSourceUpdate::Replace(message.text.clone())
+                };
+                if update.bytes() > MARKDOWN_LAYOUT_CACHE_BYTES
+                    || update.assembled_bytes() > MARKDOWN_LAYOUT_CACHE_BYTES
+                {
+                    inner.skip_markdown(entry.id, key);
+                    None
+                } else {
+                    inner.markdown_pending.insert((entry.id, key));
+                    inner.markdown_dispatches.insert(
+                        (entry.id, width),
+                        MarkdownDispatch {
+                            revision: key.revision,
+                            source_len: message.text.len(),
+                        },
+                    );
+                    Some(update)
+                }
+            } else {
+                None
             };
             (layout, source_update)
         };
-        if should_request {
+        if let Some(source_update) = source_update {
+            {
+                let mut inner = self.inner.borrow_mut();
+                inner.markdown_requests = inner.markdown_requests.saturating_add(1);
+                inner.markdown_request_bytes = inner
+                    .markdown_request_bytes
+                    .saturating_add(source_update.bytes());
+            }
             match self.markdown_runner.request(MarkdownLayoutRequest {
                 entry_id: entry.id,
                 key,
@@ -1356,13 +1600,16 @@ impl TranscriptRenderCache {
                     let mut inner = self.inner.borrow_mut();
                     for superseded in superseded {
                         inner.markdown_pending.remove(&superseded);
+                        if superseded == (entry.id, key) {
+                            inner.markdown_dispatches.remove(&(entry.id, width));
+                            inner.skip_markdown(entry.id, key);
+                        }
                     }
                 }
                 Err(()) => {
-                    self.inner
-                        .borrow_mut()
-                        .markdown_pending
-                        .remove(&(entry.id, key));
+                    let mut inner = self.inner.borrow_mut();
+                    inner.markdown_pending.remove(&(entry.id, key));
+                    inner.markdown_dispatches.remove(&(entry.id, width));
                 }
             }
         }
@@ -1431,13 +1678,14 @@ impl TranscriptRenderCache {
 
     fn drain_markdown_results_inner(&self, app: Option<&App>) -> bool {
         let mut changed = false;
+        self.prune_markdown_pending();
         let reflow_anchor = app.and_then(|app| self.current_reflow_anchor(app));
         while let Some(result) = self.markdown_runner.try_result() {
             if let Some(layout) = result.layout {
                 if self.store_markdown_layout(result.entry_id, result.key, Arc::new(layout))
                     && self.pending_reflow_anchor.borrow().is_none()
                 {
-                    *self.pending_reflow_anchor.borrow_mut() = reflow_anchor;
+                    *self.pending_reflow_anchor.borrow_mut() = reflow_anchor.clone();
                 }
                 changed = true;
             } else {
@@ -1445,7 +1693,14 @@ impl TranscriptRenderCache {
                 inner
                     .markdown_pending
                     .remove(&(result.entry_id, result.key));
-                inner.markdown_force_replace.insert(result.entry_id);
+                if result.retry {
+                    inner.markdown_force_replace.insert(result.entry_id);
+                    inner
+                        .markdown_dispatches
+                        .remove(&(result.entry_id, result.key.width));
+                } else {
+                    inner.skip_markdown(result.entry_id, result.key);
+                }
             }
         }
         changed
@@ -1463,6 +1718,12 @@ impl TranscriptRenderCache {
     #[cfg(test)]
     fn markdown_layout_builds(&self) -> usize {
         self.inner.borrow().markdown_layout_builds
+    }
+
+    #[cfg(test)]
+    fn markdown_request_stats(&self) -> (usize, usize) {
+        let inner = self.inner.borrow();
+        (inner.markdown_requests, inner.markdown_request_bytes)
     }
 
     #[cfg(test)]
@@ -1484,7 +1745,7 @@ impl TranscriptRenderCache {
         revision: u64,
         width: usize,
         row: usize,
-    ) -> Option<usize> {
+    ) -> Option<MarkdownAnchor> {
         let inner = self.inner.borrow();
         let layout = inner
             .markdown_layouts
@@ -1499,6 +1760,17 @@ impl TranscriptRenderCache {
                     .iter()
                     .find(|fallback| fallback.entry_id == entry_id && fallback.width == width)
                     .filter(|fallback| fallback.revision == revision)
+                    .map(|fallback| Arc::clone(&fallback.layout))
+            })
+            .or_else(|| {
+                inner
+                    .markdown_oversized_fallback
+                    .as_ref()
+                    .filter(|fallback| {
+                        fallback.entry_id == entry_id
+                            && fallback.width == width
+                            && fallback.revision == revision
+                    })
                     .map(|fallback| Arc::clone(&fallback.layout))
             })?;
         Some(layout.anchor_for_row(row))
@@ -1529,14 +1801,12 @@ impl TranscriptRenderCache {
             local_row,
             markdown_anchor: matches!(source.kind, EntryKind::Assistant(_))
                 .then(|| {
-                    (local_row > 0).then(|| {
-                        self.markdown_anchor_for_row(
-                            indexed.id,
-                            source.revision(),
-                            key.width,
-                            local_row - 1,
-                        )
-                    })?
+                    self.markdown_anchor_for_row(
+                        indexed.id,
+                        source.revision(),
+                        key.width,
+                        local_row,
+                    )
                 })
                 .flatten(),
         })
@@ -1547,7 +1817,7 @@ impl TranscriptRenderCache {
         entry_id: EntryId,
         revision: u64,
         width: usize,
-        anchor: usize,
+        anchor: &MarkdownAnchor,
     ) -> Option<usize> {
         let inner = self.inner.borrow();
         let layout = inner
@@ -1563,6 +1833,17 @@ impl TranscriptRenderCache {
                     .iter()
                     .find(|fallback| fallback.entry_id == entry_id && fallback.width == width)
                     .filter(|fallback| fallback.revision == revision)
+                    .map(|fallback| Arc::clone(&fallback.layout))
+            })
+            .or_else(|| {
+                inner
+                    .markdown_oversized_fallback
+                    .as_ref()
+                    .filter(|fallback| {
+                        fallback.entry_id == entry_id
+                            && fallback.width == width
+                            && fallback.revision == revision
+                    })
                     .map(|fallback| Arc::clone(&fallback.layout))
             })?;
         Some(layout.row_for_anchor(anchor))
@@ -1608,11 +1889,48 @@ impl TranscriptRenderCache {
 }
 
 fn markdown_foreground_layout(source: &str, width: usize) -> MarkdownLayout {
-    if source.len() <= MARKDOWN_FOREGROUND_SOURCE_BYTES {
-        MarkdownLayout::unhighlighted(source, width)
+    MarkdownLayout::foreground(source, width)
+}
+
+fn foreground_suffix_requires_rebuild(suffix: &str) -> bool {
+    suffix.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'#' | b'*' | b'_' | b'~' | b'`' | b'[' | b']' | b'(' | b')' | b'<' | b'>' | b'!'
+        )
+    }) || suffix
+        .lines()
+        .any(|line| line.starts_with("- ") || line.starts_with("+ "))
+}
+
+fn foreground_has_incomplete_syntax(source: &str) -> bool {
+    let source = if source.len() <= 8192 {
+        std::borrow::Cow::Borrowed(source)
     } else {
-        MarkdownLayout::literal("Rendering Markdown…", width)
+        let prefix_end = (0..=4096)
+            .rev()
+            .find(|offset| source.is_char_boundary(*offset))
+            .unwrap_or(0);
+        let suffix_start = (source.len().saturating_sub(4096)..=source.len())
+            .find(|offset| source.is_char_boundary(*offset))
+            .unwrap_or(source.len());
+        std::borrow::Cow::Owned(format!(
+            "{}{}",
+            &source[..prefix_end],
+            &source[suffix_start..]
+        ))
+    };
+    let mut odd = false;
+    for delimiter in ["```", "~~~", "**", "~~", "`", "*", "_"] {
+        odd |= source.matches(delimiter).count() % 2 == 1;
     }
+    odd || source.matches('[').count() > source.matches(']').count()
+}
+
+fn foreground_suffix_may_close_syntax(suffix: &str) -> bool {
+    suffix
+        .bytes()
+        .any(|byte| matches!(byte, b'`' | b'*' | b'_' | b'~' | b']' | b')'))
 }
 
 struct RenderContext<'a> {
@@ -1639,7 +1957,6 @@ struct EntryRenderer<'a> {
     entry: &'a Entry,
     cache: &'a TranscriptRenderCache,
     expanded: bool,
-    animation_frame: usize,
     markdown_layout: Option<Arc<MarkdownLayout>>,
     available_height: usize,
     output_scroll_from_bottom: usize,
@@ -1674,7 +1991,6 @@ impl<'a> EntryRenderer<'a> {
             entry,
             cache,
             expanded,
-            animation_frame: app.animation_frame,
             markdown_layout: cache.markdown_layout(entry, width),
             available_height,
             output_scroll_from_bottom: output_maximum
@@ -1701,11 +2017,7 @@ impl<'a> EntryRenderer<'a> {
                 message,
                 layout: self.markdown_layout.as_deref(),
             }),
-            EntryKind::Reasoning(reasoning) => dispatch(&ReasoningRenderer {
-                reasoning,
-                expanded: self.expanded,
-                animation_frame: self.animation_frame,
-            }),
+            EntryKind::Reasoning(_) => dispatch(&HiddenRenderer),
             EntryKind::Tool(tool) => dispatch(&ToolRenderer {
                 tool,
                 expanded: self.expanded,
@@ -1788,7 +2100,7 @@ pub(super) fn render(
     cache: &TranscriptRenderCache,
 ) -> RenderResult {
     cache.drain_markdown_results_for(app);
-    let content_area = area.inner(Margin::new(2, 0));
+    let content_area = area;
     if app.transcript.entries().is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -1998,14 +2310,12 @@ fn ensure_layout_index(
                             .filter(|source| matches!(source.kind, EntryKind::Assistant(_)))
                             .and_then(|source| {
                                 let local_row = top.saturating_sub(entry.start);
-                                (local_row > 0).then(|| {
-                                    cache.markdown_anchor_for_row(
-                                        entry.id,
-                                        source.revision(),
-                                        previous.width,
-                                        local_row - 1,
-                                    )
-                                })?
+                                cache.markdown_anchor_for_row(
+                                    entry.id,
+                                    source.revision(),
+                                    previous.width,
+                                    local_row,
+                                )
                             }),
                     })
             })
@@ -2053,8 +2363,22 @@ fn ensure_layout_index(
         index.entries[..valid_prefix.min(index.entries.len())].to_vec()
     };
     let mut next_line = updated.last().map_or(0, |entry| entry.end);
+    let mut previous_visible_is_tool = updated
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, indexed)| indexed.start < indexed.end)
+        .map(|(index, _)| matches!(entries[index].kind, EntryKind::Tool(_)));
     for entry in &entries[valid_prefix..] {
         let height = measured_entry_height(entry, app, width, available_height, cache);
+        let is_tool = matches!(entry.kind, EntryKind::Tool(_));
+        if height > 0 {
+            if previous_visible_is_tool.is_some_and(|previous_is_tool| previous_is_tool || is_tool)
+            {
+                next_line = next_line.saturating_add(TOOL_ADJACENT_GAP_ROWS);
+            }
+            previous_visible_is_tool = Some(is_tool);
+        }
         let start = next_line;
         next_line = next_line.saturating_add(height);
         updated.push(IndexedEntry {
@@ -2089,10 +2413,9 @@ fn ensure_layout_index(
                                     entry.id,
                                     source.revision(),
                                     width,
-                                    markdown_anchor,
+                                    &markdown_anchor,
                                 )
                             })
-                            .map(|row| row.saturating_add(1))
                     })
                     .unwrap_or(anchor.local_row);
                 entry.start.saturating_add(
@@ -2136,15 +2459,18 @@ fn measured_entry_height(
 impl Render for UserMessage {
     fn height(&self, width: usize) -> usize {
         self.content
-            .layout(width.saturating_sub(4).max(1))
+            .layout(width.saturating_sub(2).max(1))
             .total_rows()
             .saturating_add(2)
     }
 
     fn render(&self, context: RenderContext<'_>) {
+        context
+            .buffer
+            .set_style(context.area, context.theme.transcript_surface());
         let layout = self
             .content
-            .layout((context.area.width as usize).saturating_sub(4).max(1));
+            .layout((context.area.width as usize).saturating_sub(2).max(1));
         let rows = visible_user_lines(&layout, context.visible_rows, context.theme);
         render_rows_at_top(&rows, context.area, context.buffer);
     }
@@ -2162,16 +2488,14 @@ struct AssistantRenderer<'a> {
 impl Render for AssistantRenderer<'_> {
     fn height(&self, width: usize) -> usize {
         let theme = Theme::default();
-        let header = LinesRenderer::new(assistant_header(&theme));
-        let footer = LinesRenderer::new(assistant_footer(&theme));
-        let body = match &self.message.status {
+        match &self.message.status {
             AssistantStatus::Queued => LinesRenderer::new(vec![Line::styled(
-                "│ queued…",
+                "queued…",
                 theme.style(ThemeRole::Accent),
             )])
             .height(width),
             AssistantStatus::Thinking => LinesRenderer::new(vec![Line::styled(
-                "│ thinking…",
+                "thinking…",
                 theme.style(ThemeRole::Accent),
             )])
             .height(width),
@@ -2183,58 +2507,49 @@ impl Render for AssistantRenderer<'_> {
                 .map_or(1, MarkdownMessageRenderer::height)
                 .saturating_add(
                     LinesRenderer::new(vec![Line::styled(
-                        "│ [interrupted]",
+                        "[interrupted]",
                         theme.style(ThemeRole::Warning),
                     )])
                     .height(width),
                 ),
             AssistantStatus::Failed(message) => LinesRenderer::new(vec![Line::styled(
-                format!("│ [failed: {message}]"),
+                format!("[failed: {message}]"),
                 theme.style(ThemeRole::Warning),
             )])
             .height(width),
-        };
-        header
-            .height(width)
-            .saturating_add(body)
-            .saturating_add(footer.height(width))
+        }
     }
 
     fn render(&self, mut context: RenderContext<'_>) {
-        let mut cursor = render_child(
-            &LinesRenderer::new(assistant_header(context.theme)),
-            0,
-            &mut context,
-        );
-        cursor = match &self.message.status {
+        match &self.message.status {
             AssistantStatus::Queued => render_child(
                 &LinesRenderer::new(vec![Line::styled(
-                    "│ queued…",
+                    "queued…",
                     context.theme.style(ThemeRole::Accent),
                 )]),
-                cursor,
+                0,
                 &mut context,
             ),
             AssistantStatus::Thinking => render_child(
                 &LinesRenderer::new(vec![Line::styled(
-                    "│ thinking…",
+                    "thinking…",
                     context.theme.style(ThemeRole::Accent),
                 )]),
-                cursor,
+                0,
                 &mut context,
             ),
             AssistantStatus::Streaming | AssistantStatus::Completed => {
-                self.layout.map_or(cursor, |layout| {
-                    render_child(&MarkdownMessageRenderer { layout }, cursor, &mut context)
+                self.layout.map_or(0, |layout| {
+                    render_child(&MarkdownMessageRenderer { layout }, 0, &mut context)
                 })
             }
             AssistantStatus::Interrupted => {
-                let cursor = self.layout.map_or(cursor, |layout| {
-                    render_child(&MarkdownMessageRenderer { layout }, cursor, &mut context)
+                let cursor = self.layout.map_or(0, |layout| {
+                    render_child(&MarkdownMessageRenderer { layout }, 0, &mut context)
                 });
                 render_child(
                     &LinesRenderer::new(vec![Line::styled(
-                        "│ [interrupted]",
+                        "[interrupted]",
                         context.theme.style(ThemeRole::Warning),
                     )]),
                     cursor,
@@ -2243,18 +2558,13 @@ impl Render for AssistantRenderer<'_> {
             }
             AssistantStatus::Failed(message) => render_child(
                 &LinesRenderer::new(vec![Line::styled(
-                    format!("│ [failed: {message}]"),
+                    format!("[failed: {message}]"),
                     context.theme.style(ThemeRole::Warning),
                 )]),
-                cursor,
+                0,
                 &mut context,
             ),
         };
-        render_child(
-            &LinesRenderer::new(assistant_footer(context.theme)),
-            cursor,
-            &mut context,
-        );
     }
 }
 
@@ -2280,81 +2590,24 @@ impl Render for MarkdownMessageRenderer<'_> {
             let Some(line) = self.layout.line(source_row, context.theme) else {
                 continue;
             };
-            let mut spans = vec![Span::styled("│ ", context.theme.style(ThemeRole::Text))];
-            spans.extend(line.spans);
             context.buffer.set_line(
                 context.area.x,
                 context.area.y.saturating_add(destination_row as u16),
-                &Line::from(spans),
+                &line,
                 context.area.width,
             );
         }
     }
 }
 
-struct ReasoningRenderer<'a> {
-    reasoning: &'a Reasoning,
-    expanded: bool,
-    animation_frame: usize,
-}
+struct HiddenRenderer;
 
-impl Render for ReasoningRenderer<'_> {
-    fn height(&self, width: usize) -> usize {
-        let theme = Theme::default();
-        let header = LinesRenderer::new(reasoning_header(self, &theme));
-        let footer = LinesRenderer::new(vec![Line::styled("└", theme.style(ThemeRole::Accent))]);
-        let body = if self.expanded {
-            if self.reasoning.summary.is_empty() {
-                LinesRenderer::new(vec![reasoning_empty_line(self, &theme)]).height(width)
-            } else {
-                MessageRenderer::new(&self.reasoning.summary, ThemeRole::MutedText).height(width)
-            }
-        } else {
-            LinesRenderer::new(vec![reasoning_collapsed_line(self, &theme)]).height(width)
-        };
-        header
-            .height(width)
-            .saturating_add(body)
-            .saturating_add(footer.height(width))
+impl Render for HiddenRenderer {
+    fn height(&self, _width: usize) -> usize {
+        0
     }
 
-    fn render(&self, mut context: RenderContext<'_>) {
-        let mut cursor = render_child(
-            &LinesRenderer::new(reasoning_header(self, context.theme)),
-            0,
-            &mut context,
-        );
-        cursor = if self.expanded && !self.reasoning.summary.is_empty() {
-            render_child(
-                &MessageRenderer::new(&self.reasoning.summary, ThemeRole::MutedText),
-                cursor,
-                &mut context,
-            )
-        } else {
-            let body = if self.expanded {
-                reasoning_empty_line(self, context.theme)
-            } else {
-                reasoning_collapsed_line(self, context.theme)
-            };
-            render_child(&LinesRenderer::new(vec![body]), cursor, &mut context)
-        };
-        render_child(
-            &LinesRenderer::new(vec![Line::styled(
-                "└",
-                context.theme.style(ThemeRole::Accent),
-            )]),
-            cursor,
-            &mut context,
-        );
-    }
-
-    fn cacheable(&self) -> bool {
-        self.reasoning.status != ActivityStatus::Running
-    }
-
-    fn clickable(&self, _width: usize) -> bool {
-        true
-    }
+    fn render(&self, _context: RenderContext<'_>) {}
 }
 
 struct ToolRenderer<'a> {
@@ -2380,6 +2633,9 @@ impl Render for ToolRenderer<'_> {
     }
 
     fn render(&self, mut context: RenderContext<'_>) {
+        context
+            .buffer
+            .set_style(context.area, context.theme.transcript_surface());
         if tool_is_summary_only(self.tool) {
             LinesRenderer::new(tool_summary_lines(self.tool, context.theme)).render(context);
             return;
@@ -2420,8 +2676,8 @@ impl Render for ToolRenderer<'_> {
         );
         let footer = LinesRenderer::new(output_footer_lines(
             self.tool,
-            layout.body_height,
-            layout.viewport_height,
+            self.expanded,
+            &layout,
             scroll_from_bottom,
             context.area.width as usize,
             context.theme,
@@ -2467,8 +2723,12 @@ impl ToolRenderer<'_> {
             &Theme::default(),
         ))
         .height(width);
-        let base_artifact_header_limit =
-            artifact_header_limit(self.available_height, base_header_height);
+        let static_footer_height = usize::from(tool_exit_code(self.tool).is_some());
+        let base_artifact_header_limit = artifact_header_limit(
+            self.available_height,
+            base_header_height,
+            static_footer_height,
+        );
         let base_artifact_header_height = LinesRenderer::new(bounded_output_artifact_header_lines(
             self.tool,
             width,
@@ -2478,8 +2738,9 @@ impl ToolRenderer<'_> {
         .height(width);
         let base_chrome = base_header_height
             .saturating_add(base_artifact_header_height)
-            .saturating_add(1);
-        let base_compact_height = output_viewport_height(false, self.available_height, base_chrome);
+            .saturating_add(static_footer_height);
+        let base_compact_height =
+            output_viewport_height(false, self.available_height, base_chrome, body_height);
         let can_expand = body_height > base_compact_height;
         let header_height = LinesRenderer::new(output_tool_header_lines(
             self.tool,
@@ -2488,7 +2749,9 @@ impl ToolRenderer<'_> {
             &Theme::default(),
         ))
         .height(width);
-        let artifact_header_limit = artifact_header_limit(self.available_height, header_height);
+        let footer_height = usize::from(static_footer_height > 0 || can_expand);
+        let artifact_header_limit =
+            artifact_header_limit(self.available_height, header_height, footer_height);
         let artifact_header_height = LinesRenderer::new(bounded_output_artifact_header_lines(
             self.tool,
             width,
@@ -2498,9 +2761,13 @@ impl ToolRenderer<'_> {
         .height(width);
         let chrome_height = header_height
             .saturating_add(artifact_header_height)
-            .saturating_add(1);
-        let viewport_height =
-            output_viewport_height(self.expanded, self.available_height, chrome_height);
+            .saturating_add(footer_height);
+        let viewport_height = output_viewport_height(
+            self.expanded,
+            self.available_height,
+            chrome_height,
+            body_height,
+        );
         Some(ToolOutputLayout {
             header_height,
             artifact_header_limit,
@@ -2525,11 +2792,15 @@ struct ToolOutputLayout {
     can_expand: bool,
 }
 
-fn artifact_header_limit(available_height: usize, header_height: usize) -> usize {
-    let body_rows =
-        COMPACT_OUTPUT_ROWS.min(available_height.saturating_sub(header_height.saturating_add(1)));
+fn artifact_header_limit(
+    available_height: usize,
+    header_height: usize,
+    footer_height: usize,
+) -> usize {
+    let reserved_chrome = header_height.saturating_add(footer_height);
+    let body_rows = COMPACT_OUTPUT_ROWS.min(available_height.saturating_sub(reserved_chrome));
     available_height
-        .saturating_sub(header_height.saturating_add(1).saturating_add(body_rows))
+        .saturating_sub(reserved_chrome.saturating_add(body_rows))
         .min(MAX_ARTIFACT_HEADER_ROWS)
 }
 
@@ -2544,13 +2815,13 @@ impl Render for ArtifactBodyRenderer<'_> {
                 wrapped_iter_height(patch_body_line_iter(artifact, &Theme::default()), width)
             }
             ToolArtifact::SearchResults(artifact) => {
-                MessageRenderer::new(&artifact.matches, ThemeRole::MutedText).height(width)
+                output_message_height(&artifact.matches, ThemeRole::MutedText, width)
             }
             ToolArtifact::Terminal(artifact) => {
-                MessageRenderer::new(&artifact.output, ThemeRole::Text).height(width)
+                output_message_height(&artifact.output, ThemeRole::Text, width)
             }
             ToolArtifact::TextDetail(artifact) => {
-                MessageRenderer::new(&artifact.text, ThemeRole::MutedText).height(width)
+                output_message_height(&artifact.text, ThemeRole::MutedText, width)
             }
             ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_) => 0,
         }
@@ -2562,16 +2833,30 @@ impl Render for ArtifactBodyRenderer<'_> {
                 render_wrapped_iter(patch_body_line_iter(artifact, context.theme), context)
             }
             ToolArtifact::SearchResults(artifact) => {
-                MessageRenderer::new(&artifact.matches, ThemeRole::MutedText).render(context)
+                render_output_message(&artifact.matches, ThemeRole::MutedText, context)
             }
             ToolArtifact::Terminal(artifact) => {
-                MessageRenderer::new(&artifact.output, ThemeRole::Text).render(context)
+                render_output_message(&artifact.output, ThemeRole::Text, context)
             }
             ToolArtifact::TextDetail(artifact) => {
-                MessageRenderer::new(&artifact.text, ThemeRole::MutedText).render(context)
+                render_output_message(&artifact.text, ThemeRole::MutedText, context)
             }
             ToolArtifact::CodeRange(_) | ToolArtifact::FileReference(_) => {}
         }
+    }
+}
+
+fn output_message_height(text: &str, role: ThemeRole, width: usize) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        MessageRenderer::new(text, role).height(width)
+    }
+}
+
+fn render_output_message(text: &str, role: ThemeRole, context: RenderContext<'_>) {
+    if !text.is_empty() {
+        MessageRenderer::new(text, role).render(context);
     }
 }
 
@@ -2879,18 +3164,10 @@ fn visible_user_lines(
     range
         .filter_map(|row| {
             if row == 0 {
-                Some(Line::from(vec![
-                    Span::styled(
-                        "┌─ you",
-                        theme
-                            .style(ThemeRole::User)
-                            .add_modifier(ratatui::style::Modifier::BOLD),
-                    ),
-                    Span::styled(" · click to open", theme.style(ThemeRole::MutedText)),
-                ]))
+                Some(Line::default())
             } else if row <= content_rows {
                 let line = visible.next()?;
-                let mut spans = vec![Span::styled("│ ", theme.style(ThemeRole::MutedText))];
+                let mut spans = vec![Span::raw(" ")];
                 spans.extend(line.runs.into_iter().map(|run| {
                     let style = match run.kind {
                         DisplayRunKind::Text => theme.style(ThemeRole::Text),
@@ -2902,78 +3179,12 @@ fn visible_user_lines(
                 }));
                 Some(Line::from(spans))
             } else if row == content_rows.saturating_add(1) {
-                Some(Line::styled(
-                    "└",
-                    theme
-                        .style(ThemeRole::User)
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ))
+                Some(Line::default())
             } else {
                 None
             }
         })
         .collect()
-}
-
-fn assistant_header(theme: &Theme) -> Vec<Line<'static>> {
-    vec![Line::styled(
-        "┌─ funcode",
-        theme
-            .style(ThemeRole::Agent)
-            .add_modifier(ratatui::style::Modifier::BOLD),
-    )]
-}
-
-fn assistant_footer(theme: &Theme) -> Vec<Line<'static>> {
-    vec![Line::styled(
-        "└",
-        theme
-            .style(ThemeRole::Agent)
-            .add_modifier(ratatui::style::Modifier::BOLD),
-    )]
-}
-
-fn reasoning_header(renderer: &ReasoningRenderer<'_>, theme: &Theme) -> Vec<Line<'static>> {
-    let status = status_label(&renderer.reasoning.status);
-    vec![Line::from(vec![
-        Span::styled("┌─ thinking", theme.style(ThemeRole::Accent)),
-        Span::styled(
-            format!(
-                " · {status} · click to {}",
-                if renderer.expanded {
-                    "collapse"
-                } else {
-                    "expand"
-                }
-            ),
-            theme.style(ThemeRole::MutedText),
-        ),
-    ])]
-}
-
-fn reasoning_empty_line(renderer: &ReasoningRenderer<'_>, theme: &Theme) -> Line<'static> {
-    if renderer.reasoning.status == ActivityStatus::Running {
-        Line::styled(
-            format!("│ Working{}", spinner(renderer.animation_frame)),
-            theme.style(ThemeRole::Accent),
-        )
-    } else {
-        Line::styled(
-            "│ No reasoning summary was provided",
-            theme.style(ThemeRole::MutedText),
-        )
-    }
-}
-
-fn reasoning_collapsed_line(renderer: &ReasoningRenderer<'_>, theme: &Theme) -> Line<'static> {
-    if renderer.reasoning.status == ActivityStatus::Running {
-        Line::styled(
-            format!("│ Thinking{}", spinner(renderer.animation_frame)),
-            theme.style(ThemeRole::Accent),
-        )
-    } else {
-        Line::styled("│ Summary hidden", theme.style(ThemeRole::MutedText))
-    }
 }
 
 fn output_artifacts(tool: &ToolCall) -> impl Iterator<Item = &ToolArtifact> {
@@ -3084,16 +3295,16 @@ fn build_dense_tool_output_layout(tool: &ToolCall, width: usize) -> ToolOutputBo
                     } else {
                         ThemeRole::MutedText
                     };
-                    let line = Line::from(format!(
-                        "│ {}",
-                        crate::composer::safe_single_line(source, 2)
-                    ));
+                    let line =
+                        Line::from(format!(" {}", crate::composer::safe_single_line(source, 1)));
                     push_indexed_output_line(&mut rows, line, role, segment, logical_line, width);
                     logical_line = logical_line.saturating_add(1);
                 }
             }
             ToolArtifact::SearchResults(artifact) => {
-                for line in message_line_iter(&artifact.matches, ratatui::style::Style::default()) {
+                for line in
+                    output_message_line_iter(&artifact.matches, ratatui::style::Style::default())
+                {
                     push_indexed_output_line(
                         &mut rows,
                         line,
@@ -3106,7 +3317,9 @@ fn build_dense_tool_output_layout(tool: &ToolCall, width: usize) -> ToolOutputBo
                 }
             }
             ToolArtifact::Terminal(artifact) => {
-                for line in message_line_iter(&artifact.output, ratatui::style::Style::default()) {
+                for line in
+                    output_message_line_iter(&artifact.output, ratatui::style::Style::default())
+                {
                     push_indexed_output_line(
                         &mut rows,
                         line,
@@ -3130,7 +3343,9 @@ fn build_dense_tool_output_layout(tool: &ToolCall, width: usize) -> ToolOutputBo
                 }
             }
             ToolArtifact::TextDetail(artifact) => {
-                for line in message_line_iter(&artifact.text, ratatui::style::Style::default()) {
+                for line in
+                    output_message_line_iter(&artifact.text, ratatui::style::Style::default())
+                {
                     push_indexed_output_line(
                         &mut rows,
                         line,
@@ -3223,11 +3438,10 @@ fn build_sparse_artifact_rows(
             return (encoded, row_count, ThemeRole::MutedText, line_roles);
         }
     };
-    let empty_message = !patch && source.is_empty();
-    let lines: Box<dyn Iterator<Item = &str>> = if patch {
+    let lines: Box<dyn Iterator<Item = &str>> = if source.is_empty() {
+        Box::new(std::iter::empty())
+    } else if patch {
         Box::new(source.lines())
-    } else if empty_message {
-        Box::new(std::iter::once(""))
     } else {
         Box::new(source.split('\n'))
     };
@@ -3249,17 +3463,13 @@ fn build_sparse_artifact_rows(
         if patch {
             line_roles.push(role);
         }
-        let decorated = if empty_message {
-            "│".to_owned()
-        } else {
-            format!(
-                "│ {}",
-                crate::composer::safe_single_line(
-                    source,
-                    if patch || logical_line == 0 { 2 } else { 0 }
-                )
+        let decorated = format!(
+            " {}",
+            crate::composer::safe_single_line(
+                source,
+                if patch || logical_line == 0 { 1 } else { 0 }
             )
-        };
+        );
         row_count =
             row_count.saturating_add(append_sparse_wrapped_line(&mut encoded, &decorated, width));
     }
@@ -3325,35 +3535,36 @@ fn push_indexed_output_line_from(
     );
 }
 
-fn output_viewport_height(expanded: bool, available_height: usize, chrome: usize) -> usize {
+fn output_viewport_height(
+    expanded: bool,
+    available_height: usize,
+    chrome: usize,
+    body_height: usize,
+) -> usize {
     let available = available_height.saturating_sub(chrome);
-    if expanded {
+    let limit = if expanded {
         available
     } else {
         COMPACT_OUTPUT_ROWS.min(available)
-    }
+    };
+    body_height.min(limit)
 }
 
 fn output_tool_header_lines(
     tool: &ToolCall,
-    expanded: bool,
-    can_expand: bool,
+    _expanded: bool,
+    _can_expand: bool,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let title = if tool.name == "terminal" {
-        "┌─ terminal".to_owned()
+        " terminal".to_owned()
     } else {
-        format!("┌─ tool · {}", tool.name)
+        format!(" tool · {}", tool.name)
     };
-    let action = can_expand.then_some(if expanded { "collapse" } else { "expand" });
     vec![Line::from(vec![
         Span::styled(title, theme.style(ThemeRole::Accent)),
         Span::styled(
             format!(" · {}", status_label(&tool.status)),
-            theme.style(ThemeRole::MutedText),
-        ),
-        Span::styled(
-            action.map_or_else(String::new, |action| format!(" · click to {action}")),
             theme.style(ThemeRole::MutedText),
         ),
     ])]
@@ -3363,7 +3574,7 @@ fn output_artifact_header_lines(tool: &ToolCall, theme: &Theme) -> Vec<Line<'sta
     output_artifacts(tool)
         .flat_map(|artifact| match artifact {
             ToolArtifact::Patch(artifact) => vec![Line::styled(
-                format!("│ Edited {}", artifact.path.display()),
+                format!(" Edited {}", artifact.path.display()),
                 theme.style(ThemeRole::Accent),
             )],
             ToolArtifact::SearchResults(artifact) => search_results_header(artifact, theme),
@@ -3390,7 +3601,7 @@ fn bounded_output_artifact_header_lines(
     rows.truncate(maximum_rows);
     if let Some(last) = rows.last_mut() {
         *last = Line::styled(
-            if width >= 3 { "│ …" } else { "…" },
+            if width >= 2 { " …" } else { "…" },
             theme.style(ThemeRole::MutedText),
         );
     }
@@ -3399,26 +3610,22 @@ fn bounded_output_artifact_header_lines(
 
 fn output_footer_lines(
     tool: &ToolCall,
-    body_height: usize,
-    viewport_height: usize,
+    expanded: bool,
+    layout: &ToolOutputLayout,
     scroll_from_bottom: usize,
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let maximum = body_height.saturating_sub(viewport_height);
+    let maximum = layout.body_height.saturating_sub(layout.viewport_height);
     let from_bottom = scroll_from_bottom.min(maximum);
     let top = maximum.saturating_sub(from_bottom);
-    let visible_end = top.saturating_add(viewport_height).min(body_height);
-    let mut spans = vec![Span::styled("└", theme.style(ThemeRole::Accent))];
-    if let Some(exit_code) = output_artifacts(tool)
-        .filter_map(|artifact| match artifact {
-            ToolArtifact::Terminal(TerminalArtifact { exit_code, .. }) => *exit_code,
-            _ => None,
-        })
-        .last()
-    {
+    let visible_end = top
+        .saturating_add(layout.viewport_height)
+        .min(layout.body_height);
+    let mut spans = vec![Span::raw(" ")];
+    if let Some(exit_code) = tool_exit_code(tool) {
         spans.push(Span::styled(
-            format!(" exit {exit_code}"),
+            format!("exit {exit_code}"),
             if exit_code == 0 {
                 theme.style(ThemeRole::DiffAdded)
             } else {
@@ -3426,15 +3633,29 @@ fn output_footer_lines(
             },
         ));
     }
-    if maximum > 0 {
+    if !expanded && layout.can_expand {
+        let separator = if spans.len() > 1 { " · " } else { "" };
+        spans.push(Span::styled(
+            format!("{separator}Click to expand"),
+            theme.style(ThemeRole::MutedText),
+        ));
+    } else if expanded && maximum == 0 && layout.can_expand {
+        let separator = if spans.len() > 1 { " · " } else { "" };
+        spans.push(Span::styled(
+            format!("{separator}Click to collapse"),
+            theme.style(ThemeRole::MutedText),
+        ));
+    }
+    if expanded && maximum > 0 {
         let full_state = if from_bottom == 0 {
             "latest".to_owned()
         } else {
             "paused · End to follow".to_owned()
         };
         let full_indicator = format!(
-            " · lines {}-{visible_end}/{body_height} · {full_state}",
-            top + 1
+            " · lines {}-{visible_end}/{} · {full_state}",
+            top + 1,
+            layout.body_height
         );
         let used = spans.iter().fold(0usize, |used, span| {
             used.saturating_add(UnicodeWidthStr::width(span.content.as_ref()))
@@ -3443,17 +3664,31 @@ fn output_footer_lines(
             if used.saturating_add(UnicodeWidthStr::width(full_indicator.as_str())) <= width {
                 full_indicator
             } else if from_bottom == 0 {
-                format!(" · {visible_end}/{body_height} · latest")
+                format!(" · {visible_end}/{} · latest", layout.body_height)
             } else {
                 " · paused · End to follow".to_owned()
             };
         spans.push(Span::styled(indicator, theme.style(ThemeRole::MutedText)));
     }
-    vec![Line::from(spans)]
+    if spans.len() == 1 {
+        Vec::new()
+    } else {
+        vec![Line::from(spans)]
+    }
+}
+
+fn tool_exit_code(tool: &ToolCall) -> Option<i32> {
+    output_artifacts(tool)
+        .filter_map(|artifact| match artifact {
+            ToolArtifact::Terminal(TerminalArtifact { exit_code, .. }) => *exit_code,
+            _ => None,
+        })
+        .last()
 }
 
 fn generic_tool_lines(tool: &ToolCall, theme: &Theme) -> Vec<Line<'static>> {
     vec![Line::from(vec![
+        Span::raw(" "),
         Span::styled(
             format!("Tool {}: ", tool.name),
             theme.style(ThemeRole::Accent),
@@ -3492,6 +3727,7 @@ fn tool_summary_lines(tool: &ToolCall, theme: &Theme) -> Vec<Line<'static>> {
         ActivityStatus::Failed(message) => format!(" · failed: {message}"),
     };
     vec![Line::from(vec![
+        Span::raw(" "),
         Span::styled("Read File: ", theme.style(ThemeRole::Accent)),
         Span::styled(path, theme.style(ThemeRole::Text)),
         Span::styled(status, theme.style(ThemeRole::MutedText)),
@@ -3513,7 +3749,7 @@ fn retry_lines(retry: &RetryAttempt, theme: &Theme) -> Vec<Line<'static>> {
 fn code_range_header(artifact: &CodeRangeArtifact, theme: &Theme) -> Vec<Line<'static>> {
     vec![Line::styled(
         format!(
-            "│ Read {}:{}-{}",
+            " Read {}:{}-{}",
             artifact.path.display(),
             artifact.start_line,
             artifact.end_line
@@ -3527,7 +3763,7 @@ fn patch_line_iter<'a>(
     theme: &'a Theme,
 ) -> impl Iterator<Item = Line<'static>> + 'a {
     std::iter::once(Line::styled(
-        format!("│ Edited {}", artifact.path.display()),
+        format!(" Edited {}", artifact.path.display()),
         theme.style(ThemeRole::Accent),
     ))
     .chain(patch_body_line_iter(artifact, theme))
@@ -3546,7 +3782,7 @@ fn patch_body_line_iter<'a>(
             ThemeRole::MutedText
         };
         Line::styled(
-            format!("│ {}", crate::composer::safe_single_line(line, 2)),
+            format!(" {}", crate::composer::safe_single_line(line, 1)),
             theme.style(role),
         )
     })
@@ -3555,8 +3791,8 @@ fn patch_body_line_iter<'a>(
 fn search_results_header(artifact: &SearchResultsArtifact, theme: &Theme) -> Vec<Line<'static>> {
     vec![Line::styled(
         format!(
-            "│ Search /{}/",
-            crate::composer::safe_single_line(&artifact.query, 10)
+            " Search /{}/",
+            crate::composer::safe_single_line(&artifact.query, 9)
         ),
         theme.style(ThemeRole::Accent),
     )]
@@ -3566,15 +3802,15 @@ fn terminal_header(artifact: &TerminalArtifact, theme: &Theme) -> Vec<Line<'stat
     vec![
         Line::styled(
             format!(
-                "│ # {}",
-                crate::composer::safe_single_line(&artifact.description, 2)
+                " # {}",
+                crate::composer::safe_single_line(&artifact.description, 1)
             ),
             theme.style(ThemeRole::MutedText),
         ),
         Line::styled(
             format!(
-                "│ $ {}",
-                crate::composer::safe_single_line(&artifact.command, 4)
+                " $ {}",
+                crate::composer::safe_single_line(&artifact.command, 3)
             ),
             theme.style(ThemeRole::Text),
         ),
@@ -3583,7 +3819,7 @@ fn terminal_header(artifact: &TerminalArtifact, theme: &Theme) -> Vec<Line<'stat
 
 fn terminal_exit_line(exit_code: i32, theme: &Theme) -> Line<'static> {
     Line::styled(
-        format!("│ exit {exit_code}"),
+        format!(" exit {exit_code}"),
         if exit_code == 0 {
             theme.style(ThemeRole::DiffAdded)
         } else {
@@ -3594,7 +3830,7 @@ fn terminal_exit_line(exit_code: i32, theme: &Theme) -> Line<'static> {
 
 fn file_reference_lines(artifact: &FileReferenceArtifact, theme: &Theme) -> Vec<Line<'static>> {
     vec![Line::styled(
-        format!("│ File {}", artifact.path.display()),
+        format!(" File {}", artifact.path.display()),
         theme.style(ThemeRole::Accent),
     )]
 }
@@ -3606,21 +3842,32 @@ fn message_line_iter(
     message_line_iter_from(text, style, 0)
 }
 
+fn output_message_line_iter(
+    text: &str,
+    style: ratatui::style::Style,
+) -> Box<dyn Iterator<Item = Line<'static>> + '_> {
+    if text.is_empty() {
+        Box::new(std::iter::empty())
+    } else {
+        message_line_iter(text, style)
+    }
+}
+
 fn message_line_iter_from(
     text: &str,
     style: ratatui::style::Style,
     starting_line: usize,
 ) -> Box<dyn Iterator<Item = Line<'static>> + '_> {
     if text.is_empty() {
-        return Box::new(std::iter::once(Line::styled("│", style)));
+        return Box::new(std::iter::once(Line::styled(" ", style)));
     }
     Box::new(text.split('\n').enumerate().flat_map(move |(index, text)| {
         let logical_line = starting_line.saturating_add(index);
         crate::composer::SubmittedContent::plain(text)
-            .display_lines(if logical_line == 0 { 2 } else { 0 })
+            .display_lines(if logical_line == 0 { 1 } else { 0 })
             .into_iter()
             .map(move |line| {
-                let mut spans = vec![Span::styled("│ ", style)];
+                let mut spans = vec![Span::styled(" ", style)];
                 spans.extend(
                     line.runs
                         .into_iter()
@@ -3776,15 +4023,10 @@ fn status_label(status: &ActivityStatus) -> String {
     status.to_string()
 }
 
-fn spinner(frame: usize) -> &'static str {
-    ["|", "/", "-", "\\"][(frame / 2) % 4]
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AssistantRenderer, ReasoningRenderer, Render, RenderContext, ToolRenderer,
-        TranscriptRenderCache, render,
+        AssistantRenderer, Render, RenderContext, ToolRenderer, TranscriptRenderCache, render,
     };
     use crate::ui::markdown::MarkdownLayout;
     use crate::{
@@ -3793,8 +4035,8 @@ mod tests {
         composer::SubmittedContent,
         theme::{Theme, ThemeId, ThemeRole},
         transcript::{
-            ActivityStatus, AssistantMessage, AssistantStatus, CodeRangeArtifact,
-            FileReferenceArtifact, PatchArtifact, Reasoning, RetryAttempt, SearchResultsArtifact,
+            ActivityStatus, AssistantMessage, AssistantStatus, CodeRangeArtifact, EntryKind,
+            FileReferenceArtifact, PatchArtifact, RetryAttempt, SearchResultsArtifact,
             TerminalArtifact, TextDetailArtifact, ToolArtifact, ToolCall, TranscriptEvent,
             UserMessage,
         },
@@ -3961,23 +4203,6 @@ mod tests {
             assert!(symbols(&render_widget(&renderer, 80)).contains(expected));
         }
 
-        let reasoning = Reasoning {
-            summary: "checked the code".into(),
-            status: ActivityStatus::Completed,
-        };
-        let collapsed = ReasoningRenderer {
-            reasoning: &reasoning,
-            expanded: false,
-            animation_frame: 0,
-        };
-        let expanded = ReasoningRenderer {
-            reasoning: &reasoning,
-            expanded: true,
-            animation_frame: 0,
-        };
-        assert!(symbols(&render_widget(&collapsed, 80)).contains("Summary hidden"));
-        assert!(symbols(&render_widget(&expanded, 80)).contains("checked the code"));
-
         let tool = ToolCall {
             call_id: 1,
             name: "details".into(),
@@ -4015,15 +4240,52 @@ mod tests {
             message: "timeout".into(),
         };
         let user = render_widget(&user, 80);
-        assert!(symbols(&user).contains("you"));
-        let header = user.cell((3, 0)).expect("user header");
+        assert!(symbols(&user).contains("prompt"));
+        let padding = user.cell((0, 0)).expect("user padding");
         let body = user.cell((2, 1)).expect("user message body");
-        assert_eq!(
-            header.style().fg,
-            Theme::default().style(ThemeRole::User).fg
+        assert_ne!(
+            padding.style().bg,
+            Theme::default().style(ThemeRole::Surface).bg
         );
         assert_eq!(body.style().fg, Theme::default().style(ThemeRole::Text).fg);
         assert!(symbols(&render_widget(&retry, 80)).contains("Attempt 2/3 failed"));
+    }
+
+    #[test]
+    fn user_is_shaded_while_assistant_content_stays_borderless_and_unshaded() {
+        let user = UserMessage {
+            content: SubmittedContent::plain("prompt"),
+        };
+        let assistant = AssistantMessage {
+            text: "response".into(),
+            status: AssistantStatus::Completed,
+        };
+        let layout = MarkdownLayout::new(&assistant.text, 80);
+        let assistant = AssistantRenderer {
+            message: &assistant,
+            layout: Some(&layout),
+        };
+
+        let user = render_widget(&user, 80);
+        let assistant = render_widget(&assistant, 80);
+        let user_symbols = symbols(&user);
+        let assistant_symbols = symbols(&assistant);
+
+        assert!(user_symbols.contains("prompt"));
+        assert!(assistant_symbols.contains("response"));
+        assert!(!user_symbols.contains(['┌', '└', '│']));
+        assert!(!assistant_symbols.contains(['┌', '└', '│']));
+        let user_background = user.cell((0, 0)).expect("user padding").style().bg;
+        let assistant_background = assistant
+            .cell((0, 0))
+            .expect("assistant response")
+            .style()
+            .bg;
+        assert_eq!(
+            assistant_background,
+            Theme::default().style(ThemeRole::Surface).bg
+        );
+        assert_ne!(user_background, assistant_background);
     }
 
     #[test]
@@ -4230,10 +4492,53 @@ mod tests {
         assert!(text.contains("$ generate-logs"));
         assert!(text.contains("output 30"));
         assert!(!text.contains("output 20"));
+        assert!(text.contains("Click to expand"));
+        assert!(!text.contains("latest"));
     }
 
     #[test]
-    fn short_output_keeps_fixed_height_without_offering_expansion() {
+    fn tool_output_is_shaded_without_border_glyphs() {
+        let tool = ToolCall {
+            call_id: 4,
+            name: "terminal".into(),
+            summary: "Run check".into(),
+            status: ActivityStatus::Completed,
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Run check".into(),
+                command: "cargo check".into(),
+                output: "Finished".into(),
+                exit_code: Some(0),
+            })],
+        };
+        let renderer = ToolRenderer {
+            tool: &tool,
+            expanded: false,
+            available_height: 24,
+            scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
+        };
+
+        let rendered = render_widget(&renderer, 80);
+        let text = symbols(&rendered);
+        let card_background = rendered.cell((0, 0)).expect("tool card padding").style().bg;
+
+        assert!(text.contains("$ cargo check"));
+        assert!(text.contains("Finished"));
+        assert!(!text.contains(['┌', '└', '│']));
+        assert_eq!(
+            rendered.cell((0, 0)).expect("one-cell gutter").symbol(),
+            " "
+        );
+        assert_eq!(rendered.cell((1, 0)).expect("tool title").symbol(), "t");
+        assert_ne!(
+            card_background,
+            Theme::default().style(ThemeRole::Surface).bg
+        );
+    }
+
+    #[test]
+    fn short_output_shrinks_to_its_content_without_offering_expansion() {
         let tool = ToolCall {
             call_id: 5,
             name: "terminal".into(),
@@ -4257,7 +4562,7 @@ mod tests {
         let rendered = render_widget(&renderer, 80);
         let text = symbols(&rendered);
 
-        assert_eq!(rendered.area.height, 14);
+        assert_eq!(rendered.area.height, 5);
         assert!(!renderer.clickable(80));
         assert!(!text.contains("click to expand"));
         assert!(text.contains("ok"));
@@ -4283,8 +4588,33 @@ mod tests {
             body_layout: None,
             cache: None,
         };
-        assert_eq!(render_widget(&empty, 80).area.height, 14);
+        assert_eq!(render_widget(&empty, 80).area.height, 4);
         assert!(!empty.clickable(80));
+    }
+
+    #[test]
+    fn short_search_output_does_not_reserve_an_empty_footer() {
+        let tool = ToolCall {
+            call_id: 52,
+            name: "search_files".into(),
+            summary: "No matches".into(),
+            status: ActivityStatus::Completed,
+            artifacts: vec![ToolArtifact::SearchResults(SearchResultsArtifact {
+                query: "missing".into(),
+                matches: "No matches found.".into(),
+            })],
+        };
+        let renderer = ToolRenderer {
+            tool: &tool,
+            expanded: false,
+            available_height: 24,
+            scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
+        };
+
+        assert_eq!(render_widget(&renderer, 80).area.height, 3);
+        assert!(!renderer.clickable(80));
     }
 
     #[test]
@@ -4364,7 +4694,8 @@ mod tests {
         let layout = renderer.output_layout(80).expect("output layout");
         let text = symbols(&render_widget(&renderer, 80));
 
-        assert_eq!(layout.viewport_height, super::COMPACT_OUTPUT_ROWS);
+        assert_eq!(layout.viewport_height, layout.body_height);
+        assert!(layout.viewport_height <= super::COMPACT_OUTPUT_ROWS);
         assert!(layout.artifact_header_height <= 4);
         assert!(text.contains("output 8"));
         assert!(text.contains('…'));
@@ -4441,7 +4772,7 @@ mod tests {
         };
         let paused = ToolRenderer {
             tool: &tool,
-            expanded: false,
+            expanded: true,
             available_height: 20,
             scroll_from_bottom: 5,
             body_layout: None,
@@ -4555,7 +4886,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_restores_the_paused_anchor_after_expansion_exposes_the_tail() {
+    fn collapse_returns_compact_output_to_its_latest_tail() {
         let mut app = App::new();
         let cache = TranscriptRenderCache::default();
         let output = (1..=40)
@@ -4587,18 +4918,19 @@ mod tests {
 
         let (_, compact) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
         app.update_tool_output_scroll_metrics(&compact.output_scroll_metrics);
-        app.scroll_tool_output_by(tool_id, 1);
-        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 5);
-
         app.activate_transcript_entry(tool_id);
         let (_, expanded) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
         app.update_tool_output_scroll_metrics(&expanded.output_scroll_metrics);
-        assert_eq!(app.tool_output_scroll_offset(tool_id, 20), 0);
+        app.scroll_tool_output_by(tool_id, 1);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 20), 5);
 
         app.activate_transcript_entry(tool_id);
-        let (_, collapsed) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        let (collapsed_text, collapsed) =
+            render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
         app.update_tool_output_scroll_metrics(&collapsed.output_scroll_metrics);
-        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 5);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 0);
+        assert!(collapsed_text.contains("output 40"));
+        assert!(!collapsed_text.contains("paused · End to follow"));
     }
 
     #[test]
@@ -4632,8 +4964,11 @@ mod tests {
             .expect("tool entry")
             .id;
 
-        let (tail, result) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
-        app.update_tool_output_scroll_metrics(&result.output_scroll_metrics);
+        let (_, compact) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        app.update_tool_output_scroll_metrics(&compact.output_scroll_metrics);
+        app.activate_transcript_entry(tool_id);
+        let (tail, expanded) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        app.update_tool_output_scroll_metrics(&expanded.output_scroll_metrics);
         let before_scroll = cache.stats();
         app.scroll_tool_output_by(tool_id, 1);
         let (history, _) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
@@ -4644,7 +4979,6 @@ mod tests {
         assert_eq!(after_scroll.0, before_scroll.0);
         assert!(after_scroll.1 > before_scroll.1);
 
-        app.activate_transcript_entry(tool_id);
         let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 30);
         assert!(cache.stats().0 > after_scroll.0);
 
@@ -4738,6 +5072,9 @@ mod tests {
             .expect("tool entry")
             .id;
 
+        let (_, compact) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        app.update_tool_output_scroll_metrics(&compact.output_scroll_metrics);
+        app.activate_transcript_entry(tool_id);
         let (rendered, first) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
         app.update_tool_output_scroll_metrics(&first.output_scroll_metrics);
         let first_stats = cache.tool_output_stats();
@@ -4752,7 +5089,7 @@ mod tests {
         assert_eq!(first_stats.0, 1);
         assert_eq!(second_stats.0, first_stats.0);
         assert_eq!(second_stats.1, first_stats.1);
-        assert!(second_stats.2.saturating_sub(first_stats.2) <= super::COMPACT_OUTPUT_ROWS);
+        assert!(second_stats.2.saturating_sub(first_stats.2) <= 24);
         assert_eq!(entries, 1);
         assert!(bytes <= super::TOOL_OUTPUT_LAYOUT_CACHE_BYTES);
     }
@@ -5165,6 +5502,9 @@ mod tests {
             .expect("tool entry")
             .id;
 
+        let (_, compact) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        app.update_tool_output_scroll_metrics(&compact.output_scroll_metrics);
+        app.activate_transcript_entry(tool_id);
         let (_, wide) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
         app.update_tool_output_scroll_metrics(&wide.output_scroll_metrics);
         app.scroll_tool_output_by(tool_id, 8);
@@ -5199,30 +5539,6 @@ mod tests {
     }
 
     #[test]
-    fn running_reasoning_bypasses_rendered_slice_cache_between_animation_frames() {
-        let mut app = App::new();
-        app.transcript.submit(1, "prompt".into(), Vec::new());
-        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
-        app.handle_agent_event(AgentEvent::ReasoningDelta {
-            request_id: 1,
-            summary: "checking".into(),
-        });
-        let cache = TranscriptRenderCache::default();
-
-        app.animation_frame = 0;
-        let first = render_transcript(&app, &cache);
-        let first_stats = cache.stats();
-        app.animation_frame = 2;
-        let second = render_transcript(&app, &cache);
-        let second_stats = cache.stats();
-
-        assert!(first.contains("Thinking|"));
-        assert!(second.contains("Thinking/"));
-        assert_eq!(second_stats.0, first_stats.0);
-        assert_eq!(second_stats.1, first_stats.1 + 1);
-    }
-
-    #[test]
     fn assistant_markdown_renders_without_mutating_source_and_reuses_semantic_layout() {
         let source = "# Result\n\nUse **care** and `cargo test`.";
         let mut app = App::new();
@@ -5234,14 +5550,20 @@ mod tests {
         });
         let cache = TranscriptRenderCache::default();
 
+        let literal = render_transcript(&app, &cache);
+        assert!(literal.contains("Result"));
+        assert!(!literal.contains("# Result"));
+        assert!(literal.contains("care"));
+        assert!(!literal.contains("**care**"));
+        assert!(!literal.contains("`cargo test`"));
+        assert_eq!(cache.markdown_layout_builds(), 0);
+        wait_for_markdown(&app, &cache);
+        assert_eq!(cache.markdown_layout_builds(), 1);
         let terminal = render_transcript(&app, &cache);
         assert!(terminal.contains("Result"));
         assert!(terminal.contains("Use care and cargo test."));
         assert!(!terminal.contains("# Result"));
         assert!(!terminal.contains("**care**"));
-        assert_eq!(cache.markdown_layout_builds(), 0);
-        wait_for_markdown(&app, &cache);
-        assert_eq!(cache.markdown_layout_builds(), 1);
 
         let _ = render_transcript_with_theme(&app, &cache, &Theme::resolve(ThemeId::Paper));
         assert_eq!(cache.markdown_layout_builds(), 1);
@@ -5261,6 +5583,7 @@ mod tests {
             request_id: 21,
             text: " More.".into(),
         });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 21 });
         let _ = render_transcript(&app, &cache);
         wait_for_markdown(&app, &cache);
         assert_eq!(cache.markdown_layout_builds(), 2);
@@ -5385,7 +5708,7 @@ mod tests {
         assert_eq!(cache.markdown_layout_builds(), 0);
         assert_eq!(
             first.line(0, &Theme::default()).unwrap().to_string(),
-            "Rendering Markdown…"
+            "Result"
         );
 
         app.handle_agent_event(AgentEvent::TextDelta {
@@ -5394,7 +5717,15 @@ mod tests {
         });
         let entry = app.transcript.entries().last().expect("updated assistant");
         let pending = cache.markdown_layout(entry, 80).expect("updated fallback");
-        assert!(pending.height() >= 1);
+        let pending_text = (0..pending.height())
+            .filter_map(|row| pending.line(row, &Theme::default()))
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(pending_text.contains("Result"));
+        assert!(!pending_text.contains("# Result"));
+        assert!(pending_text.contains("latest revision"));
+        app.handle_agent_event(AgentEvent::Completed { request_id: 41 });
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let semantic = loop {
@@ -5421,6 +5752,195 @@ mod tests {
         };
         assert!(semantic.contains("Result"));
         assert_eq!(cache.markdown_cache_stats().2, 0);
+    }
+
+    #[test]
+    fn foreground_markdown_projection_keeps_incomplete_syntax_literal_and_is_frame_bounded() {
+        let source = format!("**unfinished [link](target `code {}", "x".repeat(3_000));
+        assert!(source.len() < super::MARKDOWN_STREAM_REBUILD_MIN_GROWTH);
+
+        let started = Instant::now();
+        let layout = super::markdown_foreground_layout(&source, 38);
+        let elapsed = started.elapsed();
+        let rendered = (0..layout.height())
+            .filter_map(|row| layout.line(row, &Theme::default()))
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            elapsed < Duration::from_millis(16),
+            "literal projection took {elapsed:?}"
+        );
+        assert_eq!(rendered.replace('\n', ""), source);
+        assert!(rendered.contains("**unfinished"));
+    }
+
+    #[test]
+    fn foreground_markdown_projection_hides_valid_markers_before_background_work_finishes() {
+        let source = "# Result\n\n**bold** and `code`\n\n```rust\nfn main() {}\n```";
+        let layout = super::markdown_foreground_layout(source, 38);
+        let rendered = (0..layout.height())
+            .filter_map(|row| layout.line(row, &Theme::default()))
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Result"));
+        assert!(rendered.contains("bold and code"));
+        assert!(rendered.contains("┌─ rust"));
+        assert!(!rendered.contains('#'));
+        assert!(!rendered.contains("**"));
+        assert!(!rendered.contains('`'));
+    }
+
+    #[test]
+    fn sustained_streaming_deltas_schedule_logarithmic_full_layout_work() {
+        let mut app = App::new();
+        app.transcript.submit(43, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 43 });
+        let cache = TranscriptRenderCache::default();
+
+        for _ in 0..100 {
+            app.handle_agent_event(AgentEvent::TextDelta {
+                request_id: 43,
+                text: "x".repeat(1_024),
+            });
+            let entry = app
+                .transcript
+                .entries()
+                .last()
+                .expect("streaming assistant");
+            drop(cache.markdown_layout(entry, 80));
+        }
+        app.handle_agent_event(AgentEvent::Completed { request_id: 43 });
+        let entry = app
+            .transcript
+            .entries()
+            .last()
+            .expect("completed assistant");
+        drop(cache.markdown_layout(entry, 80));
+
+        let (requests, bytes) = cache.markdown_request_stats();
+        assert!(requests <= 8, "scheduled {requests} full layout builds");
+        assert!(bytes <= 2 * 100 * 1_024, "queued {bytes} source bytes");
+    }
+
+    #[test]
+    fn punctuation_and_unicode_deltas_keep_one_incremental_foreground_projection() {
+        let mut app = App::new();
+        app.transcript.submit(46, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 46 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 46,
+            text: "x".repeat(super::MARKDOWN_FOREGROUND_REPROJECT_BYTES + 1),
+        });
+        let cache = TranscriptRenderCache::default();
+        let entry = app.transcript.entries().last().expect("assistant entry");
+        let first = cache.markdown_layout(entry, 80).expect("foreground layout");
+        let allocation = std::sync::Arc::as_ptr(&first) as usize;
+        drop(first);
+
+        for _ in 0..1_600 {
+            app.handle_agent_event(AgentEvent::TextDelta {
+                request_id: 46,
+                text: "`_λ[]_`\n".into(),
+            });
+            let entry = app.transcript.entries().last().expect("assistant entry");
+            let layout = cache.markdown_layout(entry, 80).expect("foreground layout");
+            assert_eq!(std::sync::Arc::as_ptr(&layout) as usize, allocation);
+        }
+        let entry = app.transcript.entries().last().expect("assistant entry");
+        assert!(matches!(
+            &entry.kind,
+            EntryKind::Assistant(message) if message.text.len() > 16 * 1024
+        ));
+        let (requests, _) = cache.markdown_request_stats();
+        assert!(requests <= 8, "scheduled {requests} background builds");
+    }
+
+    #[test]
+    fn an_uncacheable_semantic_layout_keeps_complete_literal_text_without_requeueing() {
+        const SOURCE_LEN: usize = 300_000;
+        let mut app = App::new();
+        app.transcript.submit(44, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 44 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 44,
+            text: "x".repeat(SOURCE_LEN),
+        });
+        let cache = TranscriptRenderCache::default();
+        let entry = app.transcript.entries().last().expect("assistant entry");
+        let literal = cache.markdown_layout(entry, 3).expect("literal projection");
+        let expected_height = SOURCE_LEN.div_ceil(3);
+        assert_eq!(literal.height(), expected_height);
+        assert_eq!(
+            literal.line(0, &Theme::default()).unwrap().to_string(),
+            "xxx"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cache.markdown_cache_stats().2 != 0 {
+            cache.drain_markdown_results();
+            assert!(Instant::now() < deadline, "oversized layout did not settle");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let requests = cache.markdown_request_stats();
+        for _ in 0..3 {
+            let entry = app.transcript.entries().last().expect("assistant entry");
+            let repeated = cache.markdown_layout(entry, 3).expect("literal projection");
+            assert_eq!(repeated.height(), expected_height);
+            assert!(std::sync::Arc::ptr_eq(&literal, &repeated));
+        }
+        assert_eq!(cache.markdown_request_stats(), requests);
+    }
+
+    #[test]
+    fn oversized_and_unicode_heavy_foreground_projections_are_reused() {
+        let mut app = App::new();
+        app.transcript.submit(47, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 47 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 47,
+            text: format!("**{}**", "x".repeat(super::MARKDOWN_LAYOUT_CACHE_BYTES + 1)),
+        });
+        let cache = TranscriptRenderCache::default();
+        let entry = app.transcript.entries().last().expect("assistant entry");
+        let oversized = cache
+            .markdown_layout(entry, 80)
+            .expect("oversized projection");
+        assert!(
+            !oversized
+                .line(0, &Theme::default())
+                .unwrap()
+                .to_string()
+                .contains("**")
+        );
+        drop(oversized);
+        let entry = app.transcript.entries().last().expect("assistant entry");
+        let repeated = cache
+            .markdown_layout(entry, 80)
+            .expect("oversized projection");
+        assert!(
+            !repeated
+                .line(0, &Theme::default())
+                .unwrap()
+                .to_string()
+                .contains("**")
+        );
+        let (_, bytes, _, _) = cache.markdown_cache_stats();
+        assert!(bytes <= super::MARKDOWN_LAYOUT_CACHE_BYTES);
+
+        let unicode = MarkdownLayout::literal(&"λ".repeat(200_000), 1);
+        assert_eq!(unicode.height(), 200_000);
+        assert_eq!(
+            unicode
+                .line(199_999, &Theme::default())
+                .unwrap()
+                .to_string(),
+            "λ"
+        );
+        assert!(unicode.bytes() < super::MARKDOWN_LAYOUT_CACHE_BYTES);
     }
 
     #[test]
@@ -5598,6 +6118,9 @@ mod tests {
                 .unwrap();
             let result = wait_for_runner_result(&runner, 8, revision, 80);
             assert_eq!(result.layout.is_some(), revision == 2);
+            if revision == 1 {
+                assert!(!result.retry, "deterministic builder panics must not retry");
+            }
         }
 
         runner.disconnect_results();
@@ -5631,6 +6154,44 @@ mod tests {
                 .is_err()
         );
         runner.stop(true);
+    }
+
+    #[test]
+    fn a_builder_panic_disables_background_work_for_that_exact_revision() {
+        let mut app = App::new();
+        app.transcript.submit(49, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 49 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 49,
+            text: "# deterministic panic".into(),
+        });
+        let cache = TranscriptRenderCache {
+            markdown_runner: super::MarkdownLayoutRunner::spawn_with(|_, _| {
+                panic!("injected persistent builder panic")
+            }),
+            ..TranscriptRenderCache::default()
+        };
+        let entry = app.transcript.entries().last().expect("assistant entry");
+        let _ = cache.markdown_layout(entry, 80);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            cache.drain_markdown_results();
+            if cache.markdown_cache_stats().2 == 0 && cache.markdown_runner.stats().0 == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "builder panic did not settle");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let settled_requests = cache.markdown_request_stats();
+        assert_eq!(settled_requests.0, 1);
+
+        for _ in 0..3 {
+            let entry = app.transcript.entries().last().expect("assistant entry");
+            assert!(cache.markdown_layout(entry, 80).is_some());
+        }
+        assert_eq!(cache.markdown_request_stats(), settled_requests);
+        assert_eq!(cache.markdown_cache_stats().2, 0);
     }
 
     #[test]
@@ -5711,6 +6272,91 @@ mod tests {
         runner.stop(true);
     }
 
+    #[test]
+    fn markdown_runner_rejects_one_oversized_request_and_bounds_undrained_results() {
+        let runner = super::MarkdownLayoutRunner::spawn_with(MarkdownLayout::literal);
+        assert!(
+            runner
+                .request(super::MarkdownLayoutRequest {
+                    entry_id: 1,
+                    key: super::MarkdownLayoutKey {
+                        revision: 1,
+                        width: 80,
+                    },
+                    source: super::MarkdownSourceUpdate::Replace(
+                        "x".repeat(super::MARKDOWN_LAYOUT_CACHE_BYTES + 1,)
+                    ),
+                    content_width: 78,
+                })
+                .is_err()
+        );
+        assert_eq!(runner.stats().0, 0);
+        assert_eq!(runner.stats().1, 0);
+
+        let builds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let build_count = std::sync::Arc::clone(&builds);
+        let retained = super::MarkdownLayoutRunner::spawn_with(move |source, width| {
+            build_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            MarkdownLayout::literal(source, width)
+        });
+        let retained_len = super::MARKDOWN_LAYOUT_CACHE_BYTES - 8;
+        retained
+            .request(super::MarkdownLayoutRequest {
+                entry_id: 90,
+                key: super::MarkdownLayoutKey {
+                    revision: 1,
+                    width: 80,
+                },
+                source: super::MarkdownSourceUpdate::Replace("x".repeat(retained_len)),
+                content_width: 78,
+            })
+            .unwrap();
+        let _ = wait_for_runner_result(&retained, 90, 1, 80);
+        assert!(
+            retained
+                .request(super::MarkdownLayoutRequest {
+                    entry_id: 90,
+                    key: super::MarkdownLayoutKey {
+                        revision: 2,
+                        width: 80,
+                    },
+                    source: super::MarkdownSourceUpdate::Append {
+                        from_len: retained_len,
+                        suffix: "0123456789abcdef".into(),
+                    },
+                    content_width: 78,
+                })
+                .is_err()
+        );
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        for entry_id in 2..80 {
+            runner
+                .request(super::MarkdownLayoutRequest {
+                    entry_id,
+                    key: super::MarkdownLayoutKey {
+                        revision: 1,
+                        width: 80,
+                    },
+                    source: super::MarkdownSourceUpdate::Replace("x".repeat(120_000)),
+                    content_width: 78,
+                })
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (pending, _, _, _, _) = runner.stats();
+            if pending == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "result pressure build timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let (results, result_bytes) = runner.result_stats();
+        assert!(results <= super::MARKDOWN_LAYOUT_CACHE_CAPACITY);
+        assert!(result_bytes <= super::MARKDOWN_LAYOUT_CACHE_BYTES);
+    }
+
     fn wait_for_runner_result(
         runner: &super::MarkdownLayoutRunner,
         entry_id: u64,
@@ -5752,7 +6398,7 @@ mod tests {
 
         let entry = app.transcript.entries().last().expect("assistant entry");
         let dispatch_started = Instant::now();
-        let _ = cache.markdown_layout(entry, 76);
+        let _ = cache.markdown_layout(entry, 80);
         assert!(
             dispatch_started.elapsed() < Duration::from_millis(16),
             "cold fenced dispatch initialized highlighting on the foreground thread"
@@ -5820,6 +6466,67 @@ mod tests {
             after.contains(&anchored),
             "expected {anchored:?} to remain visible after async reflow: {after:?}"
         );
+    }
+
+    #[test]
+    fn literal_to_semantic_replacement_keeps_the_exact_visible_source_word() {
+        let mut app = App::new();
+        app.transcript.submit(45, "prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 45 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 45,
+            text: format!(
+                "**{}**",
+                (0..400)
+                    .map(|index| format!("anchor-{index:03} "))
+                    .collect::<String>()
+            ),
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let first_build = std::sync::Arc::clone(&first);
+        let cache = TranscriptRenderCache {
+            markdown_runner: super::MarkdownLayoutRunner::spawn_with(move |source, width| {
+                if first_build.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+                MarkdownLayout::new(source, width)
+            }),
+            ..TranscriptRenderCache::default()
+        };
+        let (_, initial) = render_transcript_at(&app, &cache, &Theme::default(), 60, 10);
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        app.update_transcript_scroll_maximum(initial.scroll_maximum);
+        app.scroll_transcript_by(12);
+        let (literal, _) = render_transcript_at(&app, &cache, &Theme::default(), 60, 10);
+        let anchored = literal
+            .split_whitespace()
+            .find(|word| word.starts_with("anchor-"))
+            .expect("a literal source word is visible")
+            .trim_matches('*')
+            .to_owned();
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            cache.drain_markdown_results_for(&app);
+            let (_, _, pending, _) = cache.markdown_cache_stats();
+            if pending == 0 && cache.markdown_runner.stats().0 == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "semantic layout timed out");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let (semantic, _) = render_transcript_at(&app, &cache, &Theme::default(), 60, 10);
+        let semantic_anchor = semantic
+            .split_whitespace()
+            .find(|word| word.starts_with("anchor-"))
+            .expect("a semantic source word is visible")
+            .trim_matches('*');
+
+        assert_eq!(semantic_anchor, anchored);
     }
 
     #[test]
@@ -5949,6 +6656,7 @@ mod tests {
             request_id: 52,
             text: " updated".into(),
         });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 52 });
         let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
         wait_for_markdown(&app, &cache);
         assert_eq!(cache.markdown_layout_builds(), 3);
@@ -5973,6 +6681,8 @@ mod tests {
                 .join("\n\n"),
         });
         let cache = TranscriptRenderCache::default();
+        let _ = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
+        wait_for_markdown(&app, &cache);
         let roles = [
             ThemeRole::MarkdownHeading1,
             ThemeRole::MarkdownHeading2,

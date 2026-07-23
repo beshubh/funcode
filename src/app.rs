@@ -1270,7 +1270,8 @@ impl App {
                         InputOwner::Composer | InputOwner::Suggestions,
                         Some(PointerTarget::TranscriptOutput(entry_id)),
                     ) => {
-                        self.active_tool_output = Some(entry_id);
+                        self.active_tool_output =
+                            self.tool_output_is_scrollable(entry_id).then_some(entry_id);
                         None
                     }
                     _ => None,
@@ -1309,7 +1310,8 @@ impl App {
                     InputOwner::Composer
                     | InputOwner::Suggestions
                     | InputOwner::PendingSubmission
-                        if let Some(PointerTarget::TranscriptOutput(entry_id)) = target =>
+                        if let Some(PointerTarget::TranscriptOutput(entry_id)) = target
+                            && self.tool_output_is_scrollable(entry_id) =>
                     {
                         self.scroll_tool_output_by(entry_id, delta);
                     }
@@ -1375,6 +1377,14 @@ impl App {
             .collect::<Vec<_>>();
         state.sort_unstable_by_key(|(entry_id, _)| *entry_id);
         state
+    }
+
+    fn tool_output_is_scrollable(&self, entry_id: EntryId) -> bool {
+        self.entry_is_expanded(entry_id)
+            && self
+                .tool_output_scrolls
+                .get(&entry_id)
+                .is_some_and(|state| state.maximum > 0)
     }
 
     fn pointer_activation_state(&self) -> PointerActivationState {
@@ -1472,6 +1482,9 @@ impl App {
         layout_id: ToolOutputLayoutId,
         row_index: Option<&Arc<ToolOutputRowIndex>>,
     ) -> usize {
+        if !self.entry_is_expanded(entry_id) {
+            return 0;
+        }
         let Some(state) = self.tool_output_scrolls.get(&entry_id) else {
             return 0;
         };
@@ -1489,7 +1502,7 @@ impl App {
         &mut self,
         metrics: &[ToolOutputScrollMetrics],
     ) -> bool {
-        metrics.iter().fold(false, |changed, metrics| {
+        let metrics_changed = metrics.iter().fold(false, |changed, metrics| {
             let previous = self
                 .tool_output_scrolls
                 .get(&metrics.entry_id)
@@ -1525,7 +1538,14 @@ impl App {
             let entry_changed = current != previous;
             self.tool_output_scrolls.insert(metrics.entry_id, current);
             entry_changed || changed
-        })
+        });
+        let focus_changed = self
+            .active_tool_output
+            .is_some_and(|entry_id| !self.tool_output_is_scrollable(entry_id));
+        if focus_changed {
+            self.active_tool_output = None;
+        }
+        metrics_changed || focus_changed
     }
 
     #[cfg(test)]
@@ -1907,6 +1927,7 @@ impl App {
                 if self.transcript.is_queued(request_id) {
                     self.active_request = Some(request_id);
                     self.cancellation_requested = false;
+                    self.session_usage.begin_request();
                 }
                 (
                     request_id,
@@ -1947,16 +1968,21 @@ impl App {
                 attempt,
                 max_retries,
                 message,
-            } => (
-                request_id,
-                TranscriptEvent::Retrying {
-                    turn_id: request_id,
-                    attempt,
-                    max_retries,
-                    message,
-                },
-                false,
-            ),
+            } => {
+                if self.active_request == Some(request_id) {
+                    self.session_usage.retry_request();
+                }
+                (
+                    request_id,
+                    TranscriptEvent::Retrying {
+                        turn_id: request_id,
+                        attempt,
+                        max_retries,
+                        message,
+                    },
+                    false,
+                )
+            }
             AgentEvent::ToolStarted {
                 request_id,
                 call_id,
@@ -2015,31 +2041,46 @@ impl App {
                 },
                 false,
             ),
-            AgentEvent::Completed { request_id } => (
-                request_id,
-                TranscriptEvent::Completed {
-                    turn_id: request_id,
-                },
-                true,
-            ),
-            AgentEvent::Interrupted { request_id } => (
-                request_id,
-                TranscriptEvent::Interrupted {
-                    turn_id: request_id,
-                },
-                true,
-            ),
+            AgentEvent::Completed { request_id } => {
+                if self.active_request == Some(request_id) {
+                    self.session_usage.complete_request();
+                }
+                (
+                    request_id,
+                    TranscriptEvent::Completed {
+                        turn_id: request_id,
+                    },
+                    true,
+                )
+            }
+            AgentEvent::Interrupted { request_id } => {
+                if self.active_request == Some(request_id) {
+                    self.session_usage.abandon_request();
+                }
+                (
+                    request_id,
+                    TranscriptEvent::Interrupted {
+                        turn_id: request_id,
+                    },
+                    true,
+                )
+            }
             AgentEvent::Failed {
                 request_id,
                 message,
-            } => (
-                request_id,
-                TranscriptEvent::Failed {
-                    turn_id: request_id,
-                    message,
-                },
-                true,
-            ),
+            } => {
+                if self.active_request == Some(request_id) {
+                    self.session_usage.fail_request();
+                }
+                (
+                    request_id,
+                    TranscriptEvent::Failed {
+                        turn_id: request_id,
+                        message,
+                    },
+                    true,
+                )
+            }
         };
         self.transcript.apply(transcript_event);
         if finishes_request {
@@ -2213,8 +2254,9 @@ impl App {
             Some(EntryKind::User(_)) => self.open_message_dialog(entry_id),
             Some(EntryKind::Reasoning(_)) => self.toggle_entry(entry_id),
             Some(EntryKind::Tool(_)) => {
-                self.active_tool_output = Some(entry_id);
                 self.toggle_entry(entry_id);
+                self.active_tool_output =
+                    self.tool_output_is_scrollable(entry_id).then_some(entry_id);
             }
             Some(EntryKind::Assistant(_) | EntryKind::Retry(_)) | None => {}
         }
@@ -3509,6 +3551,7 @@ mod tests {
                 input_tokens: 120,
                 output_tokens: 30,
                 total_tokens: 150,
+                reasoning_tokens: 0,
             },
         });
         app.handle_agent_event(AgentEvent::Usage {
@@ -3517,11 +3560,47 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
                 total_tokens: 2,
+                reasoning_tokens: 0,
             },
         });
 
         assert_eq!(app.session_usage.total_tokens(), Some(150));
+        assert_eq!(app.session_usage.context_tokens(), None);
+
+        app.handle_agent_event(AgentEvent::Completed { request_id: 3 });
+
         assert_eq!(app.session_usage.context_tokens(), Some(150));
+    }
+
+    #[test]
+    fn provider_snapshots_cannot_reduce_retained_session_context() {
+        let mut app = App::new();
+        app.transcript.submit(1, "first prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::Usage {
+            request_id: 1,
+            usage: crate::usage::TokenUsage {
+                input_tokens: 4_800,
+                output_tokens: 200,
+                total_tokens: 5_000,
+                reasoning_tokens: 0,
+            },
+        });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 1 });
+
+        app.transcript.submit(2, "second prompt".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 2 });
+        app.handle_agent_event(AgentEvent::Usage {
+            request_id: 2,
+            usage: crate::usage::TokenUsage {
+                input_tokens: 400,
+                output_tokens: 100,
+                total_tokens: 500,
+                reasoning_tokens: 0,
+            },
+        });
+
+        assert_eq!(app.session_usage.context_tokens(), Some(5_000));
     }
 
     #[test]
@@ -3769,23 +3848,34 @@ mod tests {
     #[test]
     fn tool_output_scroll_pauses_tail_follow_and_preserves_visible_history() {
         let mut app = App::new();
-        app.update_tool_output_scroll_maximum(42, 20);
+        app.transcript.submit(1, "inspect".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 1,
+            call_id: 1,
+            name: "terminal".into(),
+            summary: "Inspect output".into(),
+            artifacts: Vec::new(),
+        });
+        let tool_id = app.transcript.entries()[2].id;
+        app.update_tool_output_scroll_maximum(tool_id, 20);
+        app.activate_transcript_entry(tool_id);
 
-        assert_eq!(app.tool_output_scroll_offset(42, 20), 0);
-        assert!(app.scroll_tool_output_by(42, 1));
-        assert_eq!(app.active_tool_output(), Some(42));
-        assert_eq!(app.tool_output_scroll_offset(42, 20), 5);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 20), 0);
+        assert!(app.scroll_tool_output_by(tool_id, 1));
+        assert_eq!(app.active_tool_output(), Some(tool_id));
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 20), 5);
 
-        app.update_tool_output_scroll_maximum(42, 30);
-        assert_eq!(app.tool_output_scroll_offset(42, 30), 15);
+        app.update_tool_output_scroll_maximum(tool_id, 30);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 15);
 
-        app.update_tool_output_scroll_maximum(42, 0);
-        assert_eq!(app.tool_output_scroll_offset(42, 0), 0);
-        app.update_tool_output_scroll_maximum(42, 30);
-        assert_eq!(app.tool_output_scroll_offset(42, 30), 15);
+        app.update_tool_output_scroll_maximum(tool_id, 0);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 0), 0);
+        app.update_tool_output_scroll_maximum(tool_id, 30);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 15);
 
-        assert!(app.scroll_tool_output_by(42, -3));
-        assert_eq!(app.tool_output_scroll_offset(42, 30), 0);
+        assert!(app.scroll_tool_output_by(tool_id, -3));
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 0);
     }
 
     #[test]
@@ -3833,24 +3923,36 @@ mod tests {
     #[test]
     fn active_tool_output_owns_scroll_keys_until_end_or_an_outside_click() {
         let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "inspect".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 1,
+            call_id: 1,
+            name: "terminal".into(),
+            summary: "Inspect output".into(),
+            artifacts: Vec::new(),
+        });
+        let tool_id = app.transcript.entries()[2].id;
         app.update_transcript_scroll_maximum(20);
-        app.update_tool_output_scroll_maximum(42, 30);
+        app.update_tool_output_scroll_maximum(tool_id, 30);
+        app.activate_transcript_entry(tool_id);
 
         let outcome = app.handle_pointer(PointerEvent::Scroll {
             delta: 1,
-            target: Some(PointerTarget::TranscriptOutput(42)),
+            target: Some(PointerTarget::TranscriptOutput(tool_id)),
         });
 
         assert!(outcome.changed);
-        assert_eq!(app.tool_output_scroll_offset(42, 30), 5);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 5);
         assert_eq!(app.transcript_scroll_offset(20), 0);
 
         app.handle_key(key(KeyCode::PageUp), Instant::now());
-        assert_eq!(app.tool_output_scroll_offset(42, 30), 10);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 10);
         assert_eq!(app.transcript_scroll_offset(20), 0);
 
         app.handle_key(key(KeyCode::End), Instant::now());
-        assert_eq!(app.tool_output_scroll_offset(42, 30), 0);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 0);
 
         app.handle_pointer(PointerEvent::Activate(Some(PointerTarget::Transcript)));
         assert_eq!(app.active_tool_output(), None);
@@ -3859,25 +3961,89 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_tool_output_does_not_capture_transcript_scrolling() {
+        let mut app = App::new();
+        app.transcript.submit(1, "inspect".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 1,
+            call_id: 1,
+            name: "terminal".into(),
+            summary: "Inspect output".into(),
+            artifacts: Vec::new(),
+        });
+        let tool_id = app.transcript.entries()[2].id;
+        app.update_transcript_scroll_maximum(20);
+        app.update_tool_output_scroll_maximum(tool_id, 30);
+
+        let outcome = app.handle_pointer(PointerEvent::Scroll {
+            delta: 1,
+            target: Some(PointerTarget::TranscriptOutput(tool_id)),
+        });
+
+        assert!(outcome.changed);
+        assert_eq!(app.transcript_scroll_offset(20), 5);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 0);
+        assert_eq!(app.active_tool_output(), None);
+    }
+
+    #[test]
+    fn expanded_tool_without_overflow_leaves_page_keys_with_the_transcript() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "inspect".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 1,
+            call_id: 1,
+            name: "terminal".into(),
+            summary: "Inspect output".into(),
+            artifacts: Vec::new(),
+        });
+        let tool_id = app.transcript.entries()[2].id;
+        app.update_transcript_scroll_maximum(20);
+        app.update_tool_output_scroll_maximum(tool_id, 0);
+
+        app.activate_transcript_entry(tool_id);
+        assert!(app.entry_is_expanded(tool_id));
+        app.handle_key(key(KeyCode::PageUp), Instant::now());
+
+        assert_eq!(app.transcript_scroll_offset(20), 5);
+        assert_eq!(app.active_tool_output(), None);
+    }
+
+    #[test]
     fn pending_submission_does_not_retarget_active_output_scrolling() {
         let mut app = App::new();
-        app.update_tool_output_scroll_maximum(42, 30);
-        app.scroll_tool_output_by(42, 1);
+        app.screen = Screen::Chat;
+        app.transcript.submit(1, "inspect".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+        app.handle_agent_event(AgentEvent::ToolStarted {
+            request_id: 1,
+            call_id: 1,
+            name: "terminal".into(),
+            summary: "Inspect output".into(),
+            artifacts: Vec::new(),
+        });
+        let tool_id = app.transcript.entries()[2].id;
+        app.update_tool_output_scroll_maximum(tool_id, 30);
+        app.activate_transcript_entry(tool_id);
+        app.scroll_tool_output_by(tool_id, 1);
         app.composer.insert_text("new request");
         let _ = app.handle_key(key(KeyCode::Enter), Instant::now());
         assert!(app.pending_submission_view().is_some());
 
         app.handle_key(key(KeyCode::PageUp), Instant::now());
-        assert_eq!(app.tool_output_scroll_offset(42, 30), 10);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 10);
         app.handle_key(key(KeyCode::End), Instant::now());
-        assert_eq!(app.tool_output_scroll_offset(42, 30), 0);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 0);
 
         let outcome = app.handle_pointer(PointerEvent::Scroll {
             delta: 1,
-            target: Some(PointerTarget::TranscriptOutput(42)),
+            target: Some(PointerTarget::TranscriptOutput(tool_id)),
         });
         assert!(outcome.changed);
-        assert_eq!(app.tool_output_scroll_offset(42, 30), 5);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 30), 5);
     }
 
     #[test]

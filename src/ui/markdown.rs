@@ -67,7 +67,376 @@ struct LogicalLine {
 #[derive(Debug, Clone)]
 pub(super) struct MarkdownLayout {
     rows: Vec<SemanticLine>,
+    literal: Option<LiteralProjection>,
     bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MarkdownAnchor {
+    offset: usize,
+    token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiteralProjection {
+    source: String,
+    width: usize,
+    lines: Vec<LiteralLogicalLine>,
+    height: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiteralLogicalLine {
+    start: usize,
+    end: usize,
+    first_row: usize,
+    rows: usize,
+    last_column: usize,
+    checkpoints: Vec<LiteralCheckpoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiteralCheckpoint {
+    row: usize,
+    offset: usize,
+}
+
+const LITERAL_CHECKPOINT_ROWS: usize = 256;
+
+impl LiteralProjection {
+    fn new(source: &str, width: usize) -> Self {
+        Self::from_owned(source.to_owned(), width)
+    }
+
+    fn from_owned(mut source: String, width: usize) -> Self {
+        if source.contains('\t') {
+            source = source.replace('\t', "    ");
+        }
+        let mut projection = Self {
+            source,
+            width: width.max(1),
+            lines: Vec::new(),
+            height: 0,
+        };
+        projection.reindex_from(0);
+        projection
+    }
+
+    fn append(&mut self, suffix: &str) {
+        let suffix = suffix.replace('\t', "    ");
+        let source_start = self.source.len();
+        self.source.push_str(&suffix);
+        let mut consumed = 0usize;
+        for segment in suffix.split_inclusive('\n') {
+            let body = segment.strip_suffix('\n').unwrap_or(segment);
+            let end = source_start
+                .saturating_add(consumed)
+                .saturating_add(body.len());
+            if let Some(line) = self.lines.last_mut() {
+                let previous_rows = line.rows;
+                extend_literal_checkpoints(
+                    &mut line.checkpoints,
+                    previous_rows,
+                    line.last_column,
+                    body,
+                    self.width,
+                    line.end.saturating_sub(line.start),
+                );
+                (line.rows, line.last_column) =
+                    advance_literal_metrics(line.rows, line.last_column, body, self.width);
+                line.end = end;
+                self.height = self
+                    .height
+                    .saturating_add(line.rows.saturating_sub(previous_rows));
+            }
+            consumed = consumed.saturating_add(segment.len());
+            if segment.ends_with('\n') {
+                self.lines.push(LiteralLogicalLine {
+                    start: source_start.saturating_add(consumed),
+                    end: source_start.saturating_add(consumed),
+                    first_row: self.height,
+                    rows: 1,
+                    last_column: 0,
+                    checkpoints: vec![LiteralCheckpoint { row: 0, offset: 0 }],
+                });
+                self.height = self.height.saturating_add(1);
+            }
+        }
+    }
+
+    fn reindex_from(&mut self, start: usize) {
+        let mut line_start = start;
+        while line_start <= self.source.len() {
+            let newline = self.source[line_start..]
+                .find('\n')
+                .map(|relative| line_start.saturating_add(relative));
+            let end = newline.unwrap_or(self.source.len());
+            let (rows, last_column) =
+                advance_literal_metrics(1, 0, &self.source[line_start..end], self.width);
+            let checkpoints = literal_checkpoints(&self.source[line_start..end], self.width);
+            self.lines.push(LiteralLogicalLine {
+                start: line_start,
+                end,
+                first_row: self.height,
+                rows,
+                last_column,
+                checkpoints,
+            });
+            self.height = self.height.saturating_add(rows);
+            let Some(newline) = newline else {
+                break;
+            };
+            line_start = newline.saturating_add(1);
+            if line_start == self.source.len() {
+                self.lines.push(LiteralLogicalLine {
+                    start: line_start,
+                    end: line_start,
+                    first_row: self.height,
+                    rows: 1,
+                    last_column: 0,
+                    checkpoints: vec![LiteralCheckpoint { row: 0, offset: 0 }],
+                });
+                self.height = self.height.saturating_add(1);
+                break;
+            }
+        }
+    }
+
+    fn line(&self, row: usize) -> Option<String> {
+        let line = self.lines.get(
+            self.lines
+                .partition_point(|line| line.first_row <= row)
+                .saturating_sub(1),
+        )?;
+        if row >= line.first_row.saturating_add(line.rows) {
+            return None;
+        }
+        let target = row.saturating_sub(line.first_row);
+        let checkpoint = checkpoint_for_row(line, target);
+        Some(
+            literal_visual_row_from(
+                &self.source[line.start..line.end],
+                self.width,
+                target,
+                checkpoint,
+            )
+            .0,
+        )
+    }
+
+    fn anchor_for_row(&self, row: usize) -> usize {
+        let index = self
+            .lines
+            .partition_point(|line| line.first_row <= row)
+            .saturating_sub(1);
+        self.lines.get(index).map_or(0, |line| {
+            let target = row.saturating_sub(line.first_row);
+            let checkpoint = checkpoint_for_row(line, target);
+            line.start.saturating_add(
+                literal_visual_row_from(
+                    &self.source[line.start..line.end],
+                    self.width,
+                    target,
+                    checkpoint,
+                )
+                .1,
+            )
+        })
+    }
+
+    fn row_for_anchor(&self, anchor: usize) -> usize {
+        let anchor = anchor.min(self.source.len());
+        let anchor = (0..=anchor)
+            .rev()
+            .find(|offset| self.source.is_char_boundary(*offset))
+            .unwrap_or(0);
+        let index = self
+            .lines
+            .partition_point(|line| line.start <= anchor)
+            .saturating_sub(1);
+        self.lines.get(index).map_or(0, |line| {
+            let relative = anchor
+                .saturating_sub(line.start)
+                .min(line.end.saturating_sub(line.start));
+            let checkpoint = line
+                .checkpoints
+                .iter()
+                .rev()
+                .find(|checkpoint| checkpoint.offset <= relative)
+                .copied()
+                .unwrap_or(LiteralCheckpoint { row: 0, offset: 0 });
+            let visual_width = self.source
+                [line.start.saturating_add(checkpoint.offset)..line.start.saturating_add(relative)]
+                .width();
+            line.first_row
+                .saturating_add(checkpoint.row)
+                .saturating_add(visual_width / self.width)
+                .min(line.first_row.saturating_add(line.rows.saturating_sub(1)))
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.source.len())
+            .saturating_add(
+                self.lines
+                    .len()
+                    .saturating_mul(std::mem::size_of::<LiteralLogicalLine>()),
+            )
+            .saturating_add(
+                self.lines
+                    .iter()
+                    .map(|line| {
+                        line.checkpoints
+                            .len()
+                            .saturating_mul(std::mem::size_of::<LiteralCheckpoint>())
+                    })
+                    .sum::<usize>(),
+            )
+    }
+}
+
+fn advance_literal_metrics(
+    mut rows: usize,
+    mut column: usize,
+    text: &str,
+    width: usize,
+) -> (usize, usize) {
+    let width = width.max(1);
+    if text.is_ascii() {
+        let total = column.saturating_add(text.len());
+        let wraps = if text.is_empty() {
+            0
+        } else {
+            total.saturating_sub(1) / width
+        };
+        let remainder = total % width;
+        return (
+            rows.saturating_add(wraps),
+            if total > 0 && remainder == 0 {
+                width
+            } else {
+                remainder
+            },
+        );
+    }
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1).min(width);
+        if column > 0 && column.saturating_add(grapheme_width) > width {
+            rows = rows.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(grapheme_width);
+    }
+    (rows.max(1), column)
+}
+
+fn checkpoint_for_row(line: &LiteralLogicalLine, target: usize) -> LiteralCheckpoint {
+    line.checkpoints
+        .get(
+            line.checkpoints
+                .partition_point(|checkpoint| checkpoint.row <= target)
+                .saturating_sub(1),
+        )
+        .copied()
+        .unwrap_or(LiteralCheckpoint { row: 0, offset: 0 })
+}
+
+fn literal_visual_row_from(
+    text: &str,
+    width: usize,
+    target: usize,
+    checkpoint: LiteralCheckpoint,
+) -> (String, usize) {
+    let width = width.max(1);
+    if text.is_ascii() {
+        let start = target.saturating_mul(width).min(text.len());
+        let end = start.saturating_add(width).min(text.len());
+        return (text[start..end].to_owned(), start);
+    }
+    let mut row = checkpoint.row;
+    let mut column = 0usize;
+    let mut output = String::new();
+    let mut start = text.len();
+    for (relative, grapheme) in text[checkpoint.offset..].grapheme_indices(true) {
+        let offset = checkpoint.offset.saturating_add(relative);
+        let source_width = UnicodeWidthStr::width(grapheme).max(1);
+        let grapheme_width = source_width.min(width);
+        if column > 0 && column.saturating_add(grapheme_width) > width {
+            if row == target {
+                return (output, start);
+            }
+            row = row.saturating_add(1);
+            column = 0;
+            output.clear();
+            start = text.len();
+        }
+        if row == target {
+            if start == text.len() {
+                start = offset;
+            }
+            output.push_str(if source_width > width {
+                "\u{fffd}"
+            } else {
+                grapheme
+            });
+        }
+        column = column.saturating_add(grapheme_width);
+    }
+    (output, start.min(text.len()))
+}
+
+fn literal_checkpoints(text: &str, width: usize) -> Vec<LiteralCheckpoint> {
+    let mut checkpoints = vec![LiteralCheckpoint { row: 0, offset: 0 }];
+    extend_literal_checkpoints(&mut checkpoints, 1, 0, text, width, 0);
+    checkpoints
+}
+
+fn extend_literal_checkpoints(
+    checkpoints: &mut Vec<LiteralCheckpoint>,
+    rows: usize,
+    mut column: usize,
+    text: &str,
+    width: usize,
+    base_offset: usize,
+) {
+    if text.is_ascii() {
+        let width = width.max(1);
+        let mut row = rows.saturating_sub(1);
+        let mut consumed = 0usize;
+        while consumed < text.len() {
+            if column == width {
+                row = row.saturating_add(1);
+                column = 0;
+                if row.is_multiple_of(LITERAL_CHECKPOINT_ROWS) {
+                    checkpoints.push(LiteralCheckpoint {
+                        row,
+                        offset: base_offset.saturating_add(consumed),
+                    });
+                }
+            }
+            let take = (width - column).min(text.len().saturating_sub(consumed));
+            column = column.saturating_add(take);
+            consumed = consumed.saturating_add(take);
+        }
+        return;
+    }
+    let width = width.max(1);
+    let mut row = rows.saturating_sub(1);
+    for (relative, grapheme) in text.grapheme_indices(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1).min(width);
+        if column > 0 && column.saturating_add(grapheme_width) > width {
+            row = row.saturating_add(1);
+            column = 0;
+            if row.is_multiple_of(LITERAL_CHECKPOINT_ROWS) {
+                checkpoints.push(LiteralCheckpoint {
+                    row,
+                    offset: base_offset.saturating_add(relative),
+                });
+            }
+        }
+        column = column.saturating_add(grapheme_width);
+    }
 }
 
 impl MarkdownLayout {
@@ -75,8 +444,13 @@ impl MarkdownLayout {
         Self::build(source, width, true)
     }
 
-    pub(super) fn unhighlighted(source: &str, width: usize) -> Self {
-        Self::build(source, width, false)
+    pub(super) fn foreground(source: &str, width: usize) -> Self {
+        const SEMANTIC_FOREGROUND_LIMIT: usize = 4 * 1024;
+        if source.len() <= SEMANTIC_FOREGROUND_LIMIT {
+            Self::build(source, width, false)
+        } else {
+            Self::literal_owned(foreground_plain_text(source), width)
+        }
     }
 
     fn build(source: &str, width: usize, syntax_highlighting: bool) -> Self {
@@ -105,29 +479,129 @@ impl MarkdownLayout {
                     .map(|span| std::mem::size_of::<SemanticSpan>().saturating_add(span.text.len()))
                     .sum::<usize>(),
             );
-        Self { rows, bytes }
+        Self {
+            rows,
+            literal: None,
+            bytes,
+        }
     }
 
     pub(super) fn height(&self) -> usize {
-        self.rows.len()
+        self.literal
+            .as_ref()
+            .map_or(self.rows.len(), |literal| literal.height)
     }
 
     pub(super) fn literal(source: &str, width: usize) -> Self {
-        let mut layout = Self {
-            rows: vec![SemanticLine::default()],
-            bytes: std::mem::size_of::<SemanticLine>(),
-        };
-        layout.append_literal(source, width);
-        layout
+        let literal = LiteralProjection::new(source, width);
+        let bytes = literal.bytes();
+        Self {
+            rows: Vec::new(),
+            literal: Some(literal),
+            bytes,
+        }
+    }
+
+    fn literal_owned(source: String, width: usize) -> Self {
+        let literal = LiteralProjection::from_owned(source, width);
+        let bytes = literal.bytes();
+        Self {
+            rows: Vec::new(),
+            literal: Some(literal),
+            bytes,
+        }
     }
 
     pub(super) fn append_literal(&mut self, suffix: &str, width: usize) {
+        if let Some(literal) = &mut self.literal
+            && literal.width == width.max(1)
+        {
+            literal.append(suffix);
+            self.bytes = literal.bytes();
+            return;
+        }
+        if let Some(literal) = self.literal.take() {
+            let mut source = literal.source;
+            source.push_str(suffix);
+            *self = Self::literal(&source, width);
+            return;
+        }
         let width = width.max(1);
+        let previous_rows = self.rows.len();
+        let previous_spans = self.rows.iter().map(|row| row.spans.len()).sum::<usize>();
         let mut column = self
             .rows
             .last()
             .map(|line| spans_width(&line.spans))
             .unwrap_or_default();
+        if suffix.is_ascii() {
+            let mut pending = String::new();
+            for byte in suffix.bytes() {
+                if byte == b'\n' {
+                    self.rows
+                        .last_mut()
+                        .expect("literal layout always has a row")
+                        .push(SemanticSpan::new(
+                            std::mem::take(&mut pending),
+                            ThemeRole::Text,
+                        ));
+                    let anchor = self
+                        .rows
+                        .last()
+                        .map_or(0, |line| line.anchor.saturating_add(1));
+                    self.rows.push(SemanticLine {
+                        spans: Vec::new(),
+                        anchor,
+                    });
+                    column = 0;
+                    continue;
+                }
+                let repetitions = if byte == b'\t' { 4 } else { 1 };
+                let character = if byte == b'\t' { ' ' } else { char::from(byte) };
+                for _ in 0..repetitions {
+                    if column == width {
+                        self.rows
+                            .last_mut()
+                            .expect("literal layout always has a row")
+                            .push(SemanticSpan::new(
+                                std::mem::take(&mut pending),
+                                ThemeRole::Text,
+                            ));
+                        let anchor = self
+                            .rows
+                            .last()
+                            .map_or(0, |line| line.anchor.saturating_add(1));
+                        self.rows.push(SemanticLine {
+                            spans: Vec::new(),
+                            anchor,
+                        });
+                        column = 0;
+                    }
+                    pending.push(character);
+                    column = column.saturating_add(1);
+                }
+            }
+            self.rows
+                .last_mut()
+                .expect("literal layout always has a row")
+                .push(SemanticSpan::new(pending, ThemeRole::Text));
+            let added_rows = self.rows.len().saturating_sub(previous_rows);
+            let added_spans = self
+                .rows
+                .iter()
+                .map(|row| row.spans.len())
+                .sum::<usize>()
+                .saturating_sub(previous_spans);
+            let expanded_bytes = suffix
+                .len()
+                .saturating_add(suffix.bytes().filter(|byte| *byte == b'\t').count() * 3);
+            self.bytes = self
+                .bytes
+                .saturating_add(expanded_bytes)
+                .saturating_add(added_rows * std::mem::size_of::<SemanticLine>())
+                .saturating_add(added_spans * std::mem::size_of::<SemanticSpan>());
+            return;
+        }
         for grapheme in suffix.graphemes(true) {
             if grapheme == "\n" {
                 let anchor = self
@@ -167,18 +641,32 @@ impl MarkdownLayout {
                 column = column.saturating_add(grapheme_width);
             }
         }
-        self.bytes = self.bytes.saturating_add(suffix.len()).saturating_add(
-            self.rows
-                .len()
-                .saturating_mul(std::mem::size_of::<SemanticLine>()),
-        );
+        let added_rows = self.rows.len().saturating_sub(previous_rows);
+        let added_spans = self
+            .rows
+            .iter()
+            .map(|row| row.spans.len())
+            .sum::<usize>()
+            .saturating_sub(previous_spans);
+        self.bytes = self
+            .bytes
+            .saturating_add(suffix.len())
+            .saturating_add(added_rows * std::mem::size_of::<SemanticLine>())
+            .saturating_add(added_spans * std::mem::size_of::<SemanticSpan>());
     }
 
     pub(super) fn bytes(&self) -> usize {
         self.bytes
     }
 
+    pub(super) fn is_literal_projection(&self) -> bool {
+        self.literal.is_some()
+    }
+
     pub(super) fn visually_eq(&self, other: &Self) -> bool {
+        if self.literal.is_some() || other.literal.is_some() {
+            return self.literal == other.literal;
+        }
         self.rows.len() == other.rows.len()
             && self
                 .rows
@@ -187,17 +675,53 @@ impl MarkdownLayout {
                 .all(|(left, right)| left.spans == right.spans)
     }
 
-    pub(super) fn anchor_for_row(&self, row: usize) -> usize {
-        self.rows.get(row).map_or(0, |line| line.anchor)
+    pub(super) fn anchor_for_row(&self, row: usize) -> MarkdownAnchor {
+        MarkdownAnchor {
+            offset: if let Some(literal) = &self.literal {
+                literal.anchor_for_row(row)
+            } else {
+                self.rows.get(row).map_or(0, |line| line.anchor)
+            },
+            token: self.row_text(row).and_then(stable_anchor_token),
+        }
     }
 
-    pub(super) fn row_for_anchor(&self, anchor: usize) -> usize {
-        self.rows
-            .partition_point(|line| line.anchor <= anchor)
-            .saturating_sub(1)
+    pub(super) fn row_for_anchor(&self, anchor: &MarkdownAnchor) -> usize {
+        let approximate = if let Some(literal) = &self.literal {
+            literal.row_for_anchor(anchor.offset)
+        } else {
+            self.rows
+                .partition_point(|line| line.anchor <= anchor.offset)
+                .saturating_sub(1)
+        };
+        let Some(token) = anchor.token.as_deref() else {
+            return approximate;
+        };
+        let height = self.height();
+        for distance in 0..=height.min(512) {
+            let before = approximate.checked_sub(distance);
+            let after = approximate
+                .checked_add(distance)
+                .filter(|row| *row < height);
+            for row in [before, after].into_iter().flatten() {
+                if self
+                    .row_text(row)
+                    .is_some_and(|text| row_contains_token(&text, token))
+                {
+                    return row;
+                }
+            }
+        }
+        approximate
     }
 
     pub(super) fn line(&self, index: usize, theme: &Theme) -> Option<Line<'static>> {
+        if let Some(literal) = &self.literal {
+            return Some(Line::styled(
+                literal.line(index)?,
+                theme.style(ThemeRole::Text),
+            ));
+        }
         let row = self.rows.get(index)?;
         Some(Line::from(
             row.spans
@@ -211,6 +735,316 @@ impl MarkdownLayout {
                 .collect::<Vec<_>>(),
         ))
     }
+
+    fn row_text(&self, row: usize) -> Option<String> {
+        if let Some(literal) = &self.literal {
+            return literal.line(row);
+        }
+        self.rows.get(row).map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<String>()
+        })
+    }
+}
+
+fn foreground_plain_text(source: &str) -> String {
+    let unclosed = if source.contains("```") || source.contains("~~~") {
+        unclosed_fence_start(source)
+    } else {
+        None
+    };
+    let (parsed, literal) = unclosed.map_or((source, ""), |start| source.split_at(start));
+    if !foreground_needs_parser(parsed) {
+        let mut output = String::with_capacity(source.len());
+        for line in parsed.split_inclusive('\n') {
+            let (body, newline) = line
+                .strip_suffix('\n')
+                .map_or((line, ""), |body| (body, "\n"));
+            let trimmed = body.trim_start_matches(' ');
+            let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+            if (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+                let indentation = body.len().saturating_sub(trimmed.len());
+                output.push_str(&body[..indentation]);
+                output.push_str(&trimmed[hashes + 1..]);
+            } else {
+                output.push_str(body);
+            }
+            output.push_str(newline);
+        }
+        output.push_str(literal);
+        return output;
+    }
+    let mut output = String::with_capacity(source.len());
+    let mut fence: Option<(char, usize, String, String)> = None;
+    for line in parsed.split_inclusive('\n') {
+        let (body, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |body| (body, "\n"));
+        let trimmed = body.trim_start_matches(' ');
+        let mut fence_content = trimmed;
+        let mut fence_prefix = String::new();
+        let mut fence_continuation = String::new();
+        while let Some(quoted) = fence_content.strip_prefix('>') {
+            fence_prefix.push_str("│ ");
+            fence_continuation.push_str("│ ");
+            fence_content = quoted.strip_prefix(' ').unwrap_or(quoted);
+        }
+        if let Some(item) = fence_content
+            .strip_prefix("- ")
+            .or_else(|| fence_content.strip_prefix("+ "))
+            .or_else(|| fence_content.strip_prefix("* "))
+        {
+            fence_prefix.push_str("• ");
+            fence_continuation.push_str("  ");
+            fence_content = item;
+        }
+        let fence_character = fence_content.chars().next().filter(|character| {
+            (*character == '`' || *character == '~')
+                && fence_content
+                    .chars()
+                    .take_while(|candidate| candidate == character)
+                    .count()
+                    >= 3
+        });
+        let fence_length = fence_character.map(|character| {
+            fence_content
+                .chars()
+                .take_while(|candidate| *candidate == character)
+                .count()
+        });
+        if let Some(character) = fence_character
+            && fence.as_ref().is_none_or(|(open, length, _, _)| {
+                *open == character
+                    && fence_length.is_some_and(|current| current >= *length)
+                    && fence_content[fence_length.unwrap_or_default()..]
+                        .trim()
+                        .is_empty()
+            })
+        {
+            if let Some((_, _, _, continuation)) = fence.take() {
+                output.push_str(&continuation);
+                output.push_str("└─");
+                output.push_str(newline);
+            } else {
+                fence = Some((
+                    character,
+                    fence_length.unwrap_or(3),
+                    fence_prefix.clone(),
+                    fence_continuation.clone(),
+                ));
+                let info = fence_content
+                    .trim_start_matches(character)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default();
+                output.push_str(&fence_prefix);
+                output.push_str("┌─");
+                if !info.is_empty() {
+                    output.push(' ');
+                    output.push_str(info);
+                }
+                output.push_str(newline);
+            }
+            continue;
+        }
+        if let Some((_, _, _, prefix)) = &fence {
+            output.push_str(prefix);
+            output.push_str("│ ");
+            output.push_str(strip_foreground_container(body));
+            output.push_str(newline);
+            continue;
+        }
+        let mut content = trimmed;
+        let indentation = body.len().saturating_sub(trimmed.len());
+        output.push_str(&body[..indentation]);
+        while let Some(quoted) = content.strip_prefix('>') {
+            output.push_str("│ ");
+            content = quoted.strip_prefix(' ').unwrap_or(quoted);
+        }
+        let hashes = content.bytes().take_while(|byte| *byte == b'#').count();
+        if (1..=6).contains(&hashes) && content.as_bytes().get(hashes) == Some(&b' ') {
+            content = &content[hashes + 1..];
+        }
+        if let Some(item) = content
+            .strip_prefix("- ")
+            .or_else(|| content.strip_prefix("+ "))
+            .or_else(|| content.strip_prefix("* "))
+        {
+            output.push_str("• ");
+            content = item;
+        }
+        if let Some(task) = content
+            .strip_prefix("[x] ")
+            .or_else(|| content.strip_prefix("[X] "))
+        {
+            output.push_str("☑ ");
+            content = task;
+        } else if let Some(task) = content.strip_prefix("[ ] ") {
+            output.push_str("☐ ");
+            content = task;
+        }
+        if content.len() >= 3 && content.bytes().all(|byte| byte == b'-') {
+            output.push_str("───");
+            output.push_str(newline);
+            continue;
+        }
+        output.push_str(&strip_inline_markers(content));
+        output.push_str(newline);
+    }
+    while output.ends_with('\n') {
+        output.pop();
+    }
+    if !literal.is_empty() {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(literal);
+    }
+    output
+}
+
+pub(super) fn foreground_suffix(source: &str) -> String {
+    foreground_plain_text(source)
+}
+
+fn strip_foreground_container(body: &str) -> &str {
+    let mut content = body.trim_start_matches(' ');
+    let had_quote = content.starts_with('>');
+    while let Some(quoted) = content.strip_prefix('>') {
+        content = quoted.strip_prefix(' ').unwrap_or(quoted);
+    }
+    if had_quote {
+        return content;
+    }
+    if let Some(item) = content
+        .strip_prefix("- ")
+        .or_else(|| content.strip_prefix("+ "))
+        .or_else(|| content.strip_prefix("* "))
+    {
+        return item;
+    }
+    body
+}
+
+fn foreground_needs_parser(source: &str) -> bool {
+    source
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'_' | b'~' | b'`' | b'[' | b']' | b'>' | b'!'))
+        || source
+            .lines()
+            .any(|line| line.starts_with("- ") || line.starts_with("+ "))
+}
+
+fn strip_inline_markers(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    while cursor < source.len() {
+        let rest = &source[cursor..];
+        if let Some(escaped) = rest.strip_prefix('\\') {
+            if let Some(next) = escaped.chars().next() {
+                output.push(next);
+                cursor = cursor.saturating_add(1 + next.len_utf8());
+            } else {
+                output.push('\\');
+                cursor = cursor.saturating_add(1);
+            }
+            continue;
+        }
+        if rest.starts_with('`')
+            && let Some(close) = find_unescaped(rest, "`", 1)
+        {
+            output.push_str(&rest[1..close]);
+            cursor = cursor.saturating_add(close + 1);
+            continue;
+        }
+        if rest.starts_with("![")
+            && let Some(close) = rest.find(')')
+        {
+            output.push_str(&rest[..close + 1]);
+            cursor = cursor.saturating_add(close + 1);
+            continue;
+        }
+        if rest.starts_with('[')
+            && let Some(label_end) = rest.find("](")
+            && let Some(destination_end) = rest[label_end + 2..].find(')')
+        {
+            let destination_end = label_end + 2 + destination_end;
+            let label = &rest[1..label_end];
+            let destination = &rest[label_end + 2..destination_end];
+            output.push_str(label);
+            if label != destination {
+                output.push_str(" → ");
+                output.push_str(destination);
+            }
+            cursor = cursor.saturating_add(destination_end + 1);
+            continue;
+        }
+        let delimiter = ["**", "__", "~~", "*", "_", "~"]
+            .into_iter()
+            .find(|delimiter| rest.starts_with(delimiter));
+        if let Some(delimiter) = delimiter
+            && let Some(close) = find_unescaped(rest, delimiter, delimiter.len())
+            && close > delimiter.len()
+            && !(delimiter == "_"
+                && source[..cursor]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphanumeric)
+                && rest[close + delimiter.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric))
+        {
+            output.push_str(&rest[delimiter.len()..close]);
+            cursor = cursor.saturating_add(close + delimiter.len());
+            continue;
+        }
+        let Some(character) = rest.chars().next() else {
+            break;
+        };
+        output.push(character);
+        cursor = cursor.saturating_add(character.len_utf8());
+    }
+    output
+}
+
+fn find_unescaped(source: &str, needle: &str, start: usize) -> Option<usize> {
+    let mut cursor = start;
+    while cursor < source.len() {
+        let relative = source[cursor..].find(needle)?;
+        let position = cursor.saturating_add(relative);
+        let escaped = source[..position]
+            .chars()
+            .rev()
+            .take_while(|c| *c == '\\')
+            .count()
+            % 2
+            == 1;
+        if !escaped {
+            return Some(position);
+        }
+        cursor = position.saturating_add(needle.len());
+    }
+    None
+}
+
+fn stable_anchor_token(text: String) -> Option<String> {
+    let mut tokens = text
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '-'
+        })
+        .filter(|token| token.chars().count() >= 4);
+    let first = tokens.next()?;
+    Some(tokens.next().unwrap_or(first).to_owned())
+}
+
+fn row_contains_token(text: &str, expected: &str) -> bool {
+    text.split(|character: char| {
+        !character.is_alphanumeric() && character != '_' && character != '-'
+    })
+    .any(|token| token == expected)
 }
 
 fn markdown_options() -> Options {
@@ -785,7 +1619,7 @@ impl MarkdownBuilder {
             let content_length = line
                 .content
                 .iter()
-                .map(|span| span.text.graphemes(true).count())
+                .map(|span| span.text.len())
                 .sum::<usize>();
             rows.extend(wrap_logical(line, self.width, anchor));
             anchor = anchor
@@ -875,7 +1709,7 @@ fn wrap_logical(line: LogicalLine, width: usize, anchor: usize) -> Vec<SemanticL
             });
             column = column.saturating_add(grapheme_width);
             row_has_content = true;
-            consumed = consumed.saturating_add(1);
+            consumed = consumed.saturating_add(grapheme.len());
         }
     }
     rows.push(row);
@@ -918,12 +1752,14 @@ fn fit_prefix(prefix: Vec<SemanticSpan>, width: usize) -> Vec<SemanticSpan> {
 
 fn unclosed_fence_start(source: &str) -> Option<usize> {
     let mut open: Option<(usize, char, usize, FenceContainer)> = None;
+    let mut list_continuation: Option<FenceContainer> = None;
     let mut offset = 0usize;
     for line_with_ending in source.split_inclusive('\n') {
         let line = line_with_ending.trim_end_matches(['\r', '\n']);
-        if let Some(candidate) =
-            container_fence_candidate(line, open.map(|(_, _, _, container)| container))
-        {
+        let expected_container = open
+            .map(|(_, _, _, container)| container)
+            .or(list_continuation);
+        if let Some(candidate) = container_fence_candidate(line, expected_container) {
             let character = candidate.text.chars().next();
             if matches!(character, Some('`' | '~')) {
                 let character = character.expect("fence character");
@@ -948,6 +1784,20 @@ fn unclosed_fence_start(source: &str) -> Option<usize> {
                 }
             }
         }
+        if open.is_none() {
+            if let Some(container) = list_container(line) {
+                list_continuation = Some(container);
+            } else if let Some(container) = list_continuation
+                && !line.trim().is_empty()
+                && line
+                    .chars()
+                    .take_while(|character| *character == ' ')
+                    .count()
+                    < container.list_indent.unwrap_or_default()
+            {
+                list_continuation = None;
+            }
+        }
         offset = offset.saturating_add(line_with_ending.len());
     }
     open.map(|(start, _, _, _)| start)
@@ -967,8 +1817,32 @@ impl FenceContainer {
                 Some(required) => {
                     closing.list_indent == Some(required) || closing.indent >= required
                 }
-                None => closing.list_indent.is_none(),
+                None if self.indent > 3 => {
+                    closing.list_indent.is_none() && closing.indent >= self.indent
+                }
+                None => closing.list_indent.is_none() && closing.indent <= 3,
             }
+    }
+}
+
+fn list_container(mut line: &str) -> Option<FenceContainer> {
+    let mut quote_depth = 0usize;
+    loop {
+        let spaces = line
+            .chars()
+            .take_while(|character| *character == ' ')
+            .count();
+        line = &line[spaces..];
+        let Some(quoted) = line.strip_prefix('>') else {
+            let (_, marker_width) = strip_list_marker(line)?;
+            return Some(FenceContainer {
+                quote_depth,
+                indent: spaces,
+                list_indent: Some(spaces.saturating_add(marker_width)),
+            });
+        };
+        quote_depth = quote_depth.saturating_add(1);
+        line = quoted.strip_prefix(' ').unwrap_or(quoted);
     }
 }
 
@@ -991,7 +1865,8 @@ fn container_fence_candidate(
         let continuation_indent = open_container
             .and_then(|container| container.list_indent)
             .is_some_and(|required| indent.saturating_add(spaces) >= required);
-        if spaces > 3 && !continuation_indent {
+        let indented_list = strip_list_marker(&line[spaces..]).is_some();
+        if spaces > 3 && !continuation_indent && !indented_list {
             return None;
         }
         indent = indent.saturating_add(spaces);
@@ -1153,7 +2028,7 @@ fn syntax_selectors() -> &'static SyntaxSelectors {
 
 #[cfg(test)]
 mod tests {
-    use super::MarkdownLayout;
+    use super::{LITERAL_CHECKPOINT_ROWS, MarkdownLayout, checkpoint_for_row};
     use crate::theme::{Theme, ThemeId, ThemeRole};
     use unicode_width::UnicodeWidthStr;
 
@@ -1263,6 +2138,24 @@ mod tests {
         assert!(rendered.contains("┌─ rust"), "{rendered:?}");
         assert!(rendered.contains("│ code"), "{rendered:?}");
         assert!(!rendered.contains("```"), "{rendered:?}");
+
+        let deeply_nested_open = "- a\n  - b\n    - ```rust\n      code";
+        let rendered = symbols(&MarkdownLayout::new(deeply_nested_open, 80)).join("\n");
+        assert!(
+            rendered.contains("    - ```rust\n      code"),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains("┌─ rust"), "{rendered:?}");
+
+        let continuation_open = "- a\n  - b\n    ```rust\n    code";
+        let rendered = symbols(&MarkdownLayout::new(continuation_open, 80)).join("\n");
+        assert!(rendered.contains("    ```rust\n    code"), "{rendered:?}");
+        assert!(!rendered.contains("┌─ rust"), "{rendered:?}");
+
+        let wrong_container_close = "- a\n  - b\n    ```rust\n    code\n```";
+        let rendered = symbols(&MarkdownLayout::new(wrong_container_close, 80)).join("\n");
+        assert!(rendered.contains("```rust"), "{rendered:?}");
+        assert!(!rendered.contains("┌─ rust"), "{rendered:?}");
     }
 
     #[test]
@@ -1485,6 +2378,22 @@ mod tests {
     }
 
     #[test]
+    fn large_foreground_projection_keeps_code_and_plain_underscore_content() {
+        let source = format!(
+            "{}\n`_λ[]_` and foo_bar another_value\n> ~~~rust\n> let value = 1;\n> ~~~\n- ```text\n- body\n- ```",
+            "x".repeat(5 * 1024)
+        );
+        let rendered = symbols(&MarkdownLayout::foreground(&source, 120)).join("\n");
+
+        assert!(rendered.contains("_λ[]_"), "{rendered:?}");
+        assert!(rendered.contains("foo_bar another_value"), "{rendered:?}");
+        assert!(rendered.contains("│ ┌─ rust"), "{rendered:?}");
+        assert!(rendered.contains("│ │ let value = 1;"), "{rendered:?}");
+        assert!(rendered.contains("• ┌─ text"), "{rendered:?}");
+        assert!(rendered.contains("  │ body"), "{rendered:?}");
+    }
+
+    #[test]
     fn narrow_prefixes_never_clip_a_wide_grapheme() {
         let rows = symbols(&MarkdownLayout::new("> 🦀", 3));
 
@@ -1504,6 +2413,60 @@ mod tests {
     #[test]
     fn one_cell_layouts_use_a_safe_placeholder_for_wide_graphemes() {
         assert_eq!(symbols(&MarkdownLayout::new("🦀", 1)), ["�"]);
+    }
+
+    #[test]
+    fn long_unicode_tail_rows_use_bounded_random_access_checkpoints() {
+        let layout = MarkdownLayout::literal(&"λ".repeat(200_000), 1);
+        let literal = layout.literal.as_ref().expect("compact literal projection");
+        let line = literal.lines.first().expect("one logical line");
+        assert!(line.checkpoints.len() > 700);
+
+        for _ in 0..4 {
+            for row in 199_980..200_000 {
+                assert_eq!(
+                    layout.line(row, &Theme::default()).unwrap().to_string(),
+                    "λ"
+                );
+                let checkpoint = checkpoint_for_row(line, row);
+                assert!(row.saturating_sub(checkpoint.row) < LITERAL_CHECKPOINT_ROWS);
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_anchor_crossing_semantic_and_literal_layouts_stays_on_a_character_boundary() {
+        let semantic = MarkdownLayout::new("**λambda** and content", 12);
+        let anchor = semantic.anchor_for_row(1);
+        let literal = MarkdownLayout::literal("λambda and content", 6);
+        let row = literal.row_for_anchor(&anchor);
+
+        assert!(row < literal.height());
+        assert!(
+            literal
+                .line(row, &Theme::default())
+                .is_some_and(|line| !line.to_string().is_empty())
+        );
+    }
+
+    #[test]
+    fn ascii_appended_to_a_unicode_line_extends_random_access_checkpoints() {
+        let mut layout = MarkdownLayout::literal("λ", 1);
+        layout.append_literal(&"x".repeat(200_000), 1);
+        let literal = layout.literal.as_ref().expect("compact literal projection");
+        let line = literal.lines.first().expect("one logical line");
+        assert!(line.checkpoints.len() > 700);
+
+        for _ in 0..4 {
+            for row in 199_981..200_001 {
+                assert_eq!(
+                    layout.line(row, &Theme::default()).unwrap().to_string(),
+                    "x"
+                );
+                let checkpoint = checkpoint_for_row(line, row);
+                assert!(row.saturating_sub(checkpoint.row) < LITERAL_CHECKPOINT_ROWS);
+            }
+        }
     }
 
     #[test]
