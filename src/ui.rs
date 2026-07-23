@@ -1,3 +1,4 @@
+mod markdown;
 pub mod transcript;
 
 pub use crate::app::PointerTarget as UiTarget;
@@ -34,6 +35,7 @@ pub struct ModelRegion {
 pub struct UiRegions {
     pub transcript: Option<Rect>,
     pub transcript_entries: Vec<transcript::EntryRegion>,
+    pub transcript_outputs: Vec<transcript::OutputRegion>,
     pub auth_providers: Vec<Rect>,
     pub suggestions: Vec<Rect>,
     pub message_copy: Option<Rect>,
@@ -43,6 +45,7 @@ pub struct UiRegions {
     pub model_refresh: Option<Rect>,
     pub context_usage: Option<Rect>,
     pub(crate) transcript_scroll_maximum: usize,
+    pub(crate) tool_output_scroll_metrics: Vec<crate::app::ToolOutputScrollMetrics>,
 }
 
 #[derive(Debug, Default)]
@@ -59,6 +62,10 @@ pub struct UiRenderer {
 impl UiRenderer {
     pub fn render(&self, frame: &mut Frame<'_>, app: &App, theme: &Theme) -> UiRegions {
         render_with_state(frame, app, theme, &self.state)
+    }
+
+    pub(crate) fn poll_background_layouts(&self, app: &App) -> bool {
+        self.state.transcript.drain_markdown_results_for(app)
     }
 }
 
@@ -121,6 +128,13 @@ impl UiRegions {
             .find(|(_, area)| area.contains(position))
         {
             Some(UiTarget::Theme(index))
+        } else if let Some(target) = self
+            .transcript_outputs
+            .iter()
+            .find(|region| region.area.contains(position))
+            .map(|region| UiTarget::TranscriptOutput(region.id))
+        {
+            Some(target)
         } else if let Some(target) = self
             .transcript_entries
             .iter()
@@ -830,7 +844,9 @@ fn render_chat(
     } else {
         let transcript = transcript::render(frame, rows[0], app, theme, &state.transcript);
         regions.transcript_entries = transcript.entries;
+        regions.transcript_outputs = transcript.outputs;
         regions.transcript_scroll_maximum = transcript.scroll_maximum;
+        regions.tool_output_scroll_metrics = transcript.output_scroll_metrics;
     }
     render_activity(frame, rows[1], app, theme);
     let composer_area = rows[2];
@@ -865,8 +881,8 @@ fn render_session_usage(
     }
 
     // Keep the count and percentage on the card in the same unit: both describe
-    // the latest request context. The cumulative session total can be much
-    // larger because providers report the repeated history on every call.
+    // the retained session context available to the next request. Cumulative
+    // provider usage is tracked separately because it repeats history.
     let context_tokens = app.session_usage.context_tokens();
     let context_percent = app
         .session_usage
@@ -1200,9 +1216,9 @@ mod tests {
     };
     use crate::{
         agent::AgentEvent,
-        app::{App, ModelsDialogPhase, PointerEvent, Screen},
+        app::{App, ModelsDialogPhase, PointerEvent, PointerTarget, Screen},
         llm::{ModelInfo, ProviderModels},
-        theme::{Theme, ThemeRole},
+        theme::{Theme, ThemeId, ThemeRole},
         transcript::{
             PatchArtifact, SearchResultsArtifact, TerminalArtifact, TextDetailArtifact,
             ToolArtifact,
@@ -1352,8 +1368,10 @@ mod tests {
                 input_tokens: 250,
                 output_tokens: 50,
                 total_tokens: 300,
+                reasoning_tokens: 0,
             },
         });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 1 });
 
         let (screen, _, regions, _) = render_to_string(&app, 100, 30);
 
@@ -1491,7 +1509,7 @@ mod tests {
             let _ = render(frame, &app, &theme);
         })
         .unwrap();
-        for label in ["queued…", "thinking", "tool", "Waiting"] {
+        for label in ["queued…", "thinking", "Read File", "Waiting"] {
             assert_eq!(style_at_text(&chat, label).fg, accent, "{label}");
         }
     }
@@ -1903,22 +1921,99 @@ mod tests {
     fn transcript_content_has_balanced_horizontal_padding() {
         let mut app = App::new();
         app.screen = Screen::Chat;
-        app.transcript.submit(1, "x".repeat(54), Vec::new());
+        app.transcript.submit(1, "x".repeat(56), Vec::new());
         let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
+        let mut regions = None;
         terminal
             .draw(|frame| {
-                let _ = render(frame, &app, &Theme::default());
+                regions = Some(render(frame, &app, &Theme::default()));
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
+        let theme = Theme::default();
+        let message = regions
+            .expect("render regions")
+            .transcript_entries
+            .into_iter()
+            .next()
+            .expect("user message region")
+            .area;
 
-        assert_eq!(buffer.cell(Position::new(1, 1)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell(Position::new(2, 1)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell(Position::new(3, 1)).unwrap().symbol(), "┌");
-        assert_eq!(buffer.cell(Position::new(56, 2)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell(Position::new(57, 2)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell(Position::new(58, 2)).unwrap().symbol(), " ");
+        assert_eq!(message.x, 1);
+        assert_eq!(
+            buffer
+                .cell(Position::new(message.x.saturating_sub(1), message.y))
+                .unwrap()
+                .style()
+                .bg,
+            theme.style(ThemeRole::Surface).bg
+        );
+        assert_eq!(
+            buffer
+                .cell(Position::new(message.x, message.y))
+                .unwrap()
+                .style()
+                .bg,
+            theme.transcript_surface().bg
+        );
+        assert_eq!(
+            buffer
+                .cell(Position::new(
+                    message.x.saturating_add(message.width.saturating_sub(1)),
+                    message.y,
+                ))
+                .unwrap()
+                .style()
+                .bg,
+            theme.transcript_surface().bg
+        );
+        assert_eq!(
+            buffer
+                .cell(Position::new(
+                    message.x.saturating_add(message.width),
+                    message.y,
+                ))
+                .unwrap()
+                .style()
+                .bg,
+            theme.style(ThemeRole::Surface).bg
+        );
+        let body_y = message.y.saturating_add(1);
+        assert_eq!(
+            buffer
+                .cell(Position::new(message.x, body_y))
+                .unwrap()
+                .symbol(),
+            " "
+        );
+        assert_eq!(
+            buffer
+                .cell(Position::new(message.x.saturating_add(1), body_y))
+                .unwrap()
+                .symbol(),
+            "x"
+        );
+        assert_eq!(
+            buffer
+                .cell(Position::new(
+                    message.x.saturating_add(message.width.saturating_sub(2)),
+                    body_y,
+                ))
+                .unwrap()
+                .symbol(),
+            "x"
+        );
+        assert_eq!(
+            buffer
+                .cell(Position::new(
+                    message.x.saturating_add(message.width.saturating_sub(1)),
+                    body_y,
+                ))
+                .unwrap()
+                .symbol(),
+            " "
+        );
     }
 
     #[test]
@@ -2215,54 +2310,59 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_is_a_clickable_collapsed_transcript_block() {
-        let mut app = App::new();
-        app.screen = Screen::Chat;
-        app.transcript.submit(1, "hello".into(), Vec::new());
-        app.handle_agent_event(AgentEvent::Started { request_id: 1 });
-        app.handle_agent_event(AgentEvent::ReasoningDelta {
-            request_id: 1,
-            summary: "Checking the request.".into(),
-        });
+    fn reasoning_activity_stays_hidden_across_terminal_states_and_late_events() {
+        let assert_hidden = |app: &App, reasoning_id| {
+            let (screen, _, regions, _) = render_to_string(app, 100, 30);
+            assert!(!screen.contains("thinking ·"));
+            assert!(!screen.contains("click to expand"));
+            assert!(!screen.contains("Summary hidden"));
+            assert!(!screen.contains("Checking the request."));
+            assert!(!screen.contains("Late reasoning must stay hidden."));
+            assert!(
+                regions
+                    .transcript_entries
+                    .iter()
+                    .all(|region| region.id != reasoning_id)
+            );
+        };
+        let terminal_events = [
+            AgentEvent::Completed { request_id: 1 },
+            AgentEvent::Interrupted { request_id: 1 },
+            AgentEvent::Failed {
+                request_id: 1,
+                message: "provider failed".into(),
+            },
+        ];
 
-        let (screen, _, regions, _) = render_to_string(&app, 100, 30);
+        for terminal_event in terminal_events {
+            let mut app = App::new();
+            app.screen = Screen::Chat;
+            app.transcript.submit(1, "hello".into(), Vec::new());
+            app.handle_agent_event(AgentEvent::Started { request_id: 1 });
+            app.handle_agent_event(AgentEvent::ReasoningDelta {
+                request_id: 1,
+                summary: "Checking the request.".into(),
+            });
+            let reasoning_id = app
+                .transcript
+                .entries()
+                .iter()
+                .find(|entry| matches!(entry.kind, crate::transcript::EntryKind::Reasoning(_)))
+                .unwrap()
+                .id;
 
-        assert!(screen.contains("thinking"));
-        assert!(!screen.contains("Checking the request."));
-        assert!(screen.contains("Waiting"));
-        let reasoning_id = app
-            .transcript
-            .entries()
-            .iter()
-            .find(|entry| matches!(entry.kind, crate::transcript::EntryKind::Reasoning(_)))
-            .unwrap()
-            .id;
-        let thinking = regions
-            .transcript_entries
-            .iter()
-            .find(|region| region.id == reasoning_id)
-            .copied()
-            .unwrap();
-        assert_eq!(
-            regions.target_at(thinking.area.x, thinking.area.y),
-            Some(UiTarget::TranscriptEntry(thinking.id))
-        );
-
-        app.activate_transcript_entry(thinking.id);
-        let (expanded, _, _, _) = render_to_string(&app, 100, 30);
-        assert!(expanded.contains("Checking the request."));
-
-        app.handle_agent_event(AgentEvent::TextDelta {
-            request_id: 1,
-            text: "reply".into(),
-        });
-        let (streaming, _, regions, _) = render_to_string(&app, 100, 30);
-        assert!(streaming.contains("thinking"));
-        assert!(!regions.transcript_entries.is_empty());
+            assert_hidden(&app, reasoning_id);
+            app.handle_agent_event(terminal_event);
+            app.handle_agent_event(AgentEvent::ReasoningDelta {
+                request_id: 1,
+                summary: "Late reasoning must stay hidden.".into(),
+            });
+            assert_hidden(&app, reasoning_id);
+        }
     }
 
     #[test]
-    fn completed_reasoning_without_a_summary_does_not_keep_working() {
+    fn reasoning_without_a_summary_stays_hidden_after_completion() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.transcript.submit(1, "hello".into(), Vec::new());
@@ -2277,14 +2377,19 @@ mod tests {
             .id;
         app.activate_transcript_entry(reasoning_id);
 
-        let (screen, _, _, _) = render_to_string(&app, 100, 30);
+        let (screen, _, regions, _) = render_to_string(&app, 100, 30);
 
-        assert!(screen.contains("No reasoning summary was provided"));
-        assert!(!screen.contains("Working"));
+        assert!(!screen.contains("No reasoning summary was provided"));
+        assert!(
+            regions
+                .transcript_entries
+                .iter()
+                .all(|region| region.id != reasoning_id)
+        );
     }
 
     #[test]
-    fn tools_are_persistent_clickable_transcript_blocks() {
+    fn read_tools_are_persistent_non_clickable_summary_records() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.transcript.submit(3, "inspect".into(), Vec::new());
@@ -2297,18 +2402,15 @@ mod tests {
             artifacts: Vec::new(),
         });
 
-        let (collapsed, _, regions, _) = render_to_string(&app, 100, 30);
-        assert!(collapsed.contains("tool"));
-        assert!(collapsed.contains("read_file"));
-        let tools = *regions.transcript_entries.last().unwrap();
-        assert_eq!(
-            regions.target_at(tools.area.x, tools.area.y),
-            Some(UiTarget::TranscriptEntry(tools.id))
+        let (screen, _, regions, _) = render_to_string(&app, 100, 30);
+        assert!(screen.contains("Read File: src/main.rs"));
+        let read_id = app.transcript.entries()[2].id;
+        assert!(
+            regions
+                .transcript_entries
+                .iter()
+                .all(|region| region.id != read_id)
         );
-
-        app.activate_transcript_entry(tools.id);
-        let (expanded, _, _, _) = render_to_string(&app, 100, 30);
-        assert!(expanded.contains("Reading src/main.rs"));
     }
 
     #[test]
@@ -2329,6 +2431,14 @@ mod tests {
                 exit_code: None,
             })],
         });
+
+        let (empty, _, empty_regions, _) = render_to_string(&app, 100, 30);
+        assert!(empty.contains("$ cargo test"));
+        assert!(
+            empty_regions.transcript_outputs.is_empty(),
+            "an empty command should not reserve a blank output viewport"
+        );
+
         app.handle_agent_event(AgentEvent::ToolOutputDelta {
             request_id: 3,
             call_id: 8,
@@ -2358,6 +2468,137 @@ mod tests {
         assert!(screen.contains("$ cargo test"));
         assert!(screen.contains("test result: ok"));
         assert!(screen.contains("exit 0"));
+    }
+
+    #[test]
+    fn shaded_tool_cards_are_separated_from_messages_and_each_other() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(3, "run both".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 3 });
+        for (call_id, command, output) in [(8, "first", "one"), (9, "second", "two")] {
+            let artifact = || {
+                vec![ToolArtifact::Terminal(TerminalArtifact {
+                    description: format!("Run {command}"),
+                    command: command.into(),
+                    output: output.into(),
+                    exit_code: Some(0),
+                })]
+            };
+            app.handle_agent_event(AgentEvent::ToolStarted {
+                request_id: 3,
+                call_id,
+                name: "terminal".into(),
+                summary: format!("Running {command}"),
+                artifacts: artifact(),
+            });
+            app.handle_agent_event(AgentEvent::ToolFinished {
+                request_id: 3,
+                call_id,
+                summary: Some("Exited with 0".into()),
+                artifacts: artifact(),
+            });
+        }
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 3,
+            text: "Done.".into(),
+        });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 3 });
+
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut regions = None;
+        terminal
+            .draw(|frame| {
+                regions = Some(render(frame, &app, &Theme::default()));
+            })
+            .unwrap();
+        let regions = regions.expect("render regions");
+        let x = regions
+            .transcript_outputs
+            .first()
+            .expect("tool output region")
+            .area
+            .x;
+        let shaded = Theme::default().transcript_surface().bg;
+        let mut shaded_runs = 0;
+        let mut was_shaded = false;
+        for y in 0..terminal.backend().buffer().area.height {
+            let is_shaded = terminal
+                .backend()
+                .buffer()
+                .cell(Position::new(x, y))
+                .is_some_and(|cell| cell.style().bg == shaded);
+            if is_shaded && !was_shaded {
+                shaded_runs += 1;
+            }
+            was_shaded = is_shaded;
+        }
+
+        assert_eq!(shaded_runs, 3, "user message and both tools need gaps");
+        let second_output = position_of(&terminal, "two").y;
+        let response = position_of(&terminal, "Done.").y;
+        assert!(
+            response >= second_output.saturating_add(3),
+            "normal response text needs a blank row after the tool card"
+        );
+    }
+
+    #[test]
+    fn ordinary_message_and_response_use_distinct_theme_backgrounds_and_response_padding() {
+        let mut app = App::new();
+        app.screen = Screen::Chat;
+        app.transcript.submit(4, "hello".into(), Vec::new());
+        app.handle_agent_event(AgentEvent::Started { request_id: 4 });
+        app.handle_agent_event(AgentEvent::TextDelta {
+            request_id: 4,
+            text: "Plain response.".into(),
+        });
+        app.handle_agent_event(AgentEvent::Completed { request_id: 4 });
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut regions = None;
+        let theme = Theme::resolve(ThemeId::FunDark);
+        terminal
+            .draw(|frame| {
+                regions = Some(render(frame, &app, &theme));
+            })
+            .unwrap();
+        let user = regions
+            .expect("render regions")
+            .transcript_entries
+            .into_iter()
+            .next()
+            .expect("user region")
+            .area;
+        let response = position_of(&terminal, "Plain response.");
+        let user_text = position_of(&terminal, "hello");
+
+        assert_eq!(
+            response.y,
+            user.y.saturating_add(user.height).saturating_add(1)
+        );
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell(response)
+                .expect("response cell")
+                .style()
+                .bg,
+            theme.style(ThemeRole::Surface).bg
+        );
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell(user_text)
+                .expect("user message cell")
+                .style()
+                .bg,
+            theme.transcript_surface().bg
+        );
     }
 
     #[test]
@@ -2417,8 +2658,6 @@ mod tests {
                 matches: "src/main.rs:1:marker".into(),
             })],
         });
-        let search_id = app.transcript.entries()[3].id;
-        app.activate_transcript_entry(search_id);
         let (screen, _, _, _) = render_to_string(&app, 100, 30);
         assert!(screen.contains("Search /marker/"));
         assert!(screen.contains("src/main.rs:1:marker"));
@@ -2433,8 +2672,8 @@ mod tests {
         app.handle_agent_event(AgentEvent::ToolStarted {
             request_id: 3,
             call_id: 3,
-            name: "read_file".into(),
-            summary: "Reading src/main.rs".into(),
+            name: "inspect".into(),
+            summary: "Inspecting output".into(),
             artifacts: Vec::new(),
         });
         app.handle_agent_event(AgentEvent::ToolFinished {
@@ -2449,18 +2688,32 @@ mod tests {
             })],
         });
         let tool_id = app.transcript.entries()[2].id;
+        let (_bottom, _, regions, _) = render_to_string(&app, 60, 20);
+        app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+        app.update_tool_output_scroll_metrics(&regions.tool_output_scroll_metrics);
         app.activate_transcript_entry(tool_id);
         let (bottom, _, regions, _) = render_to_string(&app, 60, 20);
-        app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+        app.update_tool_output_scroll_metrics(&regions.tool_output_scroll_metrics);
+        let output = regions
+            .transcript_outputs
+            .iter()
+            .find(|region| region.id == tool_id)
+            .expect("visible tool output");
+        assert_eq!(
+            regions.target_at(output.area.x, output.area.y),
+            Some(UiTarget::TranscriptOutput(tool_id))
+        );
 
-        for _ in 0..5 {
-            app.scroll_transcript_up();
-        }
+        let outcome = app.handle_pointer(PointerEvent::Scroll {
+            delta: 5,
+            target: Some(PointerTarget::TranscriptOutput(tool_id)),
+        });
         let (scrolled, _, _, _) = render_to_string(&app, 60, 20);
 
+        assert!(outcome.changed);
         assert!(bottom.contains("tool-line-39"));
         assert_ne!(bottom, scrolled);
-        assert!(scrolled.contains("↑ End to follow"));
+        assert!(scrolled.contains("paused · End to follow"));
     }
 
     #[test]
@@ -2496,7 +2749,8 @@ mod tests {
 
         let (screen, _, regions, _) = render_to_string(&app, 100, 30);
 
-        assert!(screen.contains("┌─ you"));
+        assert!(screen.contains("Please inspect this"));
+        assert!(!screen.contains("┌─ you"));
         assert!(screen.contains("@src/app.rs"));
         assert_eq!(
             regions.target_at(

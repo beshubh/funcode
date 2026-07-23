@@ -426,6 +426,9 @@ fn run_event_loop(terminal: &mut AppTerminal, launch_mode: LaunchMode) -> Result
     let mut preflight_scheduler = PreflightScheduler::default();
 
     while !should_quit {
+        if ui_renderer.poll_background_layouts(&app) {
+            redraw.mark_dirty();
+        }
         if let Some(workspace_runner) = workspace_runner.as_ref() {
             while let Some(event) = workspace_runner.try_event() {
                 let urgent = matches!(
@@ -741,6 +744,7 @@ fn render_frame(
         app.set_composer_width(area.width);
     }
     app.update_transcript_scroll_maximum(regions.transcript_scroll_maximum);
+    app.update_tool_output_scroll_metrics(&regions.tool_output_scroll_metrics);
     let wants_pointer_motion = regions.wants_pointer_motion();
     if wants_pointer_motion != *any_mouse_motion {
         execute!(stdout(), SetAnyMouseMotion(wants_pointer_motion))

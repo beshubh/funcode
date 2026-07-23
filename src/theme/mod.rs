@@ -63,13 +63,37 @@ pub enum ThemeRole {
     BuildMode,
     DiffAdded,
     DiffRemoved,
+    MarkdownHeading1,
+    MarkdownHeading2,
+    MarkdownHeading3,
+    MarkdownHeading4,
+    MarkdownHeading5,
+    MarkdownHeading6,
+    MarkdownStrong,
+    MarkdownEmphasis,
+    MarkdownStrikethrough,
+    MarkdownInlineCode,
+    MarkdownLink,
+    MarkdownQuote,
+    MarkdownRule,
+    CodeText,
+    CodeKeyword,
+    CodeString,
+    CodeComment,
+    CodeConstant,
+    CodeType,
+    CodeFunction,
+    CodeOperator,
 }
+
+const THEME_ROLE_COUNT: usize = ThemeRole::CodeOperator as usize + 1;
 
 #[derive(Debug, Clone, Copy)]
 struct ThemeDefinition {
     id: ThemeId,
     appearance: ThemeAppearance,
     background: Color,
+    transcript_surface: Color,
     foreground: Color,
     muted: Color,
     border: Color,
@@ -81,12 +105,14 @@ struct ThemeDefinition {
     build: Color,
     diff_added: Color,
     diff_removed: Color,
+    markdown_accents: [Color; 6],
 }
 
 const TERMINAL: ThemeDefinition = ThemeDefinition {
     id: ThemeId::Terminal,
     appearance: ThemeAppearance::Terminal,
     background: Color::Reset,
+    transcript_surface: Color::DarkGray,
     foreground: Color::Reset,
     muted: Color::DarkGray,
     border: Color::DarkGray,
@@ -98,12 +124,21 @@ const TERMINAL: ThemeDefinition = ThemeDefinition {
     build: Color::Rgb(63, 185, 80),
     diff_added: Color::Green,
     diff_removed: Color::Red,
+    markdown_accents: [
+        Color::Cyan,
+        Color::Blue,
+        Color::Magenta,
+        Color::Yellow,
+        Color::Green,
+        Color::DarkGray,
+    ],
 };
 
 const FUN_DARK: ThemeDefinition = ThemeDefinition {
     id: ThemeId::FunDark,
     appearance: ThemeAppearance::Dark,
     background: Color::Rgb(13, 17, 23),
+    transcript_surface: Color::Rgb(40, 43, 50),
     foreground: Color::Rgb(230, 237, 243),
     muted: Color::Rgb(139, 148, 158),
     border: Color::Rgb(48, 54, 61),
@@ -115,12 +150,21 @@ const FUN_DARK: ThemeDefinition = ThemeDefinition {
     build: Color::Rgb(63, 185, 80),
     diff_added: Color::Rgb(63, 185, 80),
     diff_removed: Color::Rgb(248, 81, 73),
+    markdown_accents: [
+        Color::Rgb(181, 255, 0),
+        Color::Rgb(88, 166, 255),
+        Color::Rgb(210, 168, 255),
+        Color::Rgb(255, 166, 87),
+        Color::Rgb(126, 231, 135),
+        Color::Rgb(255, 122, 178),
+    ],
 };
 
 const MIDNIGHT: ThemeDefinition = ThemeDefinition {
     id: ThemeId::Midnight,
     appearance: ThemeAppearance::Dark,
     background: Color::Rgb(11, 16, 32),
+    transcript_surface: Color::Rgb(30, 41, 59),
     foreground: Color::Rgb(229, 231, 235),
     muted: Color::Rgb(148, 163, 184),
     border: Color::Rgb(51, 65, 85),
@@ -132,12 +176,21 @@ const MIDNIGHT: ThemeDefinition = ThemeDefinition {
     build: Color::Rgb(63, 185, 80),
     diff_added: Color::Rgb(74, 222, 128),
     diff_removed: Color::Rgb(248, 113, 113),
+    markdown_accents: [
+        Color::Rgb(96, 165, 250),
+        Color::Rgb(167, 139, 250),
+        Color::Rgb(244, 114, 182),
+        Color::Rgb(251, 191, 36),
+        Color::Rgb(45, 212, 191),
+        Color::Rgb(148, 163, 184),
+    ],
 };
 
 const PAPER: ThemeDefinition = ThemeDefinition {
     id: ThemeId::Paper,
     appearance: ThemeAppearance::Light,
     background: Color::Rgb(250, 250, 249),
+    transcript_surface: Color::Rgb(231, 229, 228),
     foreground: Color::Rgb(28, 25, 23),
     muted: Color::Rgb(120, 113, 108),
     border: Color::Rgb(214, 211, 209),
@@ -149,13 +202,22 @@ const PAPER: ThemeDefinition = ThemeDefinition {
     build: Color::Rgb(26, 127, 55),
     diff_added: Color::Rgb(26, 127, 55),
     diff_removed: Color::Rgb(185, 28, 28),
+    markdown_accents: [
+        Color::Rgb(109, 40, 217),
+        Color::Rgb(29, 78, 216),
+        Color::Rgb(190, 24, 93),
+        Color::Rgb(180, 83, 9),
+        Color::Rgb(4, 120, 87),
+        Color::Rgb(87, 83, 78),
+    ],
 };
 
 #[derive(Debug, Clone)]
 pub struct Theme {
     id: ThemeId,
     appearance: ThemeAppearance,
-    styles: [Style; 12],
+    styles: [Style; THEME_ROLE_COUNT],
+    transcript_surface: Style,
     border_set: border::Set<'static>,
 }
 
@@ -169,6 +231,7 @@ impl Theme {
         };
         debug_assert_eq!(definition.id, id);
         let foreground = |color| Style::default().fg(color);
+        let [a1, a2, a3, a4, a5, a6] = definition.markdown_accents;
         let styles = [
             Style::default()
                 .fg(definition.foreground)
@@ -184,11 +247,33 @@ impl Theme {
             foreground(definition.build),
             foreground(definition.diff_added),
             foreground(definition.diff_removed),
+            foreground(a1).add_modifier(Modifier::BOLD),
+            foreground(a2).add_modifier(Modifier::BOLD),
+            foreground(a3),
+            foreground(a4),
+            foreground(a5),
+            foreground(a6),
+            foreground(a4).add_modifier(Modifier::BOLD),
+            foreground(a6).add_modifier(Modifier::ITALIC),
+            foreground(definition.muted).add_modifier(Modifier::CROSSED_OUT),
+            foreground(a2),
+            foreground(a2).add_modifier(Modifier::UNDERLINED),
+            foreground(a3),
+            foreground(definition.muted),
+            foreground(definition.foreground),
+            foreground(a6).add_modifier(Modifier::BOLD),
+            foreground(a5),
+            foreground(definition.muted).add_modifier(Modifier::ITALIC),
+            foreground(a4),
+            foreground(a1),
+            foreground(a2),
+            foreground(a3),
         ];
         Self {
             id,
             appearance: definition.appearance,
             styles,
+            transcript_surface: Style::default().bg(definition.transcript_surface),
             border_set: border::ROUNDED,
         }
     }
@@ -203,6 +288,10 @@ impl Theme {
 
     pub fn style(&self, role: ThemeRole) -> Style {
         self.styles[role as usize]
+    }
+
+    pub(crate) fn transcript_surface(&self) -> Style {
+        self.transcript_surface
     }
 
     pub const fn border_set(&self) -> border::Set<'static> {
@@ -279,6 +368,100 @@ mod tests {
             assert_eq!(theme.style(ThemeRole::Accent).fg, Some(accent));
             assert_eq!(theme.style(ThemeRole::PlanMode).fg, Some(plan));
             assert_eq!(theme.style(ThemeRole::BuildMode).fg, Some(build));
+        }
+    }
+
+    #[test]
+    fn bundled_markdown_roles_follow_the_exact_six_accent_palettes() {
+        let cases = [
+            (
+                ThemeId::Terminal,
+                [
+                    Color::Cyan,
+                    Color::Blue,
+                    Color::Magenta,
+                    Color::Yellow,
+                    Color::Green,
+                    Color::DarkGray,
+                ],
+            ),
+            (
+                ThemeId::FunDark,
+                [
+                    Color::Rgb(181, 255, 0),
+                    Color::Rgb(88, 166, 255),
+                    Color::Rgb(210, 168, 255),
+                    Color::Rgb(255, 166, 87),
+                    Color::Rgb(126, 231, 135),
+                    Color::Rgb(255, 122, 178),
+                ],
+            ),
+            (
+                ThemeId::Midnight,
+                [
+                    Color::Rgb(96, 165, 250),
+                    Color::Rgb(167, 139, 250),
+                    Color::Rgb(244, 114, 182),
+                    Color::Rgb(251, 191, 36),
+                    Color::Rgb(45, 212, 191),
+                    Color::Rgb(148, 163, 184),
+                ],
+            ),
+            (
+                ThemeId::Paper,
+                [
+                    Color::Rgb(109, 40, 217),
+                    Color::Rgb(29, 78, 216),
+                    Color::Rgb(190, 24, 93),
+                    Color::Rgb(180, 83, 9),
+                    Color::Rgb(4, 120, 87),
+                    Color::Rgb(87, 83, 78),
+                ],
+            ),
+        ];
+        let heading_roles = [
+            ThemeRole::MarkdownHeading1,
+            ThemeRole::MarkdownHeading2,
+            ThemeRole::MarkdownHeading3,
+            ThemeRole::MarkdownHeading4,
+            ThemeRole::MarkdownHeading5,
+            ThemeRole::MarkdownHeading6,
+        ];
+
+        for (id, accents) in cases {
+            let theme = Theme::resolve(id);
+            for (role, accent) in heading_roles.into_iter().zip(accents) {
+                assert_eq!(theme.style(role).fg, Some(accent), "{id:?} {role:?}");
+            }
+            assert_eq!(theme.style(ThemeRole::MarkdownStrong).fg, Some(accents[3]));
+            assert_eq!(
+                theme.style(ThemeRole::MarkdownEmphasis).fg,
+                Some(accents[5])
+            );
+            assert_eq!(theme.style(ThemeRole::MarkdownLink).fg, Some(accents[1]));
+            assert_eq!(
+                theme.style(ThemeRole::MarkdownInlineCode).fg,
+                Some(accents[1])
+            );
+            assert_eq!(theme.style(ThemeRole::MarkdownQuote).fg, Some(accents[2]));
+            assert_eq!(theme.style(ThemeRole::CodeString).fg, Some(accents[4]));
+            assert_eq!(theme.style(ThemeRole::CodeType).fg, Some(accents[0]));
+            assert_eq!(theme.style(ThemeRole::CodeKeyword).fg, Some(accents[5]));
+            assert_eq!(theme.style(ThemeRole::CodeConstant).fg, Some(accents[3]));
+            assert_eq!(theme.style(ThemeRole::CodeFunction).fg, Some(accents[1]));
+            assert_eq!(theme.style(ThemeRole::CodeOperator).fg, Some(accents[2]));
+            assert_eq!(
+                theme.style(ThemeRole::CodeComment).fg,
+                theme.style(ThemeRole::MutedText).fg
+            );
+            assert_eq!(
+                theme.style(ThemeRole::MarkdownRule).fg,
+                theme.style(ThemeRole::MutedText).fg
+            );
+            assert_eq!(
+                theme.style(ThemeRole::CodeText).fg,
+                theme.style(ThemeRole::Text).fg
+            );
         }
     }
 }

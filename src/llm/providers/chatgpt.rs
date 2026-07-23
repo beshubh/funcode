@@ -36,6 +36,7 @@ const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 // The backend uses this as a model-catalog schema capability version. Funcode's package is still
 // 0.x, which the backend treats as predating picker-visible catalog entries.
 const MODEL_CATALOG_CLIENT_VERSION: &str = "1.0.0";
+const MAX_MULTI_TURN_LIMIT: usize = 1000;
 
 pub(in crate::llm) fn serialized_request_bytes(
     model: &str,
@@ -201,7 +202,7 @@ impl Provider for ChatGptProvider {
                     .build()
                     .stream_prompt(prompt.clone())
                     .with_history(&rig_history)
-                    .multi_turn(16)
+                    .multi_turn(MAX_MULTI_TURN_LIMIT)
                     .await
             } else {
                 client
@@ -223,6 +224,7 @@ impl Provider for ChatGptProvider {
                         input_tokens: call.usage.input_tokens,
                         output_tokens: call.usage.output_tokens,
                         total_tokens: call.usage.total_tokens,
+                        reasoning_tokens: call.usage.reasoning_tokens,
                     })
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(_)) => ChatGptStreamEvent::Finished,
@@ -585,6 +587,7 @@ mod tests {
             input_tokens: 120,
             output_tokens: 30,
             total_tokens: 150,
+            reasoning_tokens: 0,
         };
         let events = stream_events(
             stream::iter([
