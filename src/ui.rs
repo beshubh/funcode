@@ -1218,7 +1218,7 @@ mod tests {
         agent::AgentEvent,
         app::{App, ModelsDialogPhase, PointerEvent, PointerTarget, Screen},
         llm::{ModelInfo, ProviderModels},
-        theme::{Theme, ThemeRole},
+        theme::{Theme, ThemeId, ThemeRole},
         transcript::{
             PatchArtifact, SearchResultsArtifact, TerminalArtifact, TextDetailArtifact,
             ToolArtifact,
@@ -2545,7 +2545,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_message_and_response_do_not_get_tool_spacing() {
+    fn ordinary_message_and_response_use_distinct_theme_backgrounds_and_response_padding() {
         let mut app = App::new();
         app.screen = Screen::Chat;
         app.transcript.submit(4, "hello".into(), Vec::new());
@@ -2559,9 +2559,10 @@ mod tests {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut regions = None;
+        let theme = Theme::resolve(ThemeId::FunDark);
         terminal
             .draw(|frame| {
-                regions = Some(render(frame, &app, &Theme::default()));
+                regions = Some(render(frame, &app, &theme));
             })
             .unwrap();
         let user = regions
@@ -2572,8 +2573,32 @@ mod tests {
             .expect("user region")
             .area;
         let response = position_of(&terminal, "Plain response.");
+        let user_text = position_of(&terminal, "hello");
 
-        assert_eq!(response.y, user.y.saturating_add(user.height));
+        assert_eq!(
+            response.y,
+            user.y.saturating_add(user.height).saturating_add(1)
+        );
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell(response)
+                .expect("response cell")
+                .style()
+                .bg,
+            theme.style(ThemeRole::Surface).bg
+        );
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell(user_text)
+                .expect("user message cell")
+                .style()
+                .bg,
+            theme.transcript_surface().bg
+        );
     }
 
     #[test]

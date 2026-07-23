@@ -62,6 +62,29 @@ const TOOL_OUTPUT_SPARSE_SOURCE_BYTES: usize = 512 * 1024;
 // those allocations approach the shared cache budget.
 const TOOL_OUTPUT_DENSE_ROW_ESTIMATED_BYTES: usize = 512;
 const TOOL_ADJACENT_GAP_ROWS: usize = 1;
+const TOOL_OUTPUT_VERTICAL_PADDING_ROWS: usize = 1;
+const TOOL_OUTPUT_HORIZONTAL_PADDING_COLUMNS: usize = 1;
+const ASSISTANT_MESSAGE_VERTICAL_PADDING_ROWS: usize = 1;
+const ASSISTANT_MESSAGE_HORIZONTAL_PADDING_COLUMNS: usize = 1;
+
+fn horizontally_padded_content_width(width: usize, padding: usize) -> usize {
+    let padding = padding.min(width.saturating_sub(1) / 2);
+    width.saturating_sub(padding.saturating_mul(2)).max(1)
+}
+
+fn horizontal_padding_for_width(width: u16, padding: usize) -> u16 {
+    (padding.min(width.saturating_sub(1) as usize / 2)) as u16
+}
+
+fn horizontally_inset_area(area: Rect, padding: usize) -> Rect {
+    let padding = horizontal_padding_for_width(area.width, padding);
+    Rect::new(
+        area.x.saturating_add(padding),
+        area.y,
+        area.width.saturating_sub(padding.saturating_mul(2)),
+        area.height,
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeightKey {
@@ -1275,9 +1298,11 @@ impl TranscriptRenderCache {
         }
         drop(inner);
 
+        let content_width =
+            horizontally_padded_content_width(width, TOOL_OUTPUT_HORIZONTAL_PADDING_COLUMNS);
         if let Some(cached) = incremental
             && let Ok(mut layout) = Arc::try_unwrap(cached.layout)
-            && let Some(indexed_rows) = layout.append_terminal_output(tool, width)
+            && let Some(indexed_rows) = layout.append_terminal_output(tool, content_width)
         {
             let bytes = layout.bytes();
             let layout = Arc::new(layout);
@@ -1296,7 +1321,7 @@ impl TranscriptRenderCache {
             return Some(layout);
         }
 
-        let layout = Arc::new(build_tool_output_layout(tool, width));
+        let layout = Arc::new(build_tool_output_layout(tool, content_width));
         let bytes = layout.bytes();
         let mut inner = self.inner.borrow_mut();
         let mut retained = VecDeque::with_capacity(inner.tool_output_layouts.len());
@@ -1439,7 +1464,8 @@ impl TranscriptRenderCache {
             }
         }
 
-        let content_width = width.max(1);
+        let content_width =
+            horizontally_padded_content_width(width, ASSISTANT_MESSAGE_HORIZONTAL_PADDING_COLUMNS);
         self.prune_markdown_pending();
         let (fallback_layout, source_update) = {
             let mut inner = self.inner.borrow_mut();
@@ -2521,6 +2547,9 @@ impl Render for AssistantRenderer<'_> {
     }
 
     fn render(&self, mut context: RenderContext<'_>) {
+        context
+            .buffer
+            .set_style(context.area, context.theme.style(ThemeRole::Surface));
         match &self.message.status {
             AssistantStatus::Queued => render_child(
                 &LinesRenderer::new(vec![Line::styled(
@@ -2540,12 +2569,26 @@ impl Render for AssistantRenderer<'_> {
             ),
             AssistantStatus::Streaming | AssistantStatus::Completed => {
                 self.layout.map_or(0, |layout| {
-                    render_child(&MarkdownMessageRenderer { layout }, 0, &mut context)
+                    render_child(
+                        &MarkdownMessageRenderer {
+                            layout,
+                            padded: true,
+                        },
+                        0,
+                        &mut context,
+                    )
                 })
             }
             AssistantStatus::Interrupted => {
                 let cursor = self.layout.map_or(0, |layout| {
-                    render_child(&MarkdownMessageRenderer { layout }, 0, &mut context)
+                    render_child(
+                        &MarkdownMessageRenderer {
+                            layout,
+                            padded: true,
+                        },
+                        0,
+                        &mut context,
+                    )
                 });
                 render_child(
                     &LinesRenderer::new(vec![Line::styled(
@@ -2570,31 +2613,51 @@ impl Render for AssistantRenderer<'_> {
 
 struct MarkdownMessageRenderer<'a> {
     layout: &'a MarkdownLayout,
+    padded: bool,
 }
 
 impl MarkdownMessageRenderer<'_> {
     fn height(layout: &MarkdownLayout) -> usize {
-        layout.height()
+        layout
+            .height()
+            .saturating_add(ASSISTANT_MESSAGE_VERTICAL_PADDING_ROWS.saturating_mul(2))
     }
 }
 
 impl Render for MarkdownMessageRenderer<'_> {
     fn height(&self, _width: usize) -> usize {
-        self.layout.height()
+        if self.padded {
+            Self::height(self.layout)
+        } else {
+            self.layout.height()
+        }
     }
 
     fn render(&self, context: RenderContext<'_>) {
-        let start = context.visible_rows.start.min(self.layout.height());
-        let end = context.visible_rows.end.min(self.layout.height());
-        for (destination_row, source_row) in (start..end).enumerate() {
-            let Some(line) = self.layout.line(source_row, context.theme) else {
+        let padding = usize::from(self.padded) * ASSISTANT_MESSAGE_VERTICAL_PADDING_ROWS;
+        let content_start = padding;
+        let content_end = content_start.saturating_add(self.layout.height());
+        let visible_start = context.visible_rows.start.max(content_start);
+        let visible_end = context.visible_rows.end.min(content_end);
+
+        let content_area = if self.padded {
+            horizontally_inset_area(context.area, ASSISTANT_MESSAGE_HORIZONTAL_PADDING_COLUMNS)
+        } else {
+            context.area
+        };
+        for source_row in visible_start..visible_end {
+            let Some(line) = self
+                .layout
+                .line(source_row.saturating_sub(content_start), context.theme)
+            else {
                 continue;
             };
+            let destination_row = source_row.saturating_sub(context.visible_rows.start);
             context.buffer.set_line(
-                context.area.x,
-                context.area.y.saturating_add(destination_row as u16),
+                content_area.x,
+                content_area.y.saturating_add(destination_row as u16),
                 &line,
-                context.area.width,
+                content_area.width,
             );
         }
     }
@@ -2712,10 +2775,17 @@ impl ToolRenderer<'_> {
             return None;
         }
         output_artifacts(self.tool).next()?;
-        let body_height = self.body_layout.map_or_else(
-            || ToolOutputBodyRenderer { tool: self.tool }.height(width),
+        let content_width =
+            horizontally_padded_content_width(width, TOOL_OUTPUT_HORIZONTAL_PADDING_COLUMNS);
+        let raw_body_height = self.body_layout.map_or_else(
+            || ToolOutputBodyRenderer { tool: self.tool }.height(content_width),
             ToolOutputBodyLayout::height,
         );
+        let body_height = if raw_body_height == 0 {
+            0
+        } else {
+            raw_body_height.saturating_add(TOOL_OUTPUT_VERTICAL_PADDING_ROWS.saturating_mul(2))
+        };
         let base_header_height = LinesRenderer::new(output_tool_header_lines(
             self.tool,
             self.expanded,
@@ -2893,31 +2963,58 @@ impl Render for OutputViewportRenderer<'_> {
     }
 
     fn render(&self, context: RenderContext<'_>) {
-        let body_height = self.body_layout.map_or_else(
-            || self.body.height(context.area.width as usize),
+        let content_area =
+            horizontally_inset_area(context.area, TOOL_OUTPUT_HORIZONTAL_PADDING_COLUMNS);
+        let raw_body_height = self.body_layout.map_or_else(
+            || self.body.height(content_area.width as usize),
             ToolOutputBodyLayout::height,
         );
-        let maximum = body_height.saturating_sub(self.height);
+        if raw_body_height == 0 {
+            return;
+        }
+
+        let padding = TOOL_OUTPUT_VERTICAL_PADDING_ROWS.min(self.height / 2);
+        let content_viewport_height = self.height.saturating_sub(padding.saturating_mul(2));
+        let maximum = raw_body_height.saturating_sub(content_viewport_height);
         let top = maximum.saturating_sub(self.scroll_from_bottom.min(maximum));
-        let source_start = top.saturating_add(context.visible_rows.start);
+        let visible_start = context.visible_rows.start.max(padding);
+        let visible_end = context
+            .visible_rows
+            .end
+            .min(padding.saturating_add(content_viewport_height));
+        if visible_start >= visible_end {
+            return;
+        }
+
+        let source_start = top.saturating_add(visible_start.saturating_sub(padding));
         let source_end = top
-            .saturating_add(context.visible_rows.end)
-            .min(body_height);
-        if source_start < source_end {
-            let body_context = RenderContext {
-                theme: context.theme,
-                area: context.area,
-                buffer: context.buffer,
-                visible_rows: source_start..source_end,
-            };
-            if let Some(layout) = self.body_layout {
-                layout.render(body_context);
-                if let Some(cache) = self.cache {
-                    cache.record_tool_output_rows(source_end.saturating_sub(source_start));
-                }
-            } else {
-                self.body.render(body_context);
-            }
+            .saturating_add(visible_end.saturating_sub(padding))
+            .min(raw_body_height);
+        if source_start >= source_end {
+            return;
+        }
+
+        let offset = visible_start
+            .saturating_sub(context.visible_rows.start)
+            .min(u16::MAX as usize) as u16;
+        let mut body_area = content_area;
+        body_area.y = body_area.y.saturating_add(offset);
+        body_area.height = body_area
+            .height
+            .saturating_sub(offset.min(body_area.height));
+        let body_context = RenderContext {
+            theme: context.theme,
+            area: body_area,
+            buffer: context.buffer,
+            visible_rows: source_start..source_end,
+        };
+        if let Some(layout) = self.body_layout {
+            layout.render(body_context);
+        } else {
+            self.body.render(body_context);
+        }
+        if let Some(cache) = self.cache {
+            cache.record_tool_output_rows(source_end.saturating_sub(source_start));
         }
     }
 }
@@ -4289,6 +4386,84 @@ mod tests {
     }
 
     #[test]
+    fn assistant_response_has_padding_on_all_four_sides() {
+        let assistant = AssistantMessage {
+            text: "x".repeat(79),
+            status: AssistantStatus::Completed,
+        };
+        let layout = MarkdownLayout::new(&assistant.text, 78);
+        let renderer = AssistantRenderer {
+            message: &assistant,
+            layout: Some(&layout),
+        };
+
+        let rendered = render_widget(&renderer, 80);
+
+        assert_eq!(rendered.area.height, 4);
+        assert_eq!(rendered.cell((0, 0)).expect("top padding").symbol(), " ");
+        assert_eq!(rendered.cell((0, 1)).expect("left padding").symbol(), " ");
+        assert_eq!(rendered.cell((1, 1)).expect("response body").symbol(), "x");
+        assert_eq!(rendered.cell((79, 1)).expect("right padding").symbol(), " ");
+        assert_eq!(rendered.cell((1, 3)).expect("bottom padding").symbol(), " ");
+    }
+
+    #[test]
+    fn tool_output_has_padding_on_all_four_sides() {
+        let tool = ToolCall {
+            call_id: 41,
+            name: "terminal".into(),
+            summary: "Run output".into(),
+            status: ActivityStatus::Running,
+            artifacts: vec![ToolArtifact::Terminal(TerminalArtifact {
+                description: "Run output".into(),
+                command: "emit-output".into(),
+                output: "x".repeat(79),
+                exit_code: None,
+            })],
+        };
+        let renderer = ToolRenderer {
+            tool: &tool,
+            expanded: false,
+            available_height: 24,
+            scroll_from_bottom: 0,
+            body_layout: None,
+            cache: None,
+        };
+        let viewport = renderer.output_viewport(80).expect("output viewport");
+
+        let rendered = render_widget(&renderer, 80);
+        let top = viewport.start as u16;
+        let bottom = viewport.end.saturating_sub(1) as u16;
+
+        assert_eq!(rendered.cell((1, top)).expect("top padding").symbol(), " ");
+        assert_eq!(
+            rendered
+                .cell((0, top.saturating_add(1)))
+                .expect("left padding")
+                .symbol(),
+            " "
+        );
+        assert_eq!(
+            rendered
+                .cell((2, top.saturating_add(1)))
+                .expect("output body")
+                .symbol(),
+            "x"
+        );
+        assert_eq!(
+            rendered
+                .cell((79, top.saturating_add(1)))
+                .expect("right padding")
+                .symbol(),
+            " "
+        );
+        assert_eq!(
+            rendered.cell((1, bottom)).expect("bottom padding").symbol(),
+            " "
+        );
+    }
+
+    #[test]
     fn read_file_is_a_concise_non_expandable_transcript_record() {
         let mut app = App::new();
         app.transcript.submit(1, "inspect it".into(), Vec::new());
@@ -4562,7 +4737,7 @@ mod tests {
         let rendered = render_widget(&renderer, 80);
         let text = symbols(&rendered);
 
-        assert_eq!(rendered.area.height, 5);
+        assert_eq!(rendered.area.height, 7);
         assert!(!renderer.clickable(80));
         assert!(!text.contains("click to expand"));
         assert!(text.contains("ok"));
@@ -4613,7 +4788,7 @@ mod tests {
             cache: None,
         };
 
-        assert_eq!(render_widget(&renderer, 80).area.height, 3);
+        assert_eq!(render_widget(&renderer, 80).area.height, 5);
         assert!(!renderer.clickable(80));
     }
 
@@ -4922,7 +5097,7 @@ mod tests {
         let (_, expanded) = render_transcript_at(&app, &cache, &Theme::default(), 80, 24);
         app.update_tool_output_scroll_metrics(&expanded.output_scroll_metrics);
         app.scroll_tool_output_by(tool_id, 1);
-        assert_eq!(app.tool_output_scroll_offset(tool_id, 20), 5);
+        assert_eq!(app.tool_output_scroll_offset(tool_id, 22), 5);
 
         app.activate_transcript_entry(tool_id);
         let (collapsed_text, collapsed) =
@@ -5872,12 +6047,13 @@ mod tests {
         let cache = TranscriptRenderCache::default();
         let entry = app.transcript.entries().last().expect("assistant entry");
         let literal = cache.markdown_layout(entry, 3).expect("literal projection");
-        let expected_height = SOURCE_LEN.div_ceil(3);
-        assert_eq!(literal.height(), expected_height);
-        assert_eq!(
-            literal.line(0, &Theme::default()).unwrap().to_string(),
-            "xxx"
+        let content_width = super::horizontally_padded_content_width(
+            3,
+            super::ASSISTANT_MESSAGE_HORIZONTAL_PADDING_COLUMNS,
         );
+        let expected_height = SOURCE_LEN.div_ceil(content_width);
+        assert_eq!(literal.height(), expected_height);
+        assert_eq!(literal.line(0, &Theme::default()).unwrap().to_string(), "x");
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while cache.markdown_cache_stats().2 != 0 {
